@@ -757,7 +757,7 @@
     if (owner && reply.error === 'failed') Teardown.failureTold();   // the cancel reply said why the job failed
     if (reply.brain && reply.ok !== false) showBrain(reply.brain);
     if (type === 'remember') {
-      lastCapture = { ...action.receipt, build: reply.graph && reply.graph.build_id };   // the galaxy it came from
+      lastCapture = action.receipt;                   // its `build` names the galaxy it was saved in (the server's lock)
       placeBirths([action.receipt], found, !owner);
     } else if (type === 'forget') {
       if (found === 'base') removeNote(action.index);  // after a new read the file already holds the truth
@@ -768,7 +768,7 @@
       Teardown.cancelled();                           // noted: the job's end stays quiet, the card is not touched
     } else if (!owner) {
       return;                     // a late answer moves no camera and changes no card; a teardown above is only tracked
-    } else {
+    } else if (found !== 'failed') {                  // node numbers only on a galaxy that is known to be right
       Focus.apply(Core.planFocus(reply.nodes));
     }
   }

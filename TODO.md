@@ -80,7 +80,7 @@ Still to prove:
 
 Proven with the real brain and a real public site (igloo.inc):
 
-- [x] Last run: `PREFLIGHT: 29 pass, 1 fail, 0 warn` and `DRILL: 72 pass, 0 fail`. The one fail is the OpenAI account: it has no credit (see "Brains"). Preflight has 30 checks now.
+- [x] Last run: `PREFLIGHT: 30 pass, 1 fail, 0 warn` and `DRILL: 79 pass, 0 fail`. The one fail is the OpenAI account: it has no credit (see "Brains"). Preflight has 31 checks now.
 - [x] The drill passed with a hidden browser, and also with the Chrome window on screen (`python drill.py --visible`). The snapshot from the visible window is a real picture.
 - [x] A full teardown in about one minute: 96 files, 14.7 MB, Three.js r165, GSAP 3.12.5, postprocessing 6.35.5.
 - [x] The card shows the 8 steps live, then the snapshot, the stack and the totals. The reader shows the whole note.
@@ -130,7 +130,15 @@ Review:
   - A note is known by its path, not by its title, so two notes with one title are never mixed up.
   - The drill says "put back" only when the end of its job is confirmed.
   - A late teardown answer no longer closes the reader or opens the card.
-- [x] The rules of the page now have their own test file, `page_checks.js` (67 rules). Preflight runs it.
+- [x] The rules of the page now have their own test file, `page_checks.js` (73 rules). Preflight runs it.
+- [x] CodeRabbit wrote 11 more replies. 6 had a real remaining point, and all 6 are fixed:
+  - On a Mac or Linux, Jarviz asks the system which program a process is. A script with "chrome" in its name is never stopped.
+  - A signature whose time is over can never be used, also when its content comes late.
+  - The drill takes only a good status answer. An error page is not "no job".
+  - Each saved note carries the number of its galaxy. "Forget that" needs that number.
+  - In "tell me about stripe.com, then tear down example.com", only example.com can be torn down. "I like igloo.inc. Take it apart." still works.
+  - A note is known by its notes folder and its path.
+- The other 5 replies say one thing: preflight must be all green. Its one fail is the OpenAI account with no credit. Add credit, or take the OpenAI key out of `config.json` (then that brain is not tested), and run `python preflight.py`.
 - 12 findings are not changed, on purpose:
   - The drill deletes its own test note also when a program changed it. A test note is not your work.
   - A cancel that comes while the note is saved: Jarviz already answers "too late, the note is saved".

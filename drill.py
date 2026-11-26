@@ -16,6 +16,7 @@ session is gone when the server stops.
 from __future__ import annotations
 
 import http.client
+import json
 import re
 import secrets
 import shutil
@@ -35,7 +36,13 @@ LIVE_LIMIT_S = 240          # the whole live teardown must end inside this time
 CANCEL_WAIT_S = 30          # after a cancel at the limit, how long the job may take to stop
 GOOD_TIME_S = 150           # ...and a healthy one is faster than this
 call, call_json = preflight.call, preflight.call_json
-SERVER_GONE = (OSError, http.client.HTTPException)
+
+
+class BadAnswer(Exception):
+    """The server answered, but not with a good status answer. It counts as no answer."""
+
+
+SERVER_GONE = (OSError, http.client.HTTPException, BadAnswer)
 VISIBLE = False             # --visible: the one drill with a browser window on screen
 
 
@@ -51,9 +58,22 @@ def tree(folder: Path) -> dict[str, int]:
     return {path.relative_to(folder).as_posix(): path.stat().st_size for path in sorted(folder.rglob("*")) if path.is_file()}
 
 
+def job_of(status: int, raw: bytes) -> dict:
+    """The job in ONE status answer. Only a good answer counts: HTTP 200, a JSON object, "ok" not false. Then the
+    job's view, or {} when there is no job. Anything else (an error page, a 500, {"ok": false}) raises BadAnswer:
+    it is no answer, never "no job"."""
+    try:
+        body = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        body = None
+    if status != 200 or not isinstance(body, dict) or body.get("ok") is False:
+        raise BadAnswer(f"HTTP {status}")
+    job = body.get("job")
+    return job if isinstance(job, dict) else {}
+
+
 def job_now() -> dict:
-    _, status = call_json("GET", "/teardown/status")
-    return status.get("job") or {}
+    return job_of(*call("GET", "/teardown/status"))
 
 
 def cancel(job_id: str | None) -> dict:
@@ -116,12 +136,12 @@ def follow_checks() -> list[tuple[str, bool, str]]:
     def follow(answers: list, limit: float) -> tuple[str, dict, int]:
         now, cancels, asked = [0.0], [], [0]
 
-        def ask() -> dict:
+        def ask() -> dict:                  # as job_now: one (status, body) answer, read by job_of
             answer = answers[min(asked[0], len(answers) - 1)]
             asked[0] += 1
             if answer == "gone":
                 raise ConnectionResetError("no answer")
-            return answer
+            return job_of(*answer)
 
         def sleep(seconds: float) -> None:
             now[0] += seconds
@@ -129,15 +149,26 @@ def follow_checks() -> list[tuple[str, bool, str]]:
         verdict, view = follow_job("job1", limit, ask, lambda: cancels.append(now[0]), lambda: now[0], sleep)
         return verdict, view, len(cancels)
 
+    def good(job) -> tuple[int, bytes]:
+        return 200, json.dumps({"ok": True, "job": job}).encode("utf-8")
+
     running, done, other = {"id": "job1", "state": "running"}, {"id": "job1", "state": "done"}, {"id": "job2", "state": "running"}
-    for name, answers, limit, wanted in (
-            ("a status request that fails once, then done, is a confirmed end", ["gone", done], 60, (ENDED, done, 0)),
-            ("status requests that fail until the retry limit are not a confirmed end", [running, "gone"], 60,
-             (NOT_CONFIRMED, running, 0)),
-            ("a job that still runs after the cancel and its wait is not a confirmed end", [running], 5,
-             (NOT_CONFIRMED, running, 1)),
-            ("a job that ends after the cancel is a confirmed end", [running] * 12 + [done], 5, (ENDED, done, 1)),
-            ("another job's id is \"not ours\"", [running, other], 60, (NOT_OURS, other, 0))):
+    error_500 = (500, b'{"ok": false, "error": "server_error"}')
+    html = (502, b"<html><body>Bad gateway</body></html>")
+    refused = (200, b'{"ok": false}')
+    cases = [("a status request that fails once, then done, is a confirmed end", ["gone", good(done)], 60, (ENDED, done, 0)),
+             ("status requests that fail until the retry limit are not a confirmed end", [good(running), "gone"], 60,
+              (NOT_CONFIRMED, running, 0)),
+             ("a job that still runs after the cancel and its wait is not a confirmed end", [good(running)], 5,
+              (NOT_CONFIRMED, running, 1)),
+             ("a job that ends after the cancel is a confirmed end", [good(running)] * 12 + [good(done)], 5, (ENDED, done, 1)),
+             ("another job's id is \"not ours\"", [good(running), good(other)], 60, (NOT_OURS, other, 0)),
+             ("a good answer with no job is \"not ours\"", [good(running), good(None)], 60, (NOT_OURS, {}, 0))]
+    for what, bad in (("an HTTP 500", error_500), ("an HTML error page", html), ('{"ok": false}', refused)):
+        cases.append((f"{what} once, then done, is a confirmed end", [bad, good(done)], 60, (ENDED, done, 0)))
+        cases.append((f"{what} until the retry limit is not a confirmed end", [good(running), bad], 60,
+                      (NOT_CONFIRMED, running, 0)))
+    for name, answers, limit, wanted in cases:
         got = follow(answers, limit)
         results.append((f"drill: {name}", got == wanted, f"got {got}"))
     return results
@@ -424,11 +455,16 @@ def main(argv: list[str]) -> int:
             pass
         else:
             _, kit = call_json("GET", "/teardown/diag")
-            running = job_now().get("state") == "running"
+            try:
+                running = job_now().get("state") == "running"
+                unread = ""
+            except SERVER_GONE as error:        # a status that cannot be read is not "nothing runs"
+                running, unread = True, f"The teardown status could not be read ({error})."
             ready = kit.get("ready") and kit.get("rea", {}).get("installed") == teardown.REA_PIN and not running
             if report.add(PASS if ready else FAIL, f"The kit is ready with REA {teardown.REA_PIN}",
-                          "A teardown is running now. Wait for it." if running
-                          else "; ".join(kit.get("problems") or []) or f"Node.js {kit.get('node', {}).get('version')}, Chrome found"):
+                          unread or ("A teardown is running now. Wait for it." if running
+                                     else "; ".join(kit.get("problems") or [])
+                                     or f"Node.js {kit.get('node', {}).get('version')}, Chrome found")):
                 try:
                     live(report, site, keep)
                 except SERVER_GONE as error:

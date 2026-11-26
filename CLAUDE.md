@@ -52,7 +52,7 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
 - A signature works once: `claim_signature` keeps its nonce until its time is over. The same signed request a
   second time is locked out. Every tool call is signed anew. A signature is claimed only when the request is proven
   whole: a GET in `_unlocked`, a POST after its body matched (`_signed_body_ok`, called from `_read_json`). Every
-  POST route takes its payload from `_read_json` only.
+  POST route takes its payload from `_read_json` only. A signature whose time is over is never claimed.
 - A signature is never traded for the cookie: `Handler._door` gives the cookie only to a caller that brought the
   key itself. A signature names the start of the server (`INSTANCE`), so it is worth nothing after a restart.
 - No tool and no test sends the key itself, in a header, a cookie or an address. `python server.py --link` shows
@@ -102,7 +102,10 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
   `python teardown.py browser` and `capture` both use it. The `[TEARDOWN:site|question]` tag runs only for a site whose own name is a word in the
   user's sentence (`named_by_user`), and "this" only when the user said "this site". Both are read in the part of
   the sentence that ASKS (`asking_part`, `tag_site_named`): in "do not tear down stripe.com, then tear down
-  example.com" only example.com is named. `check_site` looks up the host that Chrome opens, with its "www.".
+  example.com" only example.com is named. The site must stand in the clause that requests the teardown. Another
+  clause counts only when the request points ("tear it down"). This is a pattern, not an understanding of English:
+  the brain decides first, and this gate can only refuse. `check_site` looks up the host that Chrome opens, with
+  its "www.".
 - During a teardown, `_refuse_local_turn` reads where the page is. A private address, an address that is not a web
   address, or no answer from the browser stops the job. It does not see each connection that Chrome makes: that
   limit is written in `TODO.md` under "Not proven". Do not write that Jarviz blocks private-network requests.
@@ -126,13 +129,17 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
   preflight a made-up one. Without an id it stops the job that runs now (the voice command).
 - A teardown receipt goes on the turn that started the job (`Session.record` returns the turn). A start that is
   refused leaves no turn behind.
-- `run_rea` runs only the pinned REA version. On a Mac or Linux a process is "our Chrome" only when the program
-  is Chrome and names the profile in `--user-data-dir=` (or Chrome's crash helper names it in `--database=`)
-  (`names_profile`). Another program is never stopped.
-- The identity of a note is its path, not its title. The sources of a reply and its graph numbers come from one
-  locked step (`chat_route`, `search_route`). `/forget` takes an optional `"build"`: a capture from a galaxy that
-  was built again is not forgotten.
-- The drill counts only an end that is confirmed (`follow_job`). An end that is not confirmed is a FAIL.
+- `run_rea` runs only the pinned REA version. On a Mac or Linux a process is "our Chrome" only when the system
+  says that its program is Chrome (`ps -o comm=`, joined by pid in `posix_table`) and it names the profile in
+  `--user-data-dir=` (or Chrome's crash helper names it in `--database=`) (`names_profile`). Another program is
+  never stopped. A process list that cannot be read is "could not look".
+- The identity of a note is its notes folder and its path (`note_id`), not its title. The sources of a reply and
+  its graph numbers come from one locked step (`chat_route`, `search_route`). Every capture receipt carries
+  `"build"`, written under the lock. `/forget` needs it: a capture from a galaxy that was built again is not
+  forgotten. The page sends the build of the receipt, not the build of the reply.
+- The page does nothing by node number on a galaxy that it could not read again (`syncGraph` gives `'failed'`).
+- The drill counts only an end that is confirmed (`follow_job`). Only a good status answer counts (`job_of`).
+  An end that is not confirmed is a FAIL.
 - `main()` takes the port first and loads the galaxy after it. A second start that finds the port busy changes
   nothing. `Galaxy.refresh_if_rebuilt` follows the `notes_dir` that `config.json` names now.
 - Library fingerprints live in ONE table (`FINGERPRINTS`). A "presence" pattern must be a string that only that

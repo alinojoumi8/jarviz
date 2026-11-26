@@ -374,7 +374,7 @@ def check_remember(report: Report, ctx: dict) -> None:
     finally:
         if receipt:                                  # tests clean up after themselves
             status, gone = call_json("POST", "/forget", {"index": receipt["index"], "label": receipt["title"],
-                                                         "session": ctx["session"]})
+                                                         "build": receipt.get("build"), "session": ctx["session"]})
             trash_name = (gone.get("action") or {}).get("trash")
             if status != 200 or not trash_name:
                 problems.append(f"CLEANUP FAILED: the test note is still at {notes_dir / receipt['file']}")
@@ -489,9 +489,12 @@ def check_take_back_safe(report: Report) -> None:
     try:
         with tempfile.TemporaryDirectory() as folder:
             _take_back_steps(Path(folder).resolve(), trouble)
-        # A "build" that is not a text is a bad request, like a bad index. It is refused before the galaxy is read.
-        if server.forget_route({"index": 0, "label": "x", "build": 5})[0] != 400:
-            trouble.append("a forget whose build id is not a text is not refused as a bad request")
+        # "build" is required, and a text: without one, or with another kind, it is a bad request like a bad index.
+        # It is refused before the galaxy is read.
+        for payload in ({"index": 0, "label": "x"}, {"index": 0, "label": "x", "build": 5},
+                        {"index": 0, "label": "x", "build": None}):
+            if server.forget_route(payload)[0] != 400:
+                trouble.append(f"a forget with {payload} is not refused as a bad request")
     except Exception as error:                      # noqa: BLE001 - a check that stops says so, it never crashes preflight
         trouble.append(f"the check stopped: {type(error).__name__}: {error}")
     finally:
@@ -684,7 +687,8 @@ def _take_back_steps(notes_dir: Path, trouble: list[str]) -> None:
     trash = notes_dir / server.CAPTURES_DIR / server.TRASH_DIR
     data, before = path.read_bytes(), state()
     failing_save()
-    expect("(d) a forget whose save fails", OSError, lambda: galaxy.forget_last(capture["index"], capture["title"]))
+    expect("(d) a forget whose save fails", OSError,
+           lambda: galaxy.forget_last(capture["index"], capture["title"], capture["build"]))
     working_save()
     if state() != before or not path.is_file() or path.read_bytes() != data or any(trash.glob("*")):
         trouble.append("(d) after a failed save, the index, the file or the trash is not as before")
@@ -693,7 +697,7 @@ def _take_back_steps(notes_dir: Path, trouble: list[str]) -> None:
     # written over, the note stays in the trash, the error names it, the index is as before.
     saved = failing_save(first=lambda: path.write_bytes(intruder))
     error = expect("(h) a forget whose old place was taken", OSError,
-                   lambda: galaxy.forget_last(capture["index"], capture["title"]))
+                   lambda: galaxy.forget_last(capture["index"], capture["title"], capture["build"]))
     working_save()
     trashed = list(trash.glob("*"))
     if state() != before or not path.is_file() or path.read_bytes() != intruder:
@@ -704,7 +708,7 @@ def _take_back_steps(notes_dir: Path, trouble: list[str]) -> None:
         named("(h)", error, trashed[0].name, saved)
         path.unlink()
         os.replace(trashed[0], path)
-    galaxy.forget_last(capture["index"], capture["title"])
+    galaxy.forget_last(capture["index"], capture["title"], capture["build"])
     true_links("(h)")
 
     # (e) The file was changed after the birth (an editor plug-in): it stays, with the change, and so does the
@@ -723,18 +727,37 @@ def _take_back_steps(notes_dir: Path, trouble: list[str]) -> None:
         trouble.append("(e) a note with no fingerprint did not stay")
     true_links("(e)")
 
-    # (i) A forget with the receipt of another galaxy (built again since: another notes folder, or build.py): the
-    # same number and title may be another note. Nothing moves. The receipt of THIS galaxy works.
+    # (i) The receipt of a capture carries the build id of the galaxy at the moment of the birth, also when a new
+    # index comes in right after it (the reply's graph numbers are read later, so they would name the new one).
+    # A forget with the receipt of another galaxy (another notes folder, or build.py) may name another note under
+    # the same number and title: nothing moves. The receipt of THIS galaxy works.
     galaxy.build_id = "this-galaxy"
-    capture = galaxy.remember("the till was short on Friday")
+    real_remember, real_galaxy = galaxy.remember, server.GALAXY
+
+    def remember_then_reload(*args, **kwargs) -> dict:
+        receipt = real_remember(*args, **kwargs)
+        galaxy.build_id = "next-galaxy"             # a reload right after the birth
+        return receipt
+
+    galaxy.remember, server.GALAXY = remember_then_reload, galaxy
+    try:
+        _, body = server.do_remember("the till was short on Friday", "Remember that the till was short on Friday",
+                                     server.Session())
+    finally:
+        del galaxy.remember
+        server.GALAXY = real_galaxy
+    capture = (body.get("action") or {}).get("receipt") or {}
+    if capture.get("build") != "this-galaxy" or body.get("graph", {}).get("build_id") != "next-galaxy":
+        trouble.append(f"(i) the receipt does not hold the build of the birth: {capture.get('build')!r}")
     path, before, trashed = notes_dir / capture["file"], state(), sorted(trash.glob("*"))
-    error = expect("(i) a forget with the build id of another galaxy", ValueError,
-                   lambda: galaxy.forget_last(capture["index"], capture["title"], "another-galaxy"))
+    error = expect("(i) a forget after the galaxy was built again", ValueError,
+                   lambda: galaxy.forget_last(capture["index"], capture["title"], capture["build"]))
     if state() != before or not path.is_file() or sorted(trash.glob("*")) != trashed:
         trouble.append("(i) a forget with another galaxy's receipt moved something")
     if error is not None and "built again" not in str(error):
         trouble.append(f"(i) the reason does not say that the galaxy was built again: {error}")
-    gone = galaxy.forget_last(capture["index"], capture["title"], "this-galaxy")
+    galaxy.build_id = "this-galaxy"                 # the galaxy of the receipt again
+    gone = galaxy.forget_last(capture["index"], capture["title"], capture["build"])
     if path.exists() or gone.get("title") != capture["title"]:
         trouble.append("(i) a forget with this galaxy's receipt did not work")
     true_links("(i)")
@@ -911,7 +934,7 @@ def check_teardown_receipt_turn(report: Report) -> None:
                                                       503, "teardown_not_started")):
             session = server.Session()      # (d) a refused start leaves the session as it was, even a full one
             for number in range(server.HISTORY_TURNS):
-                session.record(f"Question {number}", "An answer.", ["coffee"], [3], paths={3: "notes/Coffee.md"})
+                session.record(f"Question {number}", "An answer.", ["coffee"], [3], ids={3: ("notes", "Coffee.md")})
             before = (receipts(session), [turn[0] for turn in session.turns], session.last_tokens, session.last_sources)
             status, body = start(session, _FakeBay(refuse=refusal))
             after = (receipts(session), [turn[0] for turn in session.turns], session.last_tokens, session.last_sources)
@@ -967,12 +990,42 @@ def check_teardown_cancel(report: Report) -> None:
                "another id, a bad id and an empty id stop nothing; the own id and no id cancel; failed and done are said")
 
 
+def check_signature_once(report: Report) -> None:
+    """A signature is claimed once, and never when its time window is over: a body that comes late cannot make an
+    old signature work, also not after its first claim was pruned. Pure: claim_signature with made-up signatures and
+    a made-up clock, on nonces that only this check uses (they are removed afterwards)."""
+    name = "A signature is claimed once, and never after its time window"
+    trouble: list[str] = []
+    window, stamp = server.SIGN_WINDOW_S, 2_000_000_000
+    nonces = [f"preflight-once-{secrets.token_hex(6)}" for _ in range(3)]
+    old, fresh, expiring = (f"{stamp}.{nonce}.x.y" for nonce in nonces)
+    try:
+        if server.claim_signature(old, now=stamp + window + 5) or server.claim_signature(old, now=stamp + window + 6):
+            trouble.append("a stamp older than the window was claimed")
+        if not server.claim_signature(fresh, now=stamp + 1):
+            trouble.append("a fresh signature was not claimed the first time")
+        if server.claim_signature(fresh, now=stamp + 2):
+            trouble.append("a fresh signature was claimed twice")
+        if not server.claim_signature(expiring, now=stamp + window - 1):
+            trouble.append("a signature at the end of its window was not claimed the first time")
+        if server.claim_signature(expiring, now=stamp + window + 1):
+            trouble.append("a signature that expired between two claims was claimed again")
+        if server.claim_signature(expiring, now=stamp + 10 * window):     # its first claim is pruned by now
+            trouble.append("an expired signature was claimed again after its first claim was pruned")
+    finally:
+        with server.USED_LOCK:
+            for nonce in nonces:
+                server.USED_SIGNATURES.pop(nonce, None)
+    report.add(FAIL if trouble else PASS, name, "; ".join(trouble) or
+               "an old stamp twice, a fresh one twice, one that expires between two claims and after the prune")
+
+
 def check_sources_stay_true(report: Report) -> None:
     """The sources of a reply are the notes the brain was SHOWN, by their identity (the path), also when a new index
     comes in: (1) two notes with the same title in two folders that swap places are not taken for each other, in
     the reply and in the session; (2) a reload that comes between the search and the render does not change what
     the brain is sent; (3) the sources and the graph numbers of one reply come from one state; (4) so do the results
-    and the numbers of /search. Pure: a test Galaxy over a temporary folder (refresh off, a fake save), a fake brain,
+    and the numbers of /search; (5) the same relative path in another notes folder is another note. Pure: a test Galaxy over a temporary folder (refresh off, a fake save), a fake brain,
     and a thread that tries a reload at the worst moment. For the length of the check, build.write_graph is a
     recorder: nothing may call it."""
     name = "The sources of a reply are the notes the brain was shown, also across a new index"
@@ -1027,7 +1080,7 @@ def check_sources_stay_true(report: Report) -> None:
             if body.get("nodes") != [] or session.last_sources != []:
                 trouble.append(f"(1) a note with the same title in another folder was taken as the source: "
                                f"{body.get('nodes')}, session {session.last_sources}")
-            session.record("What is Foo?", "The roaster.", ["foo"], [0], paths={0: foo_b.path})
+            session.record("What is Foo?", "The roaster.", ["foo"], [0], ids={0: (str(notes_dir), foo_b.path)})
             galaxy.notes.reverse()                      # index 0 is shop a's Foo again
             if session.snapshot()[2] != []:
                 trouble.append("(1) the session carried a source whose note is another Foo.md now")
@@ -1075,6 +1128,28 @@ def check_sources_stay_true(report: Report) -> None:
             labels = [hit.get("label") for hit in found.get("results", [])]
             if labels != ["Foo"] or (found.get("graph") or {}).get("build_id") != "four":
                 trouble.append(f"(4) /search mixed two states: {labels}, build {(found.get('graph') or {}).get('build_id')}")
+            # (5) notes_dir changes while the brain thinks: the other folder has the SAME relative path shop/Foo.md
+            # at the same index. It is another note.
+            first_root, second_root = notes_dir / "first notes", notes_dir / "second notes"
+            here, there = [], []
+            for root, out, text in ((first_root, here, "Foo is the roaster."), (second_root, there, "Foo is the grinder.")):
+                (root / "shop").mkdir(parents=True)
+                (root / "shop" / "Foo.md").write_text(f"# Foo\n\n{text}\n", encoding="utf-8")
+                out.append(build.make_note(root / "shop" / "Foo.md", root))
+
+            def other_folder() -> None:
+                galaxy.notes_dir, galaxy.notes[:] = second_root, there
+
+            galaxy.notes_dir, galaxy.notes[:], galaxy.build_id = first_root, here, "five"
+            server.ask_model = brain(during=other_folder)
+            body = ask_chat()
+            session = server.get_session(session_id)
+            if body.get("nodes") != [] or session.last_sources != []:
+                trouble.append(f"(5) the same shop/Foo.md in another notes folder was taken as the source: "
+                               f"{body.get('nodes')}, session {session.last_sources}")
+            session.record("What is Foo?", "The roaster.", ["foo"], [0], ids={0: (str(first_root), here[0].path)})
+            if session.snapshot()[2] != []:
+                trouble.append("(5) the session carried a source from another notes folder")
     except Exception as error:                          # noqa: BLE001 - a check that stops says so, it never crashes preflight
         trouble.append(f"the check stopped: {type(error).__name__}: {error}")
     finally:
@@ -1084,7 +1159,8 @@ def check_sources_stay_true(report: Report) -> None:
     if writes:
         trouble.append(f"build.write_graph was called {len(writes)} times: nothing may write here")
     report.add(FAIL if trouble else PASS, name, "; ".join(trouble) or
-               "two Foo.md swapped, a reload before the render, a reload before the graph numbers, /search")
+               "two Foo.md swapped, a reload before the render, a reload before the graph numbers, /search, "
+               "the same path in another notes folder")
 
 
 def check_served_files(report: Report) -> None:
@@ -1635,7 +1711,16 @@ def check_tag_intent(report: Report) -> None:
              ("Tear down stripe.com but don't take igloo.inc apart", "igloo.inc", False),
              ("Don't x-ray this site, tear down stripe.com", "this", False),
              ("Don't x-ray this site, tear down stripe.com", "stripe.com", True),
-             ("x-ray this site", "this", True), ("Tear down stripe.com", "evil.example", False))
+             ("x-ray this site", "this", True), ("Tear down stripe.com", "evil.example", False),
+             # ...in the clause that REQUESTS it. Another clause counts only when the request points ("tear it down").
+             ("Tell me about stripe.com, then tear down example.com", "example.com", True),
+             ("Tell me about stripe.com, then tear down example.com", "stripe.com", False),
+             ("I like igloo.inc. Take it apart.", "igloo.inc", True),
+             ("What is igloo.inc? Tear it down.", "igloo.inc", True),
+             ("What does stripe.com use? Tear it down.", "stripe.com", True),
+             ("Stripe.com is slow. How is it built?", "stripe.com", True),
+             ("Compare linear.app with my notes, then reverse engineer stripe.com", "stripe.com", True),
+             ("Compare linear.app with my notes, then reverse engineer stripe.com", "linear.app", False))
     trouble += [f"a tag for {site} after {said!r} is {'refused' if wanted else 'accepted'}"
                 for said, site, wanted in bound if server.tag_site_named(site, said) != wanted]
     for said in asks:                   # every request that names an address accepts a tag for that address
@@ -1669,6 +1754,7 @@ def main() -> int:
         check_brain_choice_saved(report)
         check_teardown_receipt_turn(report)
         check_teardown_cancel(report)
+        check_signature_once(report)
         check_sources_stay_true(report)
         check_served_files(report)
         check_config_hidden(report, ctx)

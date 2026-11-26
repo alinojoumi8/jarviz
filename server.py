@@ -544,6 +544,7 @@ class Galaxy:
                 "index": index,
                 "title": note.label,
                 "file": note.path,
+                "build": self.build_id,     # the galaxy this number belongs to, read under the same lock (/forget)
                 "related": self._nearest(note, [a for a, _ in new_links]),
                 "node": {"id": index, "label": note.label, "group": note.group, "excerpt": note.excerpt},
                 "links": [{"source": a, "target": b} for a, b in sorted(new_links)],
@@ -587,13 +588,13 @@ class Galaxy:
             content = render_capture(name, fact, self._related_title(fact), source)
             return self.birth_note(f"{CAPTURES_DIR}/{name}.md", content)
 
-    def forget_last(self, index: int, label: str, build_id: str | None = None) -> dict:
+    def forget_last(self, index: int, label: str, build_id: str) -> dict:
         """Undo the newest capture: move its file to captures/.trash and take its star away. `build_id`: the galaxy
-        the receipt came from. When the galaxy was built again since (another notes folder, or build.py), the same
-        number and title can be another note: then nothing moves."""
+        the receipt came from (its "build"). When the galaxy was built again since (another notes folder, or
+        build.py), the same number and title can be another note: then nothing moves."""
         with self.lock:
             self.refresh_if_rebuilt()
-            if build_id is not None and build_id != self.build_id:
+            if build_id != self.build_id:
                 raise ValueError("the galaxy was built again since that note was saved")
             note = self.note(index)
             if note is None or index != len(self.notes) - 1:
@@ -731,13 +732,13 @@ class Session:
         self.lock = threading.Lock()                        # two requests from one tab can overlap
         self.turns: deque = deque(maxlen=HISTORY_TURNS)     # [what the user said, what Jarviz replied, receipts]
         self.last_tokens: frozenset = frozenset()
-        self.last_sources: list[tuple[int, str]] = []       # (index, path): a stale index is never trusted
+        self.last_sources: list[tuple[int, tuple]] = []     # (index, note_id): a stale index is never trusted
         self.used = time.monotonic()
         self._undo: tuple | None = None                     # what the newest record() changed, for take_back()
 
     def snapshot(self) -> tuple[list[dict], frozenset, list[int]]:
         """The history, the last keywords, and the last sources that still are the same notes: the note at that
-        index still has the same path. A title is no identity: two folders can each hold a Foo.md."""
+        index still has the same identity (note_id: the notes folder and the path in it). A title is no identity."""
         with self.lock:
             history = []
             for said, replied, receipts in self.turns:
@@ -748,18 +749,18 @@ class Session:
                     history.append({"role": "user", "content": f"<receipts>\n{lines}\n</receipts>"})
             tokens, sources = self.last_tokens, list(self.last_sources)
         with GALAXY.lock:
-            still = [index for index, path in sources if still_there(index, {index: path})]
+            still = [index for index, identity in sources if still_there(index, {index: identity})]
         return history, tokens, still
 
     def record(self, said: str, replied: str, tokens, nodes: list[int], receipt: str | None = None,
-               paths: dict[int, str] | None = None) -> list:
-        """Add one turn and return it. `paths`: the path of each note the brain was shown, by its number (a source
-        is kept with that path). Without it, the path the index has now."""
-        if paths is None:
+               ids: dict[int, tuple] | None = None) -> list:
+        """Add one turn and return it. `ids`: the note_id of each note the brain was shown, by its number (a source
+        is kept with that identity). Without it, the identity the index has now."""
+        if ids is None:
             with GALAXY.lock:
-                sources = [(index, note.path) for index in nodes if (note := GALAXY.note(index)) is not None]
+                sources = [(index, note_id(note)) for index in nodes if (note := GALAXY.note(index)) is not None]
         else:
-            sources = [(index, paths[index]) for index in nodes if index in paths]
+            sources = [(index, ids[index]) for index in nodes if index in ids]
         turn = [said, replied, [receipt] if receipt else []]
         with self.lock:
             dropped = self.turns[0] if len(self.turns) == self.turns.maxlen else None
@@ -902,26 +903,36 @@ def _about_from(clause: str) -> int:
     return min(starts, default=len(clause))
 
 
-def asking_part(sentence: str) -> str:
-    """The part of the user's sentence that ASKS: what is left when the parts about a teardown that is there, about
-    the past, or refused are taken out of each clause. Rules (A) and (B) are tested on it, and the site of a
-    [TEARDOWN:...] tag must be named in it: in "Do not tear down stripe.com, then tear down example.com" only
-    example.com is asked for."""
+def _kept_clauses(sentence: str) -> list[tuple[str, str]]:
+    """Each clause of the sentence as (what is kept of it, the sign that ends it). The part about a teardown that is
+    there, about the past, or refused is taken out of each clause."""
     kept, start = [], 0
     for end in [*CLAUSE_END_RE.finditer(sentence), None]:
         clause = sentence[start:end.start() if end else len(sentence)]
-        kept.append(clause[:_about_from(clause)])
+        kept.append((clause[:_about_from(clause)], end.group() if end else ""))
         if end:
-            kept.append(end.group())
             start = end.end()
-    return " ".join(kept)
+    return kept
+
+
+def asking_part(sentence: str) -> str:
+    """The part of the user's sentence that ASKS: what is left when the parts about a teardown that is there, about
+    the past, or refused are taken out of each clause. Rules (A) and (B) are tested on it."""
+    parts = []
+    for clause, sign in _kept_clauses(sentence):
+        parts.append(clause)
+        if sign:
+            parts.append(sign)
+    return " ".join(parts)
+
+
+def _rules_hold(text: str) -> bool:
+    return bool(TEARDOWN_VERB_RE.search(text) or (TEARDOWN_QUESTION_RE.search(text) and SITE_WORD_RE.search(text)))
 
 
 def asks_for_teardown(sentence: str) -> bool:
     """Rule (A) or rule (B) above, on the part of the sentence that asks (asking_part)."""
-    rest = asking_part(sentence)
-    return bool(TEARDOWN_VERB_RE.search(rest)
-                or (TEARDOWN_QUESTION_RE.search(rest) and SITE_WORD_RE.search(rest)))
+    return _rules_hold(asking_part(sentence))
 
 
 TAG_INTENT = {"REMEMBER": asks_to_remember, "TEARDOWN": asks_for_teardown}     # tag -> (the user's sentence) -> bool
@@ -997,11 +1008,17 @@ def render_turn(question: str, shown: list[tuple[int, build.Note]], total: int) 
     return "\n\n".join(parts)
 
 
-def still_there(index: int, paths: dict[int, str]) -> bool:
-    """True when the note at `index` is still the one that was offered under that number: the same path inside the
-    notes folder. A title is no identity (two folders can each hold a Foo.md). Call it with GALAXY.lock held."""
+def note_id(note: build.Note) -> tuple[str, str]:
+    """The identity of a note of the galaxy now: (the notes folder, its path in that folder). The path alone is not
+    enough: another notes folder can hold the same shop/Foo.md. Call it with GALAXY.lock held."""
+    return str(GALAXY.notes_dir), note.path
+
+
+def still_there(index: int, ids: dict[int, tuple]) -> bool:
+    """True when the note at `index` is still the one that was offered under that number: the same note_id (the
+    same notes folder and the same path in it). A title is no identity. Call it with GALAXY.lock held."""
     note = GALAXY.note(index)
-    return note is not None and index in paths and note.path == paths[index]
+    return note is not None and index in ids and note_id(note) == ids[index]
 
 
 # -------------------------------------------------------------------- routes
@@ -1021,7 +1038,7 @@ def chat_route(payload: dict) -> tuple[int, dict]:
         offered += carried[: max(0, RETRIEVE_TOP - len(offered))]
         shown = [(index, note) for index in offered if (note := GALAXY.note(index)) is not None]
         total = len(GALAXY.notes)
-    paths = {index: note.path for index, note in shown}     # the identity of each note the brain was shown
+        ids = {index: note_id(note) for index, note in shown}  # the identity of each note the brain is shown
     turn = render_turn(question, shown, total)
     try:
         text = ask_model("chat", history + [{"role": "user", "content": turn}])
@@ -1041,10 +1058,10 @@ def chat_route(payload: dict) -> tuple[int, dict]:
     # whose note is not the one the brain was shown any more (a new index came in) is dropped. The check and the
     # graph numbers of the reply are one locked step, so the page reads the numbers of the state that was checked.
     with GALAXY.lock:
-        nodes = list(dict.fromkeys(index for index in declared or [] if still_there(index, paths)))
+        nodes = list(dict.fromkeys(index for index in declared or [] if still_there(index, ids)))
         graph = GALAXY.meta()
     answer = answer or LINES["empty"]
-    session.record(question, answer, tokens, nodes, paths=paths)
+    session.record(question, answer, tokens, nodes, ids=ids)
     return 200, reply(answer, nodes, graph=graph, sources_declared=declared is not None)
 
 
@@ -1069,10 +1086,11 @@ def remember_route(payload: dict) -> tuple[int, dict]:
 
 
 def forget_route(payload: dict) -> tuple[int, dict]:
-    """{"index", "label", and "build": the build_id of the galaxy the receipt came from}. "build" is optional."""
+    """{"index", "label", "build"}: all three from the capture's receipt. "build" (the galaxy the receipt came from,
+    a text) is REQUIRED: without it the same number and title could be a note of another galaxy."""
     index, label, build_id = payload.get("index"), payload.get("label"), payload.get("build")
     if (isinstance(index, bool) or not isinstance(index, int) or not isinstance(label, str)
-            or (build_id is not None and not isinstance(build_id, str))):
+            or not isinstance(build_id, str)):
         line = LINES["forget_failed"].format(reason="I was not told which note.")
         return 400, reply(line, ok=False, error="bad_request")
     try:
@@ -1312,16 +1330,52 @@ def teardown_image_route(query: dict) -> tuple:
     return 200, data, "image/png"
 
 
+# Does a requesting clause name its own target? This is a pattern, not an understanding of English: after the
+# teardown verb or the question words, the clause holds a word that is not in this list (a pointing word such as
+# "it" or "them", a site noun, a word of the verb or the question, or a small word). "Tear it down" names none,
+# so it points at a thing named before; "tear down example.com" names one.
+POINTING_WORDS = frozenset("it this that these those them one".split())
+NO_TARGET_WORDS = POINTING_WORDS | frozenset(
+    "site sites page website homepage webpage web app "
+    "reverse engineer engineered reverse-engineer tear tearing down teardown take apart x-ray xray "
+    "how what what's does do did is are was were work works built made make makes done use uses used using "
+    "run running on with written tech technology stack under hood "
+    "the a an please again now for me my too also just then and of its so".split())
+TARGET_WORD_RE = re.compile(r"[^\W_]+(?:[.'’-][^\W_]+)*")
+
+
+def names_own_target(clause: str) -> bool:
+    """True when a clause that requests a teardown names what it is about, instead of pointing with "it"."""
+    found = [match.start() for match in (TEARDOWN_VERB_RE.search(clause), TEARDOWN_QUESTION_RE.search(clause)) if match]
+    if not found:
+        return False
+    words = TARGET_WORD_RE.findall(clause[min(found):])
+    return any(word.lower().replace("’", "'") not in NO_TARGET_WORDS for word in words)
+
+
 def tag_site_named(site_text: str, sentence: str) -> bool:
-    """True when the user's sentence names the site of a [TEARDOWN:...] tag in the part that ASKS (asking_part).
-    "this" counts only when that part says "this site". A site named only in a refused part ("do not tear down X")
-    or in a part about an old teardown is not named. A text that is no address is left to start_teardown (it
-    refuses it)."""
-    asked = asking_part(sentence)
-    if not site_text or site_text.lower() in THIS_SITE:
-        return bool(THIS_SAID_RE.search(asked))
-    site = teardown.parse_site(site_text) if teardown is not None else None
-    return site is None or named_by_user(site.host, asked)
+    """True when the user's sentence names the site of a [TEARDOWN:...] tag where the teardown is REQUESTED.
+    A requesting clause is a kept clause (the about and refused parts are out) in which rule (A) or (B) holds by
+    itself. The site must be named in a requesting clause ("this" only by "this site" there). Only when every
+    requesting clause points ("tear it down", "how is it built") may the site be named in another kept clause: the
+    user then means a thing named before. A site named only in a refused part, in a part about an old teardown, or
+    beside a request for another site ("tell me about X, then tear down Y") is not named. A text that is no address
+    is left to start_teardown (it refuses it)."""
+    this = not site_text or site_text.lower() in THIS_SITE
+    site = None if this or teardown is None else teardown.parse_site(site_text)
+    if not this and site is None:
+        return True
+
+    def named_in(text: str) -> bool:
+        return bool(THIS_SAID_RE.search(text)) if this else named_by_user(site.host, text)
+
+    kept = [clause for clause, _ in _kept_clauses(sentence)]
+    requesting = [clause for clause in kept if _rules_hold(clause)]
+    if any(named_in(clause) for clause in requesting):
+        return True
+    if any(names_own_target(clause) for clause in requesting):
+        return False                                # the request names another target
+    return any(named_in(clause) for clause in kept)
 
 
 def tag_teardown(argument: str, question: str, session: Session, payload: dict) -> tuple[int, dict]:
@@ -1462,14 +1516,17 @@ USED_LOCK = threading.Lock()
 MAX_USED_SIGNATURES = 4096              # only good signatures come in here. When it is full: refuse, never forget
 
 
-def claim_signature(value: str) -> bool:
+def claim_signature(value: str, now: float | None = None) -> bool:
     """A signature works once. True the first time a good signature comes; False when its nonce was used before,
-    or when the table is full. A nonce is kept until the time window of its signature ends."""
+    when its time window is over (it is checked again here: a body can come late), or when the table is full. A
+    nonce is kept until the time window of its signature ends; after that its stamp alone refuses it."""
     stamp, nonce = value.split(".")[:2]
-    now = time.time()
+    now = time.time() if now is None else now
     with USED_LOCK:
         for old in [old for old, until in USED_SIGNATURES.items() if until < now]:
             del USED_SIGNATURES[old]
+        if abs(now - int(stamp)) > SIGN_WINDOW_S:      # expired: never claimed, so a pruned nonce cannot come back
+            return False
         if nonce in USED_SIGNATURES or len(USED_SIGNATURES) >= MAX_USED_SIGNATURES:
             return False
         USED_SIGNATURES[nonce] = int(stamp) + SIGN_WINDOW_S + 1

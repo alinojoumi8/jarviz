@@ -279,9 +279,29 @@ def _rea_error_text(data) -> str:
 
 # ------------------------------------------------------ which Chrome is ours
 
-def _process_table() -> list[tuple[int, str]] | None:
-    """(pid, command line) for every running Chrome. Used only to find OUR investigation browser.
-    None means "could not look" (the system tool failed). That is never the same as "none found"."""
+def _pid_lines(text: str, sep: str | None = None) -> dict[int, str]:
+    """{pid: the rest of the line} from a list that starts each line with a pid."""
+    rows = {}
+    for line in text.splitlines():
+        pid, _, rest = line.strip().partition(sep) if sep else line.strip().partition(" ")
+        if pid.strip().isdigit() and rest.strip():
+            rows[int(pid)] = rest.strip()
+    return rows
+
+
+def posix_table(commands: str, programs: str) -> list[tuple[int, str, str]]:
+    """Join the two `ps` lists by pid: (pid, command line, executable). The command line cannot tell the program
+    from its first argument ("python3 chrome_tools.py ..."), so the executable comes from `comm`: on Linux the
+    name of the executable, cut to 15 characters ("chrome", "chrome_crashpad"); on a Mac its full path, with spaces.
+    A process whose executable is not in the second list gets "": it is never ours."""
+    names = _pid_lines(programs)
+    return [(pid, command, names.get(pid, "")) for pid, command in _pid_lines(commands).items()
+            if "chrom" in command.casefold()]
+
+
+def _process_table() -> list[tuple[int, str, str]] | None:
+    """(pid, command line, executable) for every running Chrome. Used only to find OUR investigation browser.
+    None means "could not look" (a system tool failed). That is never the same as "none found"."""
     try:
         if os.name == "nt":
             script = ("[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
@@ -289,41 +309,39 @@ def _process_table() -> list[tuple[int, str]] | None:
                       "ForEach-Object { \"$($_.ProcessId)`t$($_.CommandLine)\" }")
             done = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
                                   capture_output=True, timeout=30, creationflags=NO_WINDOW, stdin=subprocess.DEVNULL)
-            text, sep = done.stdout.decode("utf-8", "replace"), "\t"
-        else:
-            done = subprocess.run(["ps", "-axww", "-o", "pid=,command="], capture_output=True, timeout=15,
-                                  stdin=subprocess.DEVNULL)
-            text, sep = done.stdout.decode("utf-8", "replace"), None
+            if done.returncode != 0:
+                return None
+            rows = _pid_lines(done.stdout.decode("utf-8", "replace"), "\t")
+            return [(pid, command, "chrome.exe") for pid, command in rows.items()]   # the query lists chrome.exe only
+        done = subprocess.run(["ps", "-axww", "-o", "pid=,command="], capture_output=True, timeout=15,
+                              stdin=subprocess.DEVNULL)
+        named = subprocess.run(["ps", "-axww", "-o", "pid=,comm="], capture_output=True, timeout=15,
+                               stdin=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError):
         return None
-    if done.returncode != 0:
+    if done.returncode != 0 or named.returncode != 0:
         return None
-    rows = []
-    for line in text.splitlines():
-        pid, _, command = line.strip().partition(sep) if sep else line.strip().partition(" ")
-        if pid.strip().isdigit() and command and "chrom" in command.casefold():     # Chrome only, never another program
-            rows.append((int(pid), command))
-    return rows
+    return posix_table(done.stdout.decode("utf-8", "replace"), named.stdout.decode("utf-8", "replace"))
 
 
-def names_profile(command: str, folder, windows: bool | None = None) -> bool:
-    """True when a process's command line names `folder` (or a folder inside it) as its profile path.
-    Windows: anywhere in it, because the query there lists chrome.exe only. Elsewhere `ps` lists every program
-    with "chrom" anywhere in its line, so two things must hold:
-    (a) the PROGRAM is Chrome: the name of the executable (the text before the first " --", its last path part,
-        which can hold spaces: "Google Chrome Helper (Renderer)") holds "chrom";
+def names_profile(command: str, folder, windows: bool | None = None, program: str = "") -> bool:
+    """True when a process runs on `folder` (or a folder inside it) as its profile path.
+    Windows: the path anywhere in the command line, because the query there lists chrome.exe only.
+    Elsewhere `ps` lists every program with "chrom" anywhere in its line, so two things must hold:
+    (a) the PROGRAM is Chrome: the name of its executable (`program`, from `ps -o comm=`; its last path part,
+        which can hold spaces: "Google Chrome Helper (Renderer)") holds "chrom". No executable: not ours;
     (b) the profile is named by --user-data-dir=<folder or inside it>, or, for Chrome's own crash helper
         (chrome_crashpad_handler), by --database=<inside the folder>.
-    Anything else (an editor that opens chrome_debug.log, node with an option under the folder) is never ours."""
+    Anything else (an editor that opens chrome_debug.log, a script called chrome_tools.py) is never ours."""
     windows = os.name == "nt" if windows is None else windows
     needle = str(folder).replace("\\", "/").rstrip("/").casefold()
     text = command.replace("\\", "/")
     if windows:
         return needle in text.casefold()
-    program, _, rest = text.partition(" --")
-    executable = program.rstrip("/").rsplit("/", 1)[-1].casefold()
+    executable = str(program or "").replace("\\", "/").rstrip("/").rsplit("/", 1)[-1].casefold()
     if "chrom" not in executable:
         return False
+    _, _, rest = text.partition(" --")
     for option in ("--" + part for part in rest.split(" --")) if rest else ():
         name, equals, value = option.partition("=")
         value = value.strip().strip("\"'").rstrip("/").casefold()
@@ -341,7 +359,7 @@ def chrome_pids_using(folder: Path) -> list[int] | None:
     table = _process_table()
     if table is None:
         return None
-    return [pid for pid, command in table if names_profile(command, folder)]
+    return [pid for pid, command, program in table if names_profile(command, folder, program=program)]
 
 
 def _kill(pid: int) -> None:
@@ -2501,31 +2519,43 @@ def _offline_bay_checks(reply: str, evidence: dict) -> list[tuple[str, bool, str
     """More offline checks: which processes are ours, which sites may open, the pinned REA, the profiles folder,
     and the bay's start, cancel and picture. No browser, no network, no REA run, no real job thread."""
     results = []
-    # Which processes are ours: on a Mac or Linux only Chrome itself, and only with the profile in --user-data-dir=
-    # (or, for its crash helper, in --database=). The home folder has a space, as a Mac one can have.
+    # Which processes are ours: on a Mac or Linux only Chrome itself (its executable, from `ps -o comm=`), and only
+    # with the profile in --user-data-dir= (or, for its crash helper, in --database=). Made-up `ps` lists; the home
+    # folder has a space, as a Mac one can have.
     root = "/Users/j s/.jarvis-tools/rea/profiles"
-    helper = ("/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework.framework/Helpers/"
-              "Google Chrome Helper (Renderer).app/Contents/MacOS/Google Chrome Helper (Renderer)")
-    posix = [(f"/opt/google/chrome/chrome --type=renderer --user-data-dir={root}/job1 --lang=en", True),
-             (f"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --user-data-dir={root}/job1 --no-first-run", True),
-             (f"{helper} --type=renderer --user-data-dir={root}/job1", True),
-             (f"/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework.framework/Helpers/"
-              f"chrome_crashpad_handler --database={root}/job1/Crashpad --url=x", True),
-             (f"vim {root}/job1/chrome_debug.log", False),
-             (f"node --redirect-warnings={root}/job1/chrome_debug.log", False),
-             (f"/usr/bin/python3 --user-data-dir={root}/job1 chrome", False),
-             (f"/opt/google/chrome/chrome --database={root}/job1/Crashpad", False),
-             (f"less --log {root}/job1 chrome", False),
-             ("/usr/bin/chromium --user-data-dir=/home/u/.config/chromium", False),
-             (f"/opt/google/chrome/chrome --user-data-dir={root}-old/job1", False)]
+    mac_chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    mac_helpers = "/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework.framework/Helpers/"
+    mac_renderer = mac_helpers + "Google Chrome Helper (Renderer).app/Contents/MacOS/Google Chrome Helper (Renderer)"
+    posix = [  # pid, command line, executable ("" = not in the second list), ours
+        (101, f"/opt/google/chrome/chrome --type=renderer --user-data-dir={root}/job1 --lang=en", "chrome", True),
+        (102, f"/opt/google/chrome/chrome_crashpad_handler --database={root}/job1/Crashpad --url=x", "chrome_crashpad", True),
+        (103, f"/usr/bin/python3 /tmp/chrome_tools.py --user-data-dir={root}/job1", "python3", False),
+        (104, f"node --redirect-warnings={root}/job1/chrome_debug.log", "node", False),
+        (105, f"vim {root}/job1/chrome_debug.log", "vim", False),
+        (106, f"/opt/google/chrome/chrome --database={root}/job1/Crashpad", "chrome", False),
+        (107, "/usr/bin/chromium --user-data-dir=/home/u/.config/chromium", "chromium", False),
+        (108, f"/opt/google/chrome/chrome --user-data-dir={root}-old/job1", "chrome", False),
+        (109, f"/opt/google/chrome/chrome --user-data-dir={root}/job1", "", False),
+        (201, f"{mac_chrome} --user-data-dir={root}/job1 --no-first-run", mac_chrome, True),
+        (202, f"{mac_renderer} --type=renderer --user-data-dir={root}/job1", mac_renderer, True),
+        (203, f"{mac_helpers}chrome_crashpad_handler --database={root}/job1/Crashpad", mac_helpers + "chrome_crashpad_handler", True),
+        (204, f"/usr/bin/python3 /Users/j s/chrome_tools.py --user-data-dir={root}/job1", "/usr/bin/python3", False)]
+    commands = "\n".join(f"{pid:>6} {command}" for pid, command, _, _ in posix)
+    programs = "\n".join(f"{pid:>6} {program}" for pid, _, program, _ in posix if program)
+    table = {pid: (command, program) for pid, command, program in posix_table(commands, programs)}
+    wrong: list = []
+    for pid, _, _, ours in posix:
+        command, program = table.get(pid, ("", ""))
+        if names_profile(command, root, windows=False, program=program) != ours:
+            wrong.append(pid)
     windows = [(r'"C:\Program Files\Google\Chrome\Application\chrome.exe" --type=gpu-process '
                 r'--user-data-dir=C:\Users\u\.jarvis-tools\rea\profiles\job1', True),
                (r'"C:\Program Files\Google\Chrome\Application\chrome.exe" "--user-data-dir=C:\Users\u\.jarvis-tools\rea\profiles\job1"', True),
                (r'"C:\Program Files\Google\Chrome\Application\chrome.exe" --user-data-dir=C:\Users\u\AppData\Local\Google\Chrome', False)]
-    wrong = [line for line, ours in posix if names_profile(line, root, windows=False) != ours]
     wrong += [line for line, ours in windows if names_profile(line, r"C:\Users\u\.jarvis-tools\rea\profiles", windows=True) != ours]
-    results.append(("a process is ours only when it runs on a job profile; an editor on a profile file is not",
-                    not wrong and names_profile(posix[0][0], root + "/job1", windows=False), f"wrong: {wrong}"))
+    one_job = names_profile(posix[0][1], root + "/job1", windows=False, program="chrome")
+    results.append(("a process is ours only when Chrome itself runs on a job profile; a script or an editor is not",
+                    not wrong and one_job and len(table) == len(posix), f"wrong: {wrong}, rows {len(table)}"))
     # Which sites may open: the same rule for the server and the command line. The lookup is a stub.
     asked: list[str] = []
 

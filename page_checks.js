@@ -6,7 +6,7 @@
    page did. Nothing goes to the network, and no file is read except the two that are named.
 
    preflight runs it:   node page_checks.js viewer/core.js viewer/app.js
-   It prints ONE line on stdout, JSON: {"pass": 70, "fail": 0, "failures": []}. The exit code is 0 when it
+   It prints ONE line on stdout, JSON: {"pass": 73, "fail": 0, "failures": []}. The exit code is 0 when it
    ran to its end, also when a rule failed. Any other exit code means it could not run (a file is
    missing, or the page code threw while it loaded); the reason is on stderr.
    For people:          node page_checks.js viewer/core.js viewer/app.js --list   (the name of every check)
@@ -161,10 +161,10 @@ function galaxy(rev, labels, build_id = 'b1') {
   return { build_id, rev, nodes: labels.map((label, id) => ({ id, label, group: 'notes', excerpt: '' })), links: [] };
 }
 const graphFile = data => 'window.GRAPH = ' + JSON.stringify(data) + ';\n';
-const receipt = (index, label) => ({ index, title: label, file: 'captures/' + label + '.md', related: 0,
+const receipt = (index, label, build = 'b1') => ({ index, title: label, file: 'captures/' + label + '.md', related: 0, build,
   node: { id: index, label, group: 'captures', excerpt: '' }, links: [{ source: index, target: 0 }] });
-const rememberReply = (rev, index, label) => ({ ok: true, answer: 'Saved ' + label, nodes: [index], graph: meta(rev),
-  action: { type: 'remember', receipt: receipt(index, label) } });
+const rememberReply = (rev, index, label, build = 'b1') => ({ ok: true, answer: 'Saved ' + label, nodes: [index], graph: meta(rev),
+  action: { type: 'remember', receipt: receipt(index, label, build) } });
 const chatReply = (answer, rev, nodes = []) => ({ ok: true, answer, nodes, graph: meta(rev) });
 const job = (id, state, extra = {}) => Object.assign({ id, label: 'Teardown · x', state, step: 2, steps: ['one', 'two', 'three'] }, extra);
 const count = (log, key) => log.filter(entry => entry.key === key).length;
@@ -551,33 +551,89 @@ story('the start-up compare with /status', {
     `${count(p.fetchLog, 'graph-data.js')} reads / ${p.$('answer').textContent}`);
 });
 
-story('forget names the galaxy of its capture', {
-  build: 'forget sends the build of the capture\'s galaxy with index, label and session',
-  refused: 'a refused forget shows the server\'s line',
-  none: 'with no build known, forget sends no build field',
-  late: 'a capture from a late reply keeps its build',
+story('no node numbers on a galaxy that could not be read', {
+  still: 'a chat reply with notes after a failed read moves no camera and lights no star',
+  answer: 'that reply still shows its answer',
+  again: 'the next reply reads again, and then lights its stars in the new galaxy',
+  startup: 'after a failed read at start-up, a reply whose read fails too lights nothing',
+  startupThen: 'after a failed read at start-up, a reply whose read works lights its stars in the new galaxy',
 }, async (t, open) => {
-  let remembered = rememberReply(6, 3, 'T');
+  let fail = true;
+  const reads = () => { if (fail) throw new Error('offline'); return graphFile(galaxy(9, ['W', 'X', 'Y', 'Z'], 'b2')); };
+  let answer = chatReply('About B', 9, [1]);
+  answer.graph = meta(9, 'b2');                       // the server's galaxy is another build now
+  const p = await open({ handlers: { '/chat': () => answer, 'graph-data.js': reads } });
+  await p.J().handleInput('tell me about B');
+  await p.tick(2500);
+  const focus = p.J().Focus.current();
+  const moved = p.graphLog.some(([name, args]) => name === 'cameraPosition' && args.length > 1);
+  t.check('still', focus.primary === null && focus.lit.length === 0 && p.$('panel').hidden === true && !moved,
+    `primary ${focus.primary}, lit ${focus.lit}`);
+  t.check('answer', p.$('answer').textContent === 'About B');
+  fail = false;
+  answer = Object.assign(chatReply('About Y', 9, [2]), { graph: meta(9, 'b2') });
+  await p.J().handleInput('tell me about Y');
+  await p.tick(0);
+  t.check('again', count(p.fetchLog, 'graph-data.js') === 2 && p.J().Focus.current().primary === 2
+    && p.$('panel-title').textContent === 'Y', `${count(p.fetchLog, 'graph-data.js')} reads, ${p.$('panel-title').textContent}`);
+
+  fail = true;
+  answer = Object.assign(chatReply('About Z', 0, [2]), { graph: meta(9, 'b2') });     // 2 is "C" in the old galaxy
+  const status = () => ({ ok: true, active: { label: 'Claude', model: 'm', has_key: true }, lines: {}, graph: meta(9, 'b2') });
+  const q = await open({ handlers: { '/status': status, '/chat': () => answer, 'graph-data.js': reads } });
+  await q.tick(0);                                    // the start-up read failed: the page is as it was
+  await q.J().handleInput('tell me about Z');
+  await q.tick(0);
+  t.check('startup', q.J().Focus.current().primary === null && labels(q) === 'A,B,C' && q.$('answer').textContent === 'About Z',
+    `${q.J().Focus.current().primary} / ${labels(q)}`);
+  fail = false;
+  answer = Object.assign(chatReply('About Z', 0, [3]), { graph: meta(9, 'b2') });
+  await q.J().handleInput('tell me about Z');
+  await q.tick(0);
+  t.check('startupThen', q.J().Focus.current().primary === 3 && q.$('panel-title').textContent === 'Z',
+    `${q.J().Focus.current().primary} / ${q.$('panel-title').textContent}`);
+});
+
+story('forget names the galaxy of its capture', {
+  build: 'forget sends the build from the capture\'s receipt, with index, label and session',
+  receipt: 'forget sends the receipt\'s build even when the reply\'s graph numbers name another build',
+  refused: 'a refused forget shows the server\'s line',
+  none: 'a receipt with no build (an old server) sends no build field, and the server\'s refusal is shown',
+  late: 'a capture from a late reply keeps its receipt\'s build',
+}, async (t, open) => {
+  let remembered = rememberReply(6, 3, 'T', 'r1');
+  let forgetAnswer = () => ({ ok: false, answer: 'Refused line', nodes: [], graph: meta(6), error: 'forget_failed' });
   const p = await open({ handlers: {
     '/remember': () => remembered,
-    '/forget': () => ({ ok: false, answer: 'Refused line', nodes: [], graph: meta(0, 'b9'), error: 'forget_failed' }),
+    '/forget': () => forgetAnswer(),
     'graph-data.js': () => graphFile(galaxy(0, ['A', 'B', 'C', 'T'], 'b9')),
   } });
+  const forgets = () => p.fetchLog.filter(entry => entry.key === '/forget').map(entry => entry.body);
   await p.J().handleInput('remember that T');
   await p.tick(1000);
   await p.J().handleInput('forget that');
   await p.tick(0);
-  const sent = p.fetchLog.filter(entry => entry.key === '/forget').map(entry => entry.body);
-  t.check('build', sent.length === 1 && sent[0].build === 'b1' && sent[0].index === 3 && sent[0].label === 'T'
+  const sent = forgets();
+  t.check('build', sent.length === 1 && sent[0].build === 'r1' && sent[0].index === 3 && sent[0].label === 'T'
     && typeof sent[0].session === 'string', JSON.stringify(sent));
   t.check('refused', p.$('answer').textContent === 'Refused line' && p.$('answer').classList.contains('trouble'));
-  remembered = Object.assign(rememberReply(0, 4, 'U'), { graph: undefined });     // a reply with no numbers
+  remembered = Object.assign(rememberReply(7, 4, 'U', 'r2'), { graph: meta(0, 'b9') });   // the reply names another build
   await p.J().handleInput('remember that U');
   await p.tick(1000);
   await p.J().handleInput('forget that');
   await p.tick(0);
-  const second = p.fetchLog.filter(entry => entry.key === '/forget').map(entry => entry.body)[1];
-  t.check('none', Boolean(second) && !('build' in second) && second.index === 4, JSON.stringify(second));
+  t.check('receipt', forgets().length === 2 && forgets()[1].build === 'r2', JSON.stringify(forgets()[1]));
+  remembered = rememberReply(1, 4, 'V', undefined);                              // an old server: no build
+  delete remembered.action.receipt.build;
+  forgetAnswer = () => ({ ok: false, answer: 'No build line', nodes: [], graph: meta(1, 'b9'), error: 'forget_failed' });
+  p.handlers['graph-data.js'] = () => graphFile(galaxy(1, ['A', 'B', 'C', 'T', 'V'], 'b9'));
+  await p.J().handleInput('remember that V');
+  await p.tick(1000);
+  await p.J().handleInput('forget that');
+  await p.tick(0);
+  const third = forgets()[2];
+  t.check('none', Boolean(third) && !('build' in third) && third.index === 4 && p.$('answer').textContent === 'No build line',
+    `${JSON.stringify(third)} / ${p.$('answer').textContent}`);
 
   const read = deferred();
   const chat = deferred();
