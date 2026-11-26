@@ -201,10 +201,29 @@ def quiet_env() -> dict:
     return {name: value for name, value in os.environ.items() if not SECRET_ENV.search(name)}
 
 
+_REA_FOUND: list[str] = []      # the REA version found the first time it was needed, once per process
+
+
+def rea_version_once() -> str:
+    """The installed REA version, read once per process ("" while none is installed: then it is read again)."""
+    if not _REA_FOUND:
+        version = installed_rea().get("version", "")
+        if not version:
+            return ""
+        _REA_FOUND.append(version)
+    return _REA_FOUND[0]
+
+
 def run_rea(command: str, *args: str, timeout: float = 90.0, on_start=None) -> dict:
-    """Run one REA command and return its JSON. Only the four web commands are allowed."""
+    """Run one REA command and return its JSON. Only the four web commands are allowed, and only the pinned
+    REA version runs: every caller (the bay and the command line) is covered here."""
     if command not in REA_COMMANDS:
         raise TeardownError("rea_command_refused", f"Jarviz does not run the REA command {command}.")
+    found = rea_version_once()
+    if found != REA_PIN:
+        raise TeardownError("rea_not_pinned", f"REA {found or 'is not installed'}{' is installed' if found else ''}, "
+                                              f"but Jarviz is pinned to {REA_PIN}. Install {REA_PACKAGE}@{REA_PIN} "
+                                              "and start Jarviz again.")
     node = find_node()
     if not node or not REA_SCRIPT.is_file():
         raise TeardownError("kit_missing", "REA or Node.js is missing.")
@@ -287,13 +306,32 @@ def _process_table() -> list[tuple[int, str]] | None:
     return rows
 
 
+def names_profile(command: str, folder, windows: bool | None = None) -> bool:
+    """True when a process's command line names `folder` (or a folder inside it) as its profile path.
+    Windows: anywhere in it, because the query there lists chrome.exe only. Elsewhere `ps` lists every program
+    with "chrom" in its line, so the path counts only as the VALUE of an option, right after "=", as in
+    --user-data-dir=<folder> or --database=<folder>/Crashpad. A program that has the path as a plain argument
+    (an editor that opens chrome_debug.log) is never one of ours."""
+    windows = os.name == "nt" if windows is None else windows
+    needle = str(folder).replace("\\", "/").rstrip("/").casefold()
+    text = command.replace("\\", "/").casefold()
+    if windows:
+        return needle in text
+    start = text.find(needle)
+    while start != -1:
+        after = text[start + len(needle):start + len(needle) + 1]
+        if start > 0 and text[start - 1] == "=" and after in ("", "/", " ", '"', "'"):
+            return True
+        start = text.find(needle, start + 1)
+    return False
+
+
 def chrome_pids_using(folder: Path) -> list[int] | None:
     """Every Chrome process whose command line names `folder` as (part of) its profile path. None: could not look."""
     table = _process_table()
     if table is None:
         return None
-    needle = str(folder).replace("\\", "/").rstrip("/").casefold()
-    return [pid for pid, command in table if needle in command.replace("\\", "/").casefold()]
+    return [pid for pid, command in table if names_profile(command, folder)]
 
 
 def _kill(pid: int) -> None:
@@ -329,11 +367,15 @@ def investigation_chromes() -> list[int] | None:
     return chrome_pids_using(PROFILES_DIR)
 
 
-def leftover_profiles() -> list[str]:
+def leftover_profiles() -> list[str] | None:
+    """The job profile folders that are still there. [] when the profiles folder is not there. None when it is
+    there but cannot be listed: "could not look", which a caller must never take as clean."""
     try:
         return sorted(item.name for item in PROFILES_DIR.iterdir())
-    except OSError:
+    except FileNotFoundError:
         return []
+    except OSError:
+        return None
 
 
 def sweep() -> dict:
@@ -341,8 +383,9 @@ def sweep() -> dict:
     found = investigation_chromes()
     for pid in found or []:
         _kill(pid)
-    removed = [name for name in leftover_profiles() if _delete_profile(PROFILES_DIR / name)]
-    return {"killed": len(found or []), "removed": len(removed), "looked": found is not None}
+    profiles = leftover_profiles()
+    removed = [name for name in profiles or [] if _delete_profile(PROFILES_DIR / name)]
+    return {"killed": len(found or []), "removed": len(removed), "looked": found is not None and profiles is not None}
 
 
 # ------------------------------------------------------------ DevTools client
@@ -921,6 +964,20 @@ def resolves_to_private(host: str) -> bool:
     except (OSError, UnicodeError):
         return False
     return any(is_private_address(str(item[4][0])) for item in found)
+
+
+def check_site(text, resolves=None) -> tuple[Site | None, str]:
+    """THE rule for which site Jarviz may open in its clean browser (start_teardown in server.py, and
+    `python teardown.py browser` and `capture`): a website address (parse_site), with a public name or the user's
+    own localhost. Returns (site, "") or (None, "not_a_site") or (None, "private_site"): a public-looking name
+    that points at this computer or at a private network. `resolves` is the lookup (the offline checks give a stub)."""
+    site = parse_site(text)
+    if site is None:
+        return None, "not_a_site"
+    name = site.host.split(":")[0]
+    if name not in LOCAL_HOSTS and (resolves or resolves_to_private)(name):
+        return None, "private_site"
+    return site, ""
 
 
 def safe_url(value, fallback: str) -> str:
@@ -1989,15 +2046,28 @@ class Bay:
         with self._lock:
             if self.job is not None and self.job.state == "running":
                 raise TeardownError("busy", "A teardown is already running.")
-            job = self.job = Job(site, question, headless)
-        threading.Thread(target=self._run, args=(job, on_done), name=f"teardown-{job.id}", daemon=True).start()
+            before, job = self.job, Job(site, question, headless)
+            self.job = job                  # the reservation: from here on a second start is "busy"
+        try:
+            threading.Thread(target=self._run, args=(job, on_done), name=f"teardown-{job.id}", daemon=True).start()
+        except RuntimeError:                # no thread for the job: take the reservation back, so the next start works
+            with self._lock:
+                if self.job is job:
+                    self.job = before
+            raise TeardownError("not_started", "The teardown could not start: the server could not begin one more "
+                                               "task. Start Jarviz again.") from None
         return job
 
-    def cancel(self) -> Job | None:
+    def cancel(self, job_id: str | None = None) -> Job | None:
+        """Cancel the running job. With `job_id`: only when THAT job is the one running (a test names its own job,
+        so it can never stop another). The check and the cancel are one locked step. Returns the job, or None."""
         with self._lock:
             job = self.job if self.job is not None and self.job.state == "running" else None
+            if job is not None and job_id is not None and job.id != job_id:
+                job = None
+            if job is not None:
+                job.cancel.set()
         if job is not None:
-            job.cancel.set()
             process = job.process
             if process is not None and process.poll() is None:
                 try:
@@ -2106,17 +2176,22 @@ class Bay:
         titles = set(self._note_titles())
         folder = self.folder()
         taken = titles | ({path.stem.casefold() for path in folder.glob("*.md")} if folder.is_dir() else set())
+        pictures = folder / ASSETS_DIR      # a picture on disk takes its name too: a new one never lands on it
+        taken |= {path.stem.casefold() for path in pictures.glob("*.png")} if pictures.is_dir() else set()
         name = note_name(job.site.host, taken)
         seconds = int(time.monotonic() - job.started)
         image = evidence.get("snapshot") or b""
-        image_path = folder / ASSETS_DIR / f"{name}.png"
+        image_path = pictures / f"{name}.png"
         births = job.births                 # kept on the job: a write that fails later must not lose the receipts
         made_folders: list[Path] = []       # the picture's folders that this job made, deepest first
+        wrote_image = False                 # True only when THIS call made the picture file
         try:
             if image:
                 made_folders = _missing_folders(image_path.parent)
                 image_path.parent.mkdir(parents=True, exist_ok=True)
-                image_path.write_bytes(image)
+                with open(image_path, "xb") as handle:      # "x": a new file only, never over one that is there
+                    wrote_image = True
+                    handle.write(image)
             concept_file = self._notes_dir() / CONCEPT_PATH
             if CONCEPT_NAME.casefold() not in titles and not concept_file.exists():
                 # REA first if it is new, then the teardown. (A REA note made by hand is left as it is.)
@@ -2137,9 +2212,9 @@ class Bay:
                                   has_snapshot=bool(image))
             births.append(self._birth(f"{TEARDOWNS_DIR}/{name}.md", content))
         except Exception:
-            if not births or births[-1].get("title") != name:
+            if wrote_image and (not births or births[-1].get("title") != name):
                 try:
-                    image_path.unlink(missing_ok=True)      # no picture without its note
+                    image_path.unlink(missing_ok=True)      # no picture without its note, and only the one made here
                 except OSError:
                     pass                    # a locked file: the notes must still be taken back below
             for path in made_folders:       # rmdir takes only an empty folder, and these are only the job's own
@@ -2407,6 +2482,167 @@ def offline_checks() -> list[tuple[str, bool, str]]:
     other_banners([{"name": "x.js", "text": many}], [])
     results.append(("hostile script text cannot stall the search", time.monotonic() - began < 5.0,
                     f"{time.monotonic() - began:.1f} s"))
+    results += _offline_bay_checks(reply, evidence)
+    return results
+
+
+def _offline_bay_checks(reply: str, evidence: dict) -> list[tuple[str, bool, str]]:
+    """More offline checks: which processes are ours, which sites may open, the pinned REA, the profiles folder,
+    and the bay's start, cancel and picture. No browser, no network, no REA run, no real job thread."""
+    results = []
+    # Which processes are ours: on a Mac or Linux only a profile path right after "=" counts.
+    root = "/home/u/.jarvis-tools/rea/profiles"
+    posix = [("/opt/google/chrome/chrome --type=renderer --user-data-dir=/home/u/.jarvis-tools/rea/profiles/job1 --lang=en", True),
+             ("/Applications/Google Chrome.app/Contents/MacOS/chrome_crashpad_handler "
+              "--database=/home/u/.jarvis-tools/rea/profiles/job1/Crashpad --url=x", True),
+             ("vim /home/u/.jarvis-tools/rea/profiles/job1/chrome_debug.log", False),
+             ("less --log /home/u/.jarvis-tools/rea/profiles/job1 chrome", False),
+             ("/usr/bin/chromium --user-data-dir=/home/u/.config/chromium", False),
+             ("/opt/google/chrome/chrome --user-data-dir=/home/u/.jarvis-tools/rea/profiles-old/job1", False)]
+    windows = [(r'"C:\Program Files\Google\Chrome\Application\chrome.exe" --type=gpu-process '
+                r'--user-data-dir=C:\Users\u\.jarvis-tools\rea\profiles\job1', True),
+               (r'"C:\Program Files\Google\Chrome\Application\chrome.exe" "--user-data-dir=C:\Users\u\.jarvis-tools\rea\profiles\job1"', True),
+               (r'"C:\Program Files\Google\Chrome\Application\chrome.exe" --user-data-dir=C:\Users\u\AppData\Local\Google\Chrome', False)]
+    wrong = [line for line, ours in posix if names_profile(line, root, windows=False) != ours]
+    wrong += [line for line, ours in windows if names_profile(line, r"C:\Users\u\.jarvis-tools\rea\profiles", windows=True) != ours]
+    results.append(("a process is ours only when it runs on a job profile; an editor on a profile file is not",
+                    not wrong and names_profile(posix[0][0], root + "/job1", windows=False), f"wrong: {wrong}"))
+    # Which sites may open: the same rule for the server and the command line. The lookup is a stub.
+    asked: list[str] = []
+
+    def lookup(name: str) -> bool:
+        asked.append(name)
+        return name == "intranet.example.com"
+
+    got = [check_site(text, resolves=lookup)[1] for text in ("intranet.example.com", "example.com", "localhost:3000",
+                                                             "make it pop")]
+    results.append(("a public name that points at a private network is refused, the user's own localhost is not",
+                    got == ["private_site", "", "", "not_a_site"] and asked == ["intranet.example.com", "example.com"],
+                    f"got {got}, looked up {asked}"))
+    # Only the pinned REA runs, and its version is read once per process. No REA process is started here.
+    saved, real_installed, real_find_node = list(_REA_FOUND), globals()["installed_rea"], globals()["find_node"]
+    codes = []
+    try:
+        _REA_FOUND.clear()
+        globals()["find_node"] = lambda: None       # if the pin check ever broke, REA still could not start here
+        for version in ("0.0.1", "0.0.2"):          # the second version is not read: the first one stays
+            globals()["installed_rea"] = lambda version=version: {"version": version, "node_range": ""}
+            try:
+                run_rea("inspect-web-page", "http://127.0.0.1:1/")
+                codes.append("ran")
+            except TeardownError as error:
+                codes.append(f"{error.code} {'0.0.1' in error.detail}")
+    finally:
+        globals()["installed_rea"], globals()["find_node"] = real_installed, real_find_node
+        _REA_FOUND[:] = saved
+    results.append(("REA that is not the pinned version is never run, and the version is read once",
+                    codes == ["rea_not_pinned True", "rea_not_pinned True"], str(codes)))
+    # A profiles folder that is there but cannot be listed is "could not look" (None), never "clean".
+    real_dir, real_iterdir = globals()["PROFILES_DIR"], Path.iterdir
+    with tempfile.TemporaryDirectory() as temp:
+        globals()["PROFILES_DIR"] = Path(temp) / "profiles"
+        try:
+            missing = leftover_profiles()
+            (Path(temp) / "profiles" / "job1").mkdir(parents=True)
+            listed = leftover_profiles()
+
+            def locked_iterdir(self):
+                if self == globals()["PROFILES_DIR"]:
+                    raise PermissionError(13, "Access is denied")
+                return real_iterdir(self)
+
+            Path.iterdir = locked_iterdir
+            try:
+                unreadable = leftover_profiles()
+            finally:
+                Path.iterdir = real_iterdir
+        finally:
+            globals()["PROFILES_DIR"] = real_dir
+    results.append(("a profiles folder that cannot be listed is reported as not looked at, never as clean",
+                    missing == [] and listed == ["job1"] and unreadable is None,
+                    f"missing {missing}, listed {listed}, unreadable {unreadable}"))
+
+    def throwaway_bay(folder: Path, birth) -> Bay:
+        return Bay(notes_dir=lambda: folder, ask=lambda system, message: reply, birth=birth, note_titles=lambda: set(),
+                   writer_name=lambda: "test", voice="plain", plain_line="{host} is done.", unbirth=lambda receipt: None)
+
+    site = Site("https://a.test/", "a.test")
+    # A job whose thread cannot start gives its reservation back, so the next start is let in.
+    bay = throwaway_bay(Path(tempfile.gettempdir()), lambda path, content: {})
+    bay._run = lambda job, on_done: None           # even a thread that did start would open no browser
+    real_start, held = threading.Thread.start, []
+
+    def no_thread(self):
+        if self.name.startswith("teardown-"):
+            raise RuntimeError("can't start new thread")
+        return real_start(self)
+
+    def held_thread(self):                          # the next job is let in, but its thread is held: no browser opens
+        if self.name.startswith("teardown-"):
+            return held.append(self.name)
+        return real_start(self)
+
+    code = None
+    threading.Thread.start = no_thread
+    try:
+        bay.start(site, "how does it work", True)
+    except TeardownError as error:
+        code = error.code
+    finally:
+        threading.Thread.start = real_start
+    free = bay.job is None and not bay.busy()
+    threading.Thread.start = held_thread
+    try:
+        again = bay.start(site, "how does it work", True)
+    except TeardownError as error:
+        again = error.code
+    finally:
+        threading.Thread.start = real_start
+    results.append(("a job whose thread cannot start gives the reservation back, and the next start is let in",
+                    code == "not_started" and free and again is bay.job and len(held) == 1,
+                    f"code {code}, free {free}, again {again}, held {held}"))
+    # A cancel with a job id stops only that job, and only while it runs. Without an id: the job that runs.
+    running, other = Job(site, "q", True), Job(site, "q", True)
+    bay.job = running
+    not_that_one = bay.cancel(job_id=other.id) is None and not running.cancel.is_set()
+    that_one = bay.cancel(job_id=running.id) is running and running.cancel.is_set()
+    bay.job = other
+    any_one = bay.cancel() is other and other.cancel.is_set()
+    ended = Job(site, "q", True)
+    ended.state = "failed"
+    bay.job = ended
+    not_ended = bay.cancel(job_id=ended.id) is None and bay.cancel() is None and not ended.cancel.is_set()
+    results.append(("a cancel that names a job stops only that job, and only while it runs",
+                    not_that_one and that_one and any_one and not_ended,
+                    f"other {not_that_one}, its own {that_one}, no id {any_one}, ended {not_ended}"))
+    # An old picture on disk keeps its name and its bytes: a birth that fails removes only the picture that THIS
+    # write made, and a write that works takes the next name.
+    with tempfile.TemporaryDirectory() as temp:
+        folder = Path(temp)
+        old_name = note_name(site.host, set())
+        pictures = folder / TEARDOWNS_DIR / ASSETS_DIR
+        pictures.mkdir(parents=True)
+        old_bytes = PNG_SIGNATURE + b"old picture"
+        (pictures / f"{old_name}.png").write_bytes(old_bytes)
+
+        def birth(path: str, content: str, fail_at: str = "") -> dict:
+            if path == fail_at:
+                raise OSError("no room")
+            return {"file": path, "title": Path(path).stem}
+
+        raised = False
+        try:
+            throwaway_bay(folder, lambda path, content: birth(path, content, CONCEPT_PATH))._write(
+                Job(site, "q", True), dict(evidence, snapshot=PNG_SIGNATURE + b"new picture"))
+        except OSError:
+            raised = True
+        kept = (pictures / f"{old_name}.png").read_bytes() == old_bytes
+        left = sorted(path.name for path in pictures.glob("*.png") if path.stem != old_name)
+        result = throwaway_bay(folder, birth)._write(Job(site, "q", True), dict(evidence, snapshot=PNG_SIGNATURE + b"new"))
+        named = result.get("name") == f"{old_name}-2" and (pictures / f"{old_name}-2.png").read_bytes() == PNG_SIGNATURE + b"new"
+        kept = kept and (pictures / f"{old_name}.png").read_bytes() == old_bytes
+    results.append(("an old picture keeps its bytes when a teardown fails, and a new one takes the next name",
+                    raised and kept and not left and named, f"raised {raised}, kept {kept}, left {left}, named {named}"))
     return results
 
 
@@ -2416,11 +2652,23 @@ def _print(data) -> None:
     print(json.dumps(data, indent=2, ensure_ascii=True))
 
 
+CLI_REFUSALS = {"not_a_site": "That is not a website address.",
+                "private_site": "That address is on a private network. Jarviz opens public websites, and your own "
+                                "projects on localhost."}
+
+
+def cli_site(address: str) -> Site | None:
+    """The site for a command, by the same rule as a teardown from the server (check_site). None: refused, and said why."""
+    site, refused = check_site(address)
+    if site is None:
+        print(CLI_REFUSALS.get(refused, "That address is refused."))
+    return site
+
+
 def cli_capture(address: str) -> int:
     """Collect the evidence for one page with a hidden browser and print the digest."""
-    site = parse_site(address)
+    site = cli_site(address)
     if site is None:
-        print("That is not a website address.")
         return 2
     started = time.monotonic()
     try:
@@ -2465,10 +2713,12 @@ def cli_browser(url: str) -> int:
             report["scrolled_px"] = (browser.page.evaluate("Math.round(window.scrollY)") or 0) - (before or 0)
     except TeardownError as error:
         report["error"] = f"{error.code}: {error.detail}"
-    report["chrome_left_on_profile"] = len(chrome_pids_using(PROFILES_DIR / job_id))
+    left = chrome_pids_using(PROFILES_DIR / job_id)
+    # None: the list of running programs could not be read. That is "not proven clean", never "clean".
+    report["chrome_left_on_profile"] = "could not look" if left is None else len(left)
     report["profile_folder_gone"] = not (PROFILES_DIR / job_id).exists()
     _print(report)
-    return 0 if "error" not in report and report["profile_folder_gone"] and not report["chrome_left_on_profile"] else 1
+    return 0 if "error" not in report and report["profile_folder_gone"] and left == [] else 1
 
 
 def main(argv: list[str]) -> int:
@@ -2477,7 +2727,7 @@ def main(argv: list[str]) -> int:
         _print(diag())
         return 0
     if command == "browser" and len(argv) > 2:
-        site = parse_site(argv[2])
+        site = cli_site(argv[2])
         return cli_browser(site.url) if site else 2
     if command == "capture" and len(argv) > 2:
         return cli_capture(argv[2])

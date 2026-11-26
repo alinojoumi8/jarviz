@@ -10,11 +10,11 @@ To add a brain: add one entry to PROVIDERS and its two lines to config.json.
 """
 from __future__ import annotations
 
+import http.client
 import json
 import re
 import threading
 import urllib.error
-import urllib.parse
 import urllib.request
 
 try:                    # optional at boot: without the package only the Claude brain is missing
@@ -30,14 +30,20 @@ USER_AGENT = "Jarviz/1.0"
 # with a bigger budget when the text comes back empty.
 MAX_TOKENS = {"chat": (4000, 16000), "teardown": (9000, 16000)}
 # A teardown note is long, so its call may take longer than a chat answer.
-TIMEOUT_S = {"chat": REQUEST_TIMEOUT_S, "teardown": 240.0}
+TIMEOUT_S = {"chat": REQUEST_TIMEOUT_S, "teardown": 240.0, "probe": 60.0}
 # How often the anthropic package may try a failed call again by itself. A teardown waits long for
 # one answer, so it gets no silent second and third wait on top.
 RETRIES = {"chat": 2, "teardown": 0}
 
 # Claude Opus 5.5: thinking is always on, so no thinking setting is ever sent, and no tool choice
 # is forced. Depth is set per route with effort.
-EFFORT = {"chat": "low", "teardown": "medium"}      # casual chat is snappier at low effort
+EFFORT = {"chat": "low", "teardown": "medium", "probe": "low"}      # casual chat is snappier at low effort
+# The probe (preflight) asks one real, very small question on the same path as ask(). The budget is the
+# smallest one each API takes: 1 token for the Messages API, 16 for the max_output_tokens of the Responses API.
+PROBE_TOKENS = {"anthropic": 1, "responses": 16}
+PROBE_SYSTEM = "Answer in one word."
+PROBE_MESSAGES = [{"role": "user", "content": "Reply with the word OK."}]
+KEY_REMOVED = "[key removed]"
 # If Claude declines a question, the API can run it again on a backup model in the same call.
 FALLBACK_BETA = "server-side-fallback-2026-07-01"
 FALLBACK_MODELS = frozenset(
@@ -91,6 +97,24 @@ class BrainError(Exception):
         self.detail = " ".join(str(detail).split())[:300]
         self.label = (brain or {}).get("label", "the")
         self.model = (brain or {}).get("model", "")
+
+
+def scrub_key(error: BrainError, key: str) -> BrainError:
+    """A provider can say the key back in its error text. The key never travels on from here: it becomes
+    "[key removed]". The detail is cut at 300 characters, so a piece of the key at its end goes too."""
+    if len(key) < 8:
+        return error
+
+    def clean(text: str) -> str:
+        text = text.replace(key, KEY_REMOVED)
+        for size in range(len(key) - 1, 7, -1):     # the cut can leave the first part of the key at the end
+            if text.endswith(key[:size]):
+                return text[:-size] + KEY_REMOVED
+        return text
+
+    error.detail = clean(error.detail)
+    error.args = tuple(clean(arg) if isinstance(arg, str) else arg for arg in error.args)
+    return error
 
 
 # ------------------------------------------------------------------- choosing
@@ -171,6 +195,7 @@ def ask(config: dict, route: str, system: str, messages: list[dict]) -> str:
         try:
             text = call(key, brain, spec, route, system, messages, budget)
         except BrainError as error:
+            scrub_key(error, key)
             if attempt and error.code == "bad_request":     # this model cannot take the bigger budget
                 break
             raise
@@ -314,14 +339,24 @@ def _call(method: str, url: str, key: str, body: dict | None, brain: dict, timeo
         with _OPENER.open(request, timeout=timeout) as response:
             payload = _json_of(response.read())
     except urllib.error.HTTPError as error:
-        raise _http_error(error.code, _json_of(error.read()), brain) from None
-    except (urllib.error.URLError, TimeoutError, OSError) as error:
+        try:
+            raw = error.read()
+        except (OSError, http.client.HTTPException, ValueError):
+            raw = b""                       # the error body did not come (a timeout): the status still says why
+        raise _http_error(error.code, _json_of(raw), brain) from None
+    except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException) as error:
+        # HTTPException: the answer broke off in the middle (IncompleteRead). No second try of a generation.
         raise BrainError("api_unreachable", type(error).__name__, brain) from None
     if payload.get("error") and "choices" not in payload and "output" not in payload:
         # some routers answer 200 and put the error in the body
         inner = payload["error"].get("code") if isinstance(payload["error"], dict) else None
         raise _http_error(inner if isinstance(inner, int) else 502, payload, brain)
     return payload
+
+
+def _bad_reply(brain: dict, what: str) -> BrainError:
+    """An answer of a shape the code cannot read. It is a BrainError, never a crash of the route."""
+    return BrainError("bad_reply", f"The answer had an unexpected shape: {what}.", brain)
 
 
 def _text_of(content) -> str:
@@ -349,9 +384,20 @@ def _chat_once(key, brain, spec, route, system, messages, budget) -> str:
         field = second if field == first else first          # this API wants the other name
         data = _call("POST", url, key, {**body, field: budget}, brain, wait)
     _token_field[brain["name"]] = field
-    choice = (data.get("choices") or [{}])[0] or {}
-    message = choice.get("message") or {}
-    text = THINK_RE.sub("", _text_of(message.get("content"))).strip()
+    choices = data.get("choices")
+    if choices is not None and not isinstance(choices, list):
+        raise _bad_reply(brain, "choices is not a list")
+    choice = (choices or [{}])[0]
+    if not isinstance(choice, dict):
+        raise _bad_reply(brain, "a choice is not an object")
+    message = choice.get("message")
+    if message is not None and not isinstance(message, dict):
+        raise _bad_reply(brain, "the message is not an object")
+    message = message or {}
+    content = message.get("content")
+    if content is not None and not isinstance(content, (str, list)):
+        raise _bad_reply(brain, "the message content is not text or a list")
+    text = THINK_RE.sub("", _text_of(content)).strip()
     if not text and (message.get("refusal") or choice.get("finish_reason") == "content_filter"):
         raise BrainError("refused", brain=brain)
     return text
@@ -362,14 +408,20 @@ def _responses_once(key, brain, spec, route, system, messages, budget) -> str:
     body = {"model": brain["model"], "instructions": system, "input": messages,
             "max_output_tokens": budget, "store": False}
     data = _call("POST", spec["base_url"] + "/responses", key, body, brain, TIMEOUT_S.get(route, REQUEST_TIMEOUT_S))
+    output = data.get("output")
+    if output is not None and not isinstance(output, list):
+        raise _bad_reply(brain, "output is not a list")
     texts, refused = [], False
-    for item in data.get("output") or []:
+    for item in output or []:
         if not isinstance(item, dict) or item.get("type") != "message":
             continue
-        for part in item.get("content") or []:
+        content = item.get("content")
+        if content is not None and not isinstance(content, list):
+            raise _bad_reply(brain, "the message content is not a list")
+        for part in content or []:
             if isinstance(part, dict) and part.get("type") == "refusal":
                 refused = True
-        texts.append(_text_of(item.get("content")))
+        texts.append(_text_of(content))
     text = "".join(texts).strip()
     if not text and refused:
         raise BrainError("refused", brain=brain)
@@ -387,12 +439,17 @@ def list_models(config: dict, name: str, limit: int = 8) -> list[str]:
         data = _call("GET", spec["base_url"] + "/models", str(config[spec["key"]]).strip(), None, brain, timeout=20)
     except BrainError:
         return []
-    return [str(item["id"]) for item in data.get("data") or [] if isinstance(item, dict) and item.get("id")][:limit]
+    items = data.get("data") if isinstance(data, dict) else None
+    if not isinstance(items, list):         # an answer of another shape offers no ids
+        return []
+    return [str(item["id"]) for item in items if isinstance(item, dict) and item.get("id")][:limit]
 
 
 def probe(config: dict, name: str | None = None) -> dict:
     """One real, cheap call that proves the key works and the model can be reached.
 
+    Claude and OpenAI: one very small real question on the SAME path that ask() uses (route "probe": the smallest
+    budget, low effort). A model list or a model page does not prove that the key may ask the model anything.
     Returns {"key": (ok, detail), "model": (ok, detail)}. ok is True, False, or None for "not checked".
     """
     brain = describe(config, name)
@@ -405,25 +462,15 @@ def probe(config: dict, name: str | None = None) -> dict:
         if spec["kind"] == "anthropic":
             if anthropic is None:
                 return {"key": (False, "The anthropic package is missing. Run: pip install anthropic"), "model": (None, "")}
-            client = anthropic.Anthropic(api_key=key, timeout=30.0)
-            try:
-                client.models.list(limit=1)
-            except anthropic.APIError as error:
-                raise _claude_error(error, brain) from None
-            try:
-                found = client.models.retrieve(brain["model"])
-            except anthropic.APIError as error:
-                model_error = _claude_error(error, brain)
-                return {"key": (True, ""), "model": (False, _model_trouble(config, brain, model_error))}
-            return {"key": (True, ""), "model": (True, f"{brain['model']} ({getattr(found, 'display_name', '') or 'found'})")}
-        if spec["kind"] == "responses":
-            model_id = urllib.parse.quote(brain["model"], safe="")
-            _call("GET", f"{spec['base_url']}/models/{model_id}", key, None, brain, timeout=30)
+            _claude_once(key, brain, spec, "probe", PROBE_SYSTEM, PROBE_MESSAGES, PROBE_TOKENS["anthropic"])
+        elif spec["kind"] == "responses":
+            _responses_once(key, brain, spec, "probe", PROBE_SYSTEM, PROBE_MESSAGES, PROBE_TOKENS["responses"])
         else:
             body = {"model": brain["model"], "messages": [{"role": "user", "content": "Reply with the word OK."}],
                     _token_field.get(brain["name"], spec["token_fields"][0]): 32, **spec.get("extra", {})}
             _call("POST", spec["base_url"] + "/chat/completions", key, body, brain, timeout=60)
     except BrainError as error:
+        scrub_key(error, key)
         if error.code in ("api_key_invalid", "api_permission"):
             return {"key": (False, f"{brain['label']} refused the key. {error.detail}"), "model": (None, "")}
         if error.code == "api_unreachable":

@@ -139,17 +139,29 @@ def make_note(file_path: Path, notes_dir: Path) -> Note:
     )
 
 
+def _skipped_folder(error: OSError) -> None:
+    """A folder that cannot be listed is skipped, and the build goes on. It is never skipped in silence."""
+    name = Path(error.filename).name if error.filename else "?"
+    print(f"Skipped folder {name}: {error.strerror or error}", file=sys.stderr)
+
+
 def note_files(notes_dir: Path) -> list[Path]:
-    """Every .md file under the folder, in a stable order. Hidden folders are skipped."""
+    """Every .md file under the folder, in a stable order. Hidden folders are skipped.
+    Only a regular file is a note: a named pipe called x.md would stop the build when it is read."""
     found: list[Path] = []
-    for folder, dirs, files in os.walk(notes_dir):
+    for folder, dirs, files in os.walk(notes_dir, onerror=_skipped_folder):
         dirs[:] = [d for d in dirs if not d.startswith(".") and d not in SKIP_DIRS]
         found.extend(
             Path(folder) / name
             for name in files
-            if name.lower().endswith(".md") and not name.startswith(".")
+            if name.lower().endswith(".md") and not name.startswith(".") and (Path(folder) / name).is_file()
         )
-    return sorted(found, key=lambda path: path.relative_to(notes_dir).as_posix().casefold())
+
+    def order(path: Path) -> tuple[str, str]:      # two names that differ only in case still have a fixed order
+        relative = path.relative_to(notes_dir).as_posix()
+        return relative.casefold(), relative
+
+    return sorted(found, key=order)
 
 
 def scan_notes(notes_dir: Path) -> list[Note]:

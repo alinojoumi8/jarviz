@@ -42,8 +42,9 @@ Jarviz has five brains. One is active. The screen shows it at the top (`brain: .
 - Your notes go to the company of the brain that you choose.
 - After you add a key, run `python preflight.py`. It makes one real call to every brain that has a key.
 - [x] Claude: tested with the real key.
-- [x] OpenAI, DeepSeek, Venice, OpenRouter: tested with real keys. Each one answered one real call in preflight.
-- Venice refused its key in one earlier run ("Authentication failed"). In the last run it answered. If it refuses again, make a new key at Venice and type it into `venice_api_key`.
+- [x] DeepSeek, Venice, OpenRouter: tested with real keys. Each one answered one real question in preflight.
+- [ ] OpenAI: the key is accepted, but the account has no credit, so OpenAI cannot answer ("You have no credits remaining"). Add credit at OpenAI, then run `python preflight.py`. An older test only read the model's page and said "ready". The test now asks one real, very small question, so it tells the truth.
+- Venice refused its key in one earlier run ("Authentication failed"). In the last runs it answered. If it refuses again, make a new key at Venice and type it into `venice_api_key`.
 
 ## Part One: the foundation
 
@@ -79,7 +80,7 @@ Still to prove:
 
 Proven with the real brain and a real public site (igloo.inc):
 
-- [x] Last run: `PREFLIGHT: 24 pass, 0 fail, 0 warn` and `DRILL: 60 pass, 0 fail`. Preflight has 24 checks now: four more brains have a key, and one check is new (a save that fails).
+- [x] Last run: `PREFLIGHT: 27 pass, 1 fail, 0 warn` and `DRILL: 67 pass, 0 fail`. The one fail is the OpenAI account: it has no credit (see "Brains"). Preflight has 28 checks now.
 - [x] The drill passed with a hidden browser, and also with the Chrome window on screen (`python drill.py --visible`). The snapshot from the visible window is a real picture.
 - [x] A full teardown in about one minute: 96 files, 14.7 MB, Three.js r165, GSAP 3.12.5, postprocessing 6.35.5.
 - [x] The card shows the 8 steps live, then the snapshot, the stack and the totals. The reader shows the whole note.
@@ -106,11 +107,33 @@ Review:
 - [x] CodeRabbit then read those 4 fixes and gave 8 findings. 6 are fixed:
   - The teardown stops when the browser cannot say where the page is, or when the page is not on a web address. Before, it went on.
   - A take-back deletes a note for good only when the file still holds what Jarviz wrote. A file that someone changed stays.
-  - A save that fails puts the index in memory back first, then the file. The galaxy and the files cannot disagree after it.
+  - A save that fails puts the index in memory back first, then the file. If the file cannot be put back either, the error says where the file is now. Jarviz never puts it back on top of another file.
   - A picture that cannot be deleted no longer stops the take-back of the notes.
   - A `[[link]]` that thousands of notes use can no longer make the server freeze when a note with that name is born.
   - "What did my teardown of stripe.com say?" does not ask for a new teardown.
 - The other 2 findings are one limit that is not closed. It is written under "Not proven" below.
+- [x] CodeRabbit read those fixes again and gave 13 findings. 10 are fixed (a put-back never writes over another file, a take-back checks the file that it will delete, "can you summarize my teardown" starts nothing, and 7 smaller ones). 3 were not real: a trace and a small test showed it.
+- [x] CodeRabbit is now installed on GitHub. Its first review of the whole pull request gave 18 major and 37 minor findings. 43 are fixed. The ones that matter most:
+  - "Do not tear down stripe.com" no longer passes as a request. "How did my teardown of stripe.com work?" no longer starts a new teardown from the page.
+  - A signed request from a tool works one time only.
+  - The brain test asks a real question. (It found that the OpenAI account has no credit.)
+  - No provider error can show a key. A change of brain keeps every other character of `config.json`.
+  - A second start of Jarviz no longer rebuilds the galaxy under the Jarviz that runs. A new `notes_dir` is followed without a restart.
+  - The microphone: a late result after "off" saves nothing. The page never adds a note on top of an old picture of the galaxy.
+  - The teardown receipt goes to the turn that started it. A cancel from a test can stop only its own job.
+- 12 findings are not changed, on purpose:
+  - The drill deletes its own test note also when a program changed it. A test note is not your work.
+  - A cancel that comes while the note is saved: Jarviz already answers "too late, the note is saved".
+  - A link file (symlink) inside your notes folder is read. The folder is yours.
+  - The lock keeps `_door` (the key in the address) next to `_unlocked`. A security review read this design.
+  - An undo that is sent twice can move a new note with the same name to the trash. The trash keeps it.
+  - A tag inside the brain's sentence still runs. The brain writes its line and the tag together, and the tag runs only when you asked.
+  - When a note is saved during a teardown that fails, the Jarviz note can stay. Jarviz says which notes stay.
+  - Preflight does not download the two libraries to check their hash. The browser does that at each start.
+  - The file sizes in a teardown note count a file from the cache with its body size.
+  - An address with a `?` part is refused. Jarviz opens a host and a path only.
+  - three.js stays at 0.186.0. The library inside 3d-force-graph is the same release (r186).
+  - The sample note "Wholesale Price List" is a sample.
 
 The page lock (it was the known gap, it is closed now):
 
@@ -118,7 +141,7 @@ The page lock (it was the known gap, it is closed now):
 - [x] The test tools never send the key. They sign each request with it. `python server.py --link` shows the link only after the server proved that it holds the key. So a program that sits on port 4700 in place of Jarviz gets nothing.
 - [x] The key is in `%USERPROFILE%\.jarvis-tools\page-key`, outside the project. Other accounts on this computer cannot read your home folder.
 - [ ] What no lock can stop: a program that runs as you. It can read the key file. It can read `config.json` too.
-- New key: delete the file `page-key` and start Jarviz again with `start-jarviz.bat`. Every browser must be unlocked again.
+- New key: close Jarviz first (close its window). Then delete the file `page-key`. Then start Jarviz again with `start-jarviz.bat`. Every browser must be unlocked again. A Jarviz that still runs keeps the old key.
 
 The PDF check (what was different from the PDF):
 
@@ -136,7 +159,10 @@ Not proven:
 
 - [ ] "This site" on a Mac (it reads the front Chrome tab). This computer has Windows, so Jarviz asks for the name.
 - [ ] A teardown written by a brain other than Claude.
-- [ ] The clean Chrome and your private network. Jarviz checks where the PAGE is. It does not see each connection that Chrome makes. So a hostile public site can make the clean Chrome send one request to an address on your home network before Jarviz stops the job. Jarviz reads nothing from that page, and the clean Chrome has no logins. An ordinary browser has the same weak point with such a site. To stop the request itself, Jarviz needs a filter between Chrome and the network (a small proxy). That is not built: it is your decision.
+- [ ] The clean Chrome and your private network. Jarviz checks the address of the PAGE. It does not see the connections that Chrome makes. There are two cases:
+  - The page itself moves to a private address. Jarviz sees that and stops the job. But Chrome has already sent the request that went there. Jarviz reads nothing from that page.
+  - The page stays on its public address and asks for things on your home network (a picture, a script, a data call). Jarviz does not see these requests at all, and the job goes on. The same is true when a public name points at a private address only for Chrome.
+  - The clean Chrome has no logins. An ordinary browser has the same weak point with such a site. To stop these requests, Jarviz needs a filter between Chrome and the network (a small proxy). That is not built: it is your decision.
 
 ## Try it
 

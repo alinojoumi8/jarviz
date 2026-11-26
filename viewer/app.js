@@ -408,13 +408,19 @@
       return false;                           // small talk: the galaxy holds still
     }
 
+    function start() {                        // where the camera starts, and the slow idle rotation
+      Graph.cameraPosition({ x: 0, y: 70, z: 560 });
+      Graph.controls().autoRotateSpeed = IDLE_SPIN;
+      spin(true);
+    }
+
     function frame() {                        // the opening shot
       rest(1600 + IDLE_RESUME_MS / 2);
       Graph.zoomToFit(REDUCED_MOTION ? 0 : 1600, 110);
     }
 
     return {
-      stateOf, linkLit, focusNode, lightCluster, clear, apply, frame,
+      stateOf, linkLit, focusNode, lightCluster, clear, apply, start, frame,
       grabbed: () => { clearTimeout(resumeTimer); spin(false); },
       released: () => rest(IDLE_RESUME_MS),
       current: () => ({ primary, lit: [...lit] }),
@@ -438,8 +444,7 @@
       .linkDirectionalParticleWidth(1.3)
       .linkDirectionalParticleSpeed(0.007)
       .onNodeClick(node => Focus.focusNode(node.id))
-      .onBackgroundClick(() => Focus.clear())
-      .cameraPosition({ x: 0, y: 70, z: 560 });
+      .onBackgroundClick(() => Focus.clear());
 
     if (THREE) {
       glowTexture = makeGlowTexture();
@@ -450,9 +455,8 @@
     Graph.d3Force('charge').strength(-75);
     Graph.d3Force('link').distance(40);
 
+    Focus.start();
     const controls = Graph.controls();
-    controls.autoRotateSpeed = IDLE_SPIN;
-    controls.autoRotate = !REDUCED_MOTION;
     controls.addEventListener('start', Focus.grabbed);
     controls.addEventListener('end', Focus.released);
 
@@ -466,6 +470,7 @@
   function addNote(receipt, options = {}) {
     let node = data.nodes[receipt.index];
     if (!node) {
+      if (receipt.index !== data.nodes.length) return null;      // a new star takes the next place: its id is its index
       const parent = data.nodes[receipt.related];
       const origin = parent && Number.isFinite(parent.x) ? parent : { x: 0, y: 0, z: 0 };
       const nudge = () => (Math.random() - 0.5) * 6;
@@ -487,7 +492,7 @@
   }
 
   // Another tab (or build.py) changed the galaxy: read the file again and keep the stars in place.
-  async function reloadGraph() {
+  async function readGraph() {
     const response = await fetch('graph-data.js?fresh=' + Date.now(), { cache: 'no-store' });
     const text = await response.text();
     const fresh = JSON.parse(text.slice(text.indexOf('{'), text.lastIndexOf('}') + 1));
@@ -497,15 +502,49 @@
     });
     Focus.clear();
     setData(nodes, fresh.links.map(link => ({ ...link })));
-    graphState = { build_id: fresh.build_id, rev: fresh.rev };
+    graphState = { build_id: fresh.build_id, rev: fresh.rev };      // the numbers of the file now on screen
+  }
+
+  // One read at a time: a caller that comes while a read is in the air gets that read.
+  // So an older read can never land after a newer one, and clear the focus of a newer answer.
+  let reading = null;
+  function reloadGraph() {
+    if (!reading) reading = readGraph().finally(() => { reading = null; });
+    return reading;
   }
 
   // `births` = how many notes this reply added or took away (the server counts one step for each).
+  // It says what it found:
+  //   'base'      the page was right before the reply: the reply's change is applied here
+  //   'reloaded'  the file was read again: it already holds the truth, nothing is replayed on top
+  //   'failed'    the read failed: change nothing, and keep the old numbers so the next reply reads again
   async function syncGraph(meta, births = 0) {
-    if (!meta) return;
-    const expected = graphState.rev + births;
-    if (meta.build_id !== graphState.build_id || meta.rev !== expected) await reloadGraph();
-    graphState = { build_id: meta.build_id, rev: meta.rev };
+    if (!meta) return 'base';
+    while (reading) await reading.catch(() => {});     // a read in the air first: its numbers decide
+    if (meta.build_id === graphState.build_id && meta.rev === graphState.rev + births) {
+      graphState = { build_id: meta.build_id, rev: meta.rev };
+      return 'base';
+    }
+    try {
+      await reloadGraph();
+    } catch (error) {
+      console.warn('Could not refresh the galaxy', error);
+      return 'failed';
+    }
+    return 'reloaded';
+  }
+
+  // A reply's new notes, by what syncGraph found. 'base': they are born here, in order. 'reloaded': the
+  // file already holds them, so only the newest is pulsed and focused, and only when its place holds the
+  // same note. 'failed': the galaxy stays as it is.
+  function placeBirths(receipts, found, quiet = false) {
+    if (found === 'base') {
+      receipts.forEach((receipt, index) => addNote(receipt, { quiet: quiet || index < receipts.length - 1 }));
+      return;
+    }
+    const newest = receipts[receipts.length - 1];
+    const there = found === 'reloaded' && newest ? data.nodes[newest.index] : null;
+    if (there && there.label === newest.node.label) addNote(newest, { quiet });
   }
 
   // ------------------------------------------------------- status and text
@@ -613,14 +652,19 @@
     showHeard((buffer.pending() + ' ' + interim).trim() + ' …');
   }
 
+  // Only the live session acts. A stopped or replaced recognizer can still send a result from audio it
+  // already had: it is dropped, so "remember that ..." never saves a note after the microphone is off.
+  const live = rec => mic.on && mic.rec === rec;
+
   function micStart() {
     if (!Recognition) return;
     const rec = new Recognition();
     rec.continuous = true;
     rec.interimResults = true;
     rec.lang = /^en/i.test(navigator.language || '') ? navigator.language : 'en-GB';
-    rec.onresult = onSpeech;
+    rec.onresult = event => { if (live(rec)) onSpeech(event); };
     rec.onerror = event => {
+      if (!live(rec)) return;
       if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
         micStop();
         showAnswer('The microphone is blocked. Allow it with the icon in the address bar, then press the button again.', true);
@@ -629,12 +673,12 @@
       }
     };
     rec.onend = () => {                               // Chrome ends a session after some silence: start again
-      if (!mic.on || mic.rec !== rec) return;
+      if (!live(rec)) return;
       if (mic.failures >= 5) {
         micStop();
         return showAnswer('Speech recognition keeps failing. Check the internet connection, then press the button again.', true);
       }
-      setTimeout(() => { if (mic.on && mic.rec === rec) { try { rec.start(); } catch (error) { micStart(); } } }, 250);
+      setTimeout(() => { if (live(rec)) { try { rec.start(); } catch (error) { micStart(); } } }, 250);
     };
     mic.rec = rec;
     mic.on = true;
@@ -644,11 +688,12 @@
   }
 
   function micStop() {
-    mic.on = false;
+    const rec = mic.rec;
+    mic.on = false;                                   // not live any more BEFORE it stops: a late result is dropped
+    mic.rec = null;
     mic.failures = 0;
     buffer.cancel();
-    if (mic.rec) { try { mic.rec.stop(); } catch (error) { /* not running */ } }
-    mic.rec = null;
+    if (rec) { try { rec.stop(); } catch (error) { /* not running */ } }
     $('mic').setAttribute('aria-pressed', 'false');
     showHeard('');
     settle();
@@ -687,7 +732,10 @@
     }
   }
 
+  let sends = 0;                // every send gets a number: only the newest one owns the answer, the focus and the card
+
   async function send(path, body, unreachable) {
+    const mine = ++sends;
     let reply;
     try {
       reply = await post(path, body);
@@ -695,29 +743,30 @@
       if (error.name !== 'AbortError') say(unreachable, true);    // never fail silently
       return;
     }
-    await handleReply(reply);
+    await handleReply(reply, mine);
   }
 
-  async function handleReply(reply) {
+  async function handleReply(reply, mine) {
     const action = reply.ok === false ? null : reply.action || null;
-    const changed = action && (action.type === 'remember' || action.type === 'forget') ? 1 : 0;
-    try {
-      await syncGraph(reply.graph, changed);
-    } catch (error) {
-      console.warn('Could not refresh the galaxy', error);
-    }
-    say(reply.answer || '', reply.ok === false);
+    const type = action ? action.type : null;
+    const found = await syncGraph(reply.graph, type === 'remember' || type === 'forget' ? 1 : 0);
+    // A newer sentence started while this one waited: it owns the answer. This reply only mends the galaxy.
+    const owner = mine === sends;
+    if (owner) say(reply.answer || '', reply.ok === false);   // also after a failed read: the save did happen
+    if (owner && reply.error === 'failed') Teardown.failureTold();   // the cancel reply said why the job failed
     if (reply.brain && reply.ok !== false) showBrain(reply.brain);
-    if (action && action.type === 'remember') {
+    if (type === 'remember') {
       lastCapture = action.receipt;
-      addNote(action.receipt);
-    } else if (action && action.type === 'forget') {
-      removeNote(action.index);
+      placeBirths([action.receipt], found, !owner);
+    } else if (type === 'forget') {
+      if (found === 'base') removeNote(action.index);  // after a new read the file already holds the truth
       lastCapture = null;
-    } else if (action && action.type === 'teardown') {
+    } else if (type === 'teardown') {
       Teardown.follow(action.job);                    // a teardown started: the card shows its steps
-    } else if (action && action.type === 'teardown_cancel') {
+    } else if (type === 'teardown_cancel') {
       Teardown.cancelled();
+    } else if (!owner) {
+      return;                     // a late answer moves no camera; the card above follows the job, and speaks nothing
     } else {
       Focus.apply(Core.planFocus(reply.nodes));
     }
@@ -769,6 +818,9 @@
     let misses = 0;
     let card = null;            // the finished teardown on the card
     let quietEnd = false;       // the user cancelled: Jarviz already said so
+    let failTold = false;       // the cancel reply already said why the followed job failed
+    let round = 0;              // goes up at each follow(): a status answer from an older round is dropped
+    let opening = 0;            // the newest request to open the reader: closeReader drops it
 
     const fetchJson = async path => (await fetch(path, { cache: 'no-store' })).json();
     const imageUrl = name => '/teardown/image?name=' + encodeURIComponent(name);
@@ -851,22 +903,22 @@
 
     async function finish(job, meta) {
       following = null;
+      const told = (quietEnd && job.state === 'cancelled') || (failTold && job.state === 'failed');
+      failTold = false;
       if (job.state !== 'done') {
         paintJob(job, job.state === 'cancelled' ? 'Cancelled.' : 'It stopped at this step.');
-        if (!(quietEnd && job.state === 'cancelled')) say(job.say || '', true);
+        if (!told) say(job.say || '', true);
         quietEnd = false;
+        // A note the server could not take back is still in the file. When the numbers moved, read the
+        // galaxy again. The receipts of a job that failed are never replayed as births.
+        await syncGraph(meta);
         return;
       }
       const result = job.result;
       if (!born.has(job.id)) {
         born.add(job.id);
-        try {
-          await syncGraph(meta, result.births.length);
-        } catch (error) {
-          console.warn('Could not refresh the galaxy', error);
-        }
         // The same door as a capture: REA first if it is new, then the teardown, and the camera flies to it.
-        result.births.forEach((receipt, index) => addNote(receipt, { quiet: index < result.births.length - 1 }));
+        placeBirths(result.births, await syncGraph(meta, result.births.length));
       }
       paintCard(result, `Taken apart in ${result.seconds} s`);
       say(result.spoken);
@@ -874,16 +926,19 @@
 
     async function poll() {
       timer = null;
+      const mine = round;                             // the follow() this request belongs to
       let status;
       try {
         status = await fetchJson('/teardown/status');
-        misses = 0;
       } catch (error) {
+        if (mine !== round) return;                   // follow() started a new watch meanwhile, with its own poll
         misses += 1;
         if (misses > 8) { following = null; return say(lines.unreachable, true); }
         timer = setTimeout(poll, POLL_MS * 3);
         return;
       }
+      if (mine !== round) return;                     // an answer about the job this tab watched before
+      misses = 0;
       if (status.ok === false) { following = null; return say(status.answer || lines.unreachable, true); }
       const job = status.job;
       if (!job || job.id !== following) { following = null; return; }
@@ -897,6 +952,8 @@
 
     function follow(job) {
       if (!job || !job.id) return;
+      round += 1;
+      failTold = false;
       following = job.id;
       misses = 0;
       closeReader();
@@ -918,9 +975,9 @@
 
     const cancel = () => send('/teardown/cancel', { session: SESSION }, lines.cancel_unreachable);
 
-    async function loadLast() {
+    async function loadLast(wanted = () => true) {    // `wanted` false: the request was dropped, the card stays shut
       const reply = await fetchJson('/teardown/last');
-      if (reply.card) paintCard(reply.card, reply.card.seconds ? `Taken apart in ${reply.card.seconds} s` : 'On file');
+      if (reply.card && wanted()) paintCard(reply.card, reply.card.seconds ? `Taken apart in ${reply.card.seconds} s` : 'On file');
       return reply;
     }
 
@@ -933,6 +990,7 @@
     }
 
     function closeReader() {
+      opening += 1;                                   // a note still on its way does not open the reader again
       $('reader').hidden = true;
       $('reader-body').replaceChildren();
     }
@@ -947,12 +1005,16 @@
     }
 
     async function openReader() {                     // "open the full teardown"
+      const mine = ++opening;
+      const wanted = () => mine === opening;          // false once the reader was closed (or opened again) meanwhile
       try {
         if (!card) {
-          const reply = await loadLast();
+          const reply = await loadLast(wanted);
+          if (!wanted()) return;
           if (!reply.card) return say(reply.answer || '');
         }
         const note = await fetchJson('/teardown/note?name=' + encodeURIComponent(card.name));
+        if (!wanted()) return;
         if (!note.ok) return say(note.answer || lines.teardown_missing, true);
         $('reader-title').textContent = note.label;
         const text = String(note.text).replace(/^#\s+.*\n+/, '');         // the title is already on top
@@ -967,17 +1029,19 @@
         $('reader-body').scrollTop = 0;
         fit();
       } catch (error) {
-        say(lines.unreachable, true);
+        if (wanted()) say(lines.unreachable, true);
       }
     }
 
     function close() {                                // "close the teardown": the reader first, then the card
       if (!$('reader').hidden) return closeReader();
+      closeReader();                                  // a reader still on its way stays shut too
       $('teardown').hidden = true;
     }
 
     return { start, cancel, follow, resume, showLast, openReader, closeReader, close, fit,
-             cancelled: () => { quietEnd = true; }, current: () => ({ following, card }) };
+             cancelled: () => { quietEnd = true; }, failureTold: () => { if (following) failTold = true; },
+             current: () => ({ following, card }) };
   })();
 
   // Voice routes: checked in this order BEFORE a sentence goes to the brain.

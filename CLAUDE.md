@@ -32,9 +32,14 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
   change is done. When something breaks, add a check for it.
 - Every API key lives only in `config.json` in the project root. Never in `viewer/`, never in a response,
   never in a log. Never ask the user to paste a key into a chat. They type it into the file.
-- The server writes to `config.json` in one place only: `save_brain_choice` changes the `"brain"` line
-  and keeps every other line. A new brain is one entry in `PROVIDERS` (`brains.py`) plus its key line
-  and model line in `config.json`. Model ids change often: read the provider's documents, do not guess.
+- The server writes to `config.json` in two places only. `write_starter_config` (from `main()`) makes the file
+  when there is none, and never writes over one. `save_brain_choice` changes the text of the `"brain"` entry
+  and keeps every other character; it reads the new text back before it replaces the file. `load_config` never
+  writes. A new brain is one entry in `PROVIDERS` (`brains.py`) plus its key line and model line in
+  `config.json`. Model ids change often: read the provider's documents, do not guess.
+- Preflight proves a brain with one very small real question on the same path as `ask()` (route `"probe"` in
+  `EFFORT` and `TIMEOUT_S`). A model list does not prove that a key may ask the model. An error text from a
+  provider goes through `scrub_key` before it travels on.
 - A provider call never follows a redirect (the key would go with it).
 - The server binds 127.0.0.1 and serves only `viewer/`.
 - The page lock: every request needs the page key. A browser brings it as the cookie `jarviz_key`. A tool signs
@@ -42,6 +47,8 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
   place decides: `Handler._unlocked` in `server.py`. A new route is locked without more work. Do not add a route
   that answers before that check. The one exception is `/lock/proof`: it proves that the server holds the key and
   shows nothing about it.
+- A signature works once: `claim_signature` (called in `_unlocked`) keeps its nonce until its time is over. The
+  same signed request a second time is locked out. Every tool call is signed anew.
 - A signature is never traded for the cookie: `Handler._door` gives the cookie only to a caller that brought the
   key itself. A signature names the start of the server (`INSTANCE`), so it is worth nothing after a restart.
 - No tool and no test sends the key itself, in a header, a cookie or an address. `python server.py --link` shows
@@ -64,7 +71,9 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
 - A control tag runs only when the user's own sentence asks for that action. Every tag in
   `TAG_HANDLERS` needs an entry in `TAG_INTENT` (`server.py`). Text inside a note can never order an action.
   A sentence that only mentions a website does not ask for a teardown. A sentence about a teardown that is there
-  ("what did my teardown of stripe.com say") does not ask for a new one (`ABOUT_TEARDOWN_RE`).
+  ("what did my teardown of stripe.com say") does not ask for a new one, and "do not tear down stripe.com"
+  does not ask for one (`asks_for_teardown`). The page's own voice route follows the same idea: a question starts
+  a teardown only when its subject IS the site (`matchTeardown` in `viewer/core.js`).
 - Note text is never HTML. The viewer uses `textContent` only. Labels given to the 3D library go
   through `Core.escapeHtml`.
 - The two outside libraries are pinned in three places that must agree: `GRAPH_LIB_URL` and
@@ -85,7 +94,8 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
   Jarviz never attaches to a browser that it did not start.
 - One place starts a teardown: `start_teardown` in `server.py`. Websites only (`teardown.parse_site`), one at a time.
   Public names and the user's own `localhost` only: no private-network names (`PRIVATE_ENDINGS`,
-  `resolves_to_private`). The `[TEARDOWN:site|question]` tag runs only for a site whose own name is a word in the
+  `resolves_to_private`). `teardown.check_site` is THE rule for which site may open: the server and the commands
+  `python teardown.py browser` and `capture` both use it. The `[TEARDOWN:site|question]` tag runs only for a site whose own name is a word in the
   user's sentence (`named_by_user`), and "this" only when the user said "this site".
 - During a teardown, `_refuse_local_turn` reads where the page is. A private address, an address that is not a web
   address, or no answer from the browser stops the job. It does not see each connection that Chrome makes: that
@@ -96,15 +106,25 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
 - A teardown that fails takes back the notes it made (`Galaxy.unbirth`), newest first. `unbirth` deletes a file only
   when it still holds the bytes that `birth_note` wrote (`Galaxy._born`). A file that someone changed stays.
 - A birth, a take-back or a forget that fails puts the index in memory back first (`Galaxy._restore`), then the file.
-  A clean-up that fails never hides the error that stopped the work.
+  A clean-up that fails never hides the error that stopped the work. A file is never put back on top of another file.
 - Every evidence line in the digest starts with who captured it (`EVIDENCE_TAGS`). The brain writes the note text.
   Code writes the Evidence section and the facts block on top.
 - Everything that comes out of the inspected website is data from a stranger: REA's output, the page reads (they
   run inside the page, so the page can change their answers), and the brain's teardown text. Every number goes
   through `_count`, every text through `_site_text` or `_clean`, every address through `safe_url`. The brain's text
   goes through `tame_note`, and its spoken line through `risky_spoken`, before it is saved or said.
-- A check that cannot look says so. `investigation_chromes()` returns `None` when the system could not be asked.
-  `None` is never a pass.
+- A check that cannot look says so. `investigation_chromes()` and `leftover_profiles()` return `None` when the
+  system could not be asked. `None` is never a pass. In preflight, a probe that got no answer is not a refusal
+  (`try_probe`): the check fails and names it.
+- `/teardown/cancel` with `{"job": id}` stops only that job. A test always sends an id: the drill its own job,
+  preflight a made-up one. Without an id it stops the job that runs now (the voice command).
+- A teardown receipt goes on the turn that started the job (`Session.record` returns the turn). A start that is
+  refused leaves no turn behind.
+- `run_rea` runs only the pinned REA version. On a Mac or Linux a process is "our Chrome" only when the profile
+  path stands right after "=" in its command line (`names_profile`): a program that only opened a file there is
+  never stopped.
+- `main()` takes the port first and loads the galaxy after it. A second start that finds the port busy changes
+  nothing. `Galaxy.refresh_if_rebuilt` follows the `notes_dir` that `config.json` names now.
 - Library fingerprints live in ONE table (`FINGERPRINTS`). A "presence" pattern must be a string that only that
   library has: a name that other libraries also mention proves nothing.
 - `/teardown/note` and `/teardown/image` serve only files inside the teardowns folder (`valid_name`). The card and

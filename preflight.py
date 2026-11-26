@@ -28,7 +28,11 @@ import server
 import teardown
 
 PASS, FAIL, WARN = "pass", "fail", "warn"
-CODE_WORD = "marmalade"
+
+
+def new_code_word() -> str:
+    """A made-up word that is easy to say, new for every run: "kotabeli". No note holds it before the test."""
+    return "".join(secrets.choice("bdfgklmnprstvz") + secrets.choice("aeiou") for _ in range(4))
 
 # Every way a browser might ask for the key file. None may work.
 CONFIG_PROBES = (
@@ -114,6 +118,9 @@ console.log(JSON.stringify({
   teardowns: ['reverse engineer igloo dot inc', 'tear down linear.app', 'how does stripe.com do that', 'what is example.com built with',
               'how does this site do that', 'Tear down the old shed', 'how should I reverse engineer my pricing',
               'what do we charge Hotel Marlowe', 'how does server.py work', 'Tear down Example.com/Docs'].map(s => { const hit = Core.matchTeardown(s); return hit ? hit.site : null; }),
+  questions: ['How did my teardown of stripe.com work?', 'What does my last teardown of igloo.inc use?', 'Do not tear down stripe.com',
+              'How does stripe.com work?', 'How does the stripe.com homepage work?', 'What is igloo.inc built with?',
+              'How does this site work?'].map(s => { const hit = Core.matchTeardown(s); return hit ? hit.site : null; }),
   addresses: ['igloo dot inc', 'stripe.com slash pricing', 'localhost:5001', 'make it pop', 'wikipedia.org'].map(s => Core.findAddress(s)),
   commands: [['last', 'show me the last teardown'], ['open', 'open the full teardown'], ['close', 'close the teardown'],
              ['cancel', 'cancel the teardown'], ['close', 'tear down the old shed']].map(([k, s]) => Core.TEARDOWN_COMMANDS[k].test(s)),
@@ -202,6 +209,18 @@ def call_json(method: str, path: str, body: dict | None = None) -> tuple[int, di
     except ValueError:
         parsed = {}
     return status, parsed if isinstance(parsed, dict) else {}
+
+
+def try_probe(send) -> tuple[str, object]:
+    """Send one probe. ("answer", what came back), ("not_sent", why) when the client itself would not send it, or
+    ("no_answer", why) when it went out and no answer came. Only an answer can show that the server refused:
+    a probe with no answer is NOT verified, never "refused"."""
+    try:
+        return "answer", send()
+    except (http.client.InvalidURL, ValueError) as error:       # before sending: a path or header http.client refuses
+        return "not_sent", type(error).__name__
+    except (OSError, http.client.HTTPException) as error:       # a timeout, a reset, a broken answer
+        return "no_answer", type(error).__name__
 
 
 def short(text: str, limit: int = 90) -> str:
@@ -317,11 +336,13 @@ def check_remember(report: Report, ctx: dict) -> None:
     captures = notes_dir / server.CAPTURES_DIR
     captures_was_there = captures.is_dir()
     token = "zq" + secrets.token_hex(3)
+    code_word = new_code_word()             # new in every run: an answer that holds it can only come from the note
     problems: list[str] = []
     brain_note = ""
+    sourced = ""
     receipt: dict = {}
     try:
-        status, body = call_json("POST", "/remember", {"text": f"Preflight probe {token}: the code word is {CODE_WORD}",
+        status, body = call_json("POST", "/remember", {"text": f"Preflight probe {token}: the code word is {code_word}",
                                                        "session": ctx["session"]})
         receipt = (body.get("action") or {}).get("receipt") or {}
         if status != 200 or not receipt:
@@ -345,8 +366,10 @@ def check_remember(report: Report, ctx: dict) -> None:
                                                              "session": "preflight-" + secrets.token_hex(4)})
                 if status != 200:
                     problems.append(f"/chat gave HTTP {status} ({answer.get('error')})")
-                elif index not in answer.get("nodes", []) and CODE_WORD not in answer.get("answer", "").lower():
-                    problems.append("/chat did not use the new note in its very next answer")
+                elif code_word not in str(answer.get("answer", "")).lower():
+                    problems.append("/chat did not use the new note in its very next answer (the code word is not in it)")
+                sourced = ("it named the note as a source" if index in (answer.get("nodes") or [])
+                           else "it did not name the note as a source")
     finally:
         if receipt:                                  # tests clean up after themselves
             status, gone = call_json("POST", "/forget", {"index": receipt["index"], "label": receipt["title"],
@@ -367,7 +390,7 @@ def check_remember(report: Report, ctx: dict) -> None:
     elif brain_note:
         report.add(WARN, name, "File written, indexed, found by search, then removed. " + brain_note)
     else:
-        report.add(PASS, name, "written, indexed, used by /chat, then removed")
+        report.add(PASS, name, f"written, indexed, used by /chat ({sourced}), then removed")
 
 
 def check_links_stay_true(report: Report) -> None:
@@ -443,6 +466,10 @@ def check_links_stay_true(report: Report) -> None:
             trouble.append("a note named Big Topic marks the crowded [[Big Topic]] as flipped when it goes")
         take_back()
         same("the note named Big Topic is taken back")
+        birth(make("Big Topic", "What the big cards are filed under. See also [[Big Topic]]."))   # it links to itself
+        same("a note named Big Topic that links to [[Big Topic]] is born")
+        take_back()
+        same("the note named Big Topic that links to itself is taken back")
     if not trouble and not mended:
         trouble.append("no link among the other notes changed, so the check proved nothing")
     report.add(FAIL if trouble else PASS, name,
@@ -451,157 +478,473 @@ def check_links_stay_true(report: Report) -> None:
 
 def check_take_back_safe(report: Report) -> None:
     """A birth, a take-back (unbirth) or a forget that fails leaves the index in memory as it was, and the note's
-    file where it was. A take-back deletes only the bytes that Jarviz wrote. Pure: a test Galaxy over a temporary
-    folder, with a fake save. It never builds and never writes the real viewer/graph-data.js. No server."""
+    file where it was. A take-back deletes only the bytes that Jarviz wrote, and a put-back never writes over a
+    file. Pure: a test Galaxy over a temporary folder, with a fake save. No server. For the length of the check,
+    build.write_graph is a recorder: the check fails if anything called it."""
     name = "A note that fails to be born or taken back leaves the index and its file as they were"
     trouble: list[str] = []
-    stamp = build.GRAPH_PATH.stat().st_mtime_ns if build.GRAPH_PATH.exists() else None
-    with tempfile.TemporaryDirectory() as folder:
-        notes_dir = Path(folder).resolve()
-        galaxy = server.Galaxy()
-        galaxy.notes_dir = notes_dir
-        galaxy.refresh_if_rebuilt = lambda: None        # Galaxy.load() would run build.build(): it writes the real file
-        save = {"error": None}
-
-        def fake_save() -> None:                        # the real one writes viewer/graph-data.js
-            if save["error"] is not None:
-                raise save["error"]
-
-        galaxy._save_graph = fake_save
-        state = lambda: ([note.path for note in galaxy.notes], set(galaxy.links), galaxy.rev)   # noqa: E731
-
-        def expect(step: str, error_type, action) -> BaseException | None:
-            try:
-                action()
-            except error_type as error:
-                return error
-            except Exception as error:                  # noqa: BLE001 - the wrong error is a finding
-                trouble.append(f"{step}: {type(error).__name__} instead of {error_type.__name__}")
-                return error
-            trouble.append(f"{step}: no {error_type.__name__}")
-            return None
-
-        def true_links(step: str) -> None:
-            if galaxy.links != set(build.compute_links(galaxy.notes)):
-                trouble.append(f"{step}: the links differ from a full rebuild")
-
-        try:
-            galaxy.birth_note("Card one.md", "# Card one\n\nFiled under [[Shared Idea]].\n")
-            galaxy.birth_note("Card two.md", "# Card two\n\nFiled under [[Shared Idea]].\n")
-            idea = "# Shared Idea\n\nWhat the cards are filed under.\n"     # its birth changes the link between the cards
-
-            # (a) The save fails after the note is in the index: the index is as before, and no file is left.
-            for error in (OSError(28, "No space left on device"), RuntimeError("a bug in the index")):
-                before, save["error"] = state(), error
-                expect(f"(a) a birth whose save fails with {type(error).__name__}", type(error),
-                       lambda: galaxy.birth_note("captures/Shared Idea.md", idea))
-                save["error"] = None
-                if state() != before:
-                    trouble.append(f"(a) after a {type(error).__name__} in the save, the index is not as before")
-                if (notes_dir / "captures" / "Shared Idea.md").exists():
-                    trouble.append(f"(a) after a {type(error).__name__} in the save, the file is still there")
-            # ...and when the file cannot be removed either, the error of the save is still the one raised.
-            real_unlink = Path.unlink
-
-            def stuck_unlink(self, *args, **kwargs):
-                if self.name == "Shared Idea.md":
-                    raise PermissionError(13, "The file is in use")
-                return real_unlink(self, *args, **kwargs)
-
-            before, save["error"] = state(), OSError(28, "No space left on device")
-            Path.unlink = stuck_unlink
-            try:
-                error = expect("(a) a birth whose save fails and whose file cannot be removed", OSError,
-                               lambda: galaxy.birth_note("captures/Shared Idea.md", idea))
-            finally:
-                Path.unlink = real_unlink
-                save["error"] = None
-            if state() != before or getattr(error, "errno", None) != 28:
-                trouble.append(f"(a) a file that cannot be removed changed the index or hid the first error: {error!r}")
-            (notes_dir / "captures" / "Shared Idea.md").unlink(missing_ok=True)
-            true_links("(a)")
-
-            # (b) A take-back whose save fails: the index is as before, and the file is back with the same bytes.
-            receipt = galaxy.birth_note("teardowns/Shared Idea.md", idea)
-            path = notes_dir / "teardowns" / "Shared Idea.md"
-            data, before = path.read_bytes(), state()
-            save["error"] = OSError(28, "No space left on device")
-            expect("(b) a take-back whose save fails", OSError, lambda: galaxy.unbirth(receipt))
-            save["error"] = None
-            if state() != before or not path.is_file() or path.read_bytes() != data:
-                trouble.append("(b) after a failed save, the index or the file is not as before")
-            if list(path.parent.glob("*.taken*")):
-                trouble.append("(b) a .taken file was left")
-
-            # (c) The save fails AND the file cannot be put back: the index is as before, the error says so, and the
-            # bytes are still in the folder. Only a move back from a .taken name fails, and only in this step.
-            real_replace = os.replace
-
-            def stuck_replace(source, destination, *args, **kwargs):
-                if str(source).endswith(".taken"):
-                    raise PermissionError(13, "The file is in use")
-                return real_replace(source, destination, *args, **kwargs)
-
-            save["error"] = OSError(28, "No space left on device")
-            os.replace = stuck_replace
-            try:
-                error = expect("(c) a take-back whose save and put-back fail", OSError, lambda: galaxy.unbirth(receipt))
-            finally:
-                os.replace = real_replace
-                save["error"] = None
-            if state() != before:
-                trouble.append("(c) after a failed save and put-back, the index is not as before")
-            if error is not None and (".taken" not in str(error) or error.__cause__ is None):
-                trouble.append(f"(c) the error does not say where the file is, or hides the first error: {error}")
-            kept = [file for file in notes_dir.rglob("*") if file.is_file() and file.read_bytes() == data]
-            if not kept:
-                trouble.append("(c) the bytes of the note are gone from the folder")
-            for file in kept:                               # put the file back by hand, as a person would
-                if file != path:
-                    os.replace(file, path)
-
-            # (f) A clean take-back: the note is gone, no .taken file is left, the links are a full rebuild's.
-            galaxy.unbirth(receipt)
-            if path.exists() or list(notes_dir.rglob("*.taken*")) or receipt["file"] in galaxy._born:
-                trouble.append("(f) after a clean take-back, the file, a .taken file or its fingerprint is left")
-            if receipt["title"] in [note.label for note in galaxy.notes]:
-                trouble.append("(f) after a clean take-back, the note is still in the index")
-            true_links("(f)")
-
-            # (d) A forget whose save fails: the index is as before, the file is back, the trash is empty.
-            capture = galaxy.remember("the till was short on Tuesday")
-            path = notes_dir / capture["file"]
-            data, before = path.read_bytes(), state()
-            save["error"] = OSError(28, "No space left on device")
-            expect("(d) a forget whose save fails", OSError, lambda: galaxy.forget_last(capture["index"], capture["title"]))
-            save["error"] = None
-            trash = notes_dir / server.CAPTURES_DIR / server.TRASH_DIR
-            if state() != before or not path.is_file() or path.read_bytes() != data or any(trash.glob("*")):
-                trouble.append("(d) after a failed save, the index, the file or the trash is not as before")
-            galaxy.forget_last(capture["index"], capture["title"])
-
-            # (e) The file was changed after the birth (an editor plug-in): it stays, with the change, and so does
-            # the note. A note this run did not make (no fingerprint) stays too.
-            receipt = galaxy.birth_note("teardowns/Teardown edited.md", "# Teardown edited\n\nJarviz wrote this.\n")
-            path = notes_dir / receipt["file"]
-            path.write_bytes(path.read_bytes() + b"An editor added this.\n")
-            edited, before = path.read_bytes(), state()
-            expect("(e) a take-back of a changed file", ValueError, lambda: galaxy.unbirth(receipt))
-            if state() != before or not path.is_file() or path.read_bytes() != edited:
-                trouble.append("(e) a changed file or its note did not stay as it was")
-            galaxy._born.pop(receipt["file"], None)
-            path.write_bytes(b"# Teardown edited\n\nJarviz wrote this.\n")
-            expect("(e) a take-back of a note with no fingerprint", ValueError, lambda: galaxy.unbirth(receipt))
-            if state() != before or not path.is_file():
-                trouble.append("(e) a note with no fingerprint did not stay")
-            true_links("(e)")
-        except Exception as error:                  # noqa: BLE001 - a check that stops says so, it never crashes preflight
-            trouble.append(f"the check stopped: {type(error).__name__}: {error}")
-    if (build.GRAPH_PATH.stat().st_mtime_ns if build.GRAPH_PATH.exists() else None) != stamp:
-        trouble.append("the real viewer/graph-data.js was written")
+    real_write, writes = build.write_graph, []
+    build.write_graph = lambda *args, **kwargs: writes.append(args)
+    try:
+        with tempfile.TemporaryDirectory() as folder:
+            _take_back_steps(Path(folder).resolve(), trouble)
+    except Exception as error:                      # noqa: BLE001 - a check that stops says so, it never crashes preflight
+        trouble.append(f"the check stopped: {type(error).__name__}: {error}")
+    finally:
+        build.write_graph = real_write
+    if writes:
+        trouble.append(f"build.write_graph was called {len(writes)} times: only the fake save may run")
     report.add(FAIL if trouble else PASS, name,
                "; ".join(trouble) or "birth, take-back and forget: the index and the file came back each time; "
-                                     "a changed file stays")
+                                     "a changed file stays; a new file at the old place is never written over")
+
+
+def _take_back_steps(notes_dir: Path, trouble: list[str]) -> None:
+    """The steps of check_take_back_safe. Each step leaves the folder and the index ready for the next one."""
+    galaxy = server.Galaxy()
+    galaxy.notes_dir = notes_dir
+    galaxy.refresh_if_rebuilt = lambda: None        # Galaxy.load() would run build.build() over the real notes
+    save: dict = {"error": None, "first": None}     # "first" runs inside the save, before its error
+
+    def fake_save() -> None:                        # the real one writes viewer/graph-data.js
+        if save["first"] is not None:
+            save["first"]()
+        if save["error"] is not None:
+            raise save["error"]
+
+    def failing_save(first=None) -> OSError:
+        save["error"], save["first"] = OSError(28, "No space left on device"), first
+        return save["error"]
+
+    def working_save() -> None:
+        save["error"] = save["first"] = None
+
+    galaxy._save_graph = fake_save
+    state = lambda: ([note.path for note in galaxy.notes], set(galaxy.links), galaxy.rev)   # noqa: E731
+    waiting = lambda: [file for file in notes_dir.rglob("*.taken*") if file.is_file()]     # noqa: E731
+
+    def expect(step: str, error_type, action) -> BaseException | None:
+        try:
+            action()
+        except error_type as error:
+            return error
+        except Exception as error:                  # noqa: BLE001 - the wrong error is a finding
+            trouble.append(f"{step}: {type(error).__name__} instead of {error_type.__name__}")
+            return error
+        trouble.append(f"{step}: no {error_type.__name__}")
+        return None
+
+    def true_links(step: str) -> None:
+        if galaxy.links != set(build.compute_links(galaxy.notes)):
+            trouble.append(f"{step}: the links differ from a full rebuild")
+
+    def named(step: str, error, place: str, cause) -> None:
+        """The error says where the file is now, and it keeps the first error as its cause."""
+        if error is not None and (place not in str(error) or error.__cause__ is not cause):
+            trouble.append(f"{step}: the error does not name {place}, or hides the first error: {error!r}")
+
+    def stuck_move_back(staged: Path, home: Path) -> None:
+        raise PermissionError(13, "The file is in use")
+
+    galaxy.birth_note("Card one.md", "# Card one\n\nFiled under [[Shared Idea]].\n")
+    galaxy.birth_note("Card two.md", "# Card two\n\nFiled under [[Shared Idea]].\n")
+    idea = "# Shared Idea\n\nWhat the cards are filed under.\n"     # its birth changes the link between the cards
+    intruder = b"# Another program\n\nThis file came while the note was away.\n"
+    edit = b"An editor added this.\n"
+
+    # (a) The save fails after the note is in the index: the index is as before, and no file is left.
+    for error in (OSError(28, "No space left on device"), RuntimeError("a bug in the index")):
+        before, save["error"] = state(), error
+        expect(f"(a) a birth whose save fails with {type(error).__name__}", type(error),
+               lambda: galaxy.birth_note("captures/Shared Idea.md", idea))
+        working_save()
+        if state() != before:
+            trouble.append(f"(a) after a {type(error).__name__} in the save, the index is not as before")
+        if (notes_dir / "captures" / "Shared Idea.md").exists():
+            trouble.append(f"(a) after a {type(error).__name__} in the save, the file is still there")
+    # ...and when the file cannot be removed either, the error of the save is still the one raised.
+    real_unlink = Path.unlink
+
+    def stuck_unlink(self, *args, **kwargs):
+        if self.name == "Shared Idea.md":
+            raise PermissionError(13, "The file is in use")
+        return real_unlink(self, *args, **kwargs)
+
+    before, saved = state(), failing_save()
+    Path.unlink = stuck_unlink
+    try:
+        error = expect("(a) a birth whose save fails and whose file cannot be removed", OSError,
+                       lambda: galaxy.birth_note("captures/Shared Idea.md", idea))
+    finally:
+        Path.unlink = real_unlink
+        working_save()
+    if state() != before or error is not saved:
+        trouble.append(f"(a) a file that cannot be removed changed the index or hid the first error: {error!r}")
+    (notes_dir / "captures" / "Shared Idea.md").unlink(missing_ok=True)
+    true_links("(a)")
+
+    # (b) A take-back whose save fails: the index is as before, and the file is back with the same bytes.
+    receipt = galaxy.birth_note("teardowns/Shared Idea.md", idea)
+    path = notes_dir / receipt["file"]
+    data, before = path.read_bytes(), state()
+    failing_save()
+    expect("(b) a take-back whose save fails", OSError, lambda: galaxy.unbirth(receipt))
+    working_save()
+    if state() != before or not path.is_file() or path.read_bytes() != data or waiting():
+        trouble.append("(b) after a failed save, the index or the file is not as before, or a .taken file is left")
+
+    # (c) The save fails AND the file cannot be put back: the index is as before, the error names the place and
+    # keeps the save's error as its cause, and the bytes are still in the folder. Only this Galaxy, only this step.
+    saved = failing_save()
+    galaxy._move_back = stuck_move_back
+    try:
+        error = expect("(c) a take-back whose save and put-back fail", OSError, lambda: galaxy.unbirth(receipt))
+    finally:
+        del galaxy._move_back
+        working_save()
+    if state() != before:
+        trouble.append("(c) after a failed save and put-back, the index is not as before")
+    named("(c)", error, ".taken", saved)
+    kept = [file for file in waiting() if file.read_bytes() == data]
+    if len(kept) != 1:
+        trouble.append("(c) the bytes of the note are not in one .taken file")
+    for file in kept:                               # put the file back by hand, as a person would
+        os.replace(file, path)
+
+    # (g) An edit lands after the move aside (an editor that still holds the file). The bytes that would be
+    # deleted are the ones checked, so the file goes back with the edit and the index is not touched.
+    real_replace = os.replace
+
+    def editing_replace(source, destination, *args, **kwargs):
+        real_replace(source, destination, *args, **kwargs)
+        if ".taken" in Path(destination).name:
+            with open(destination, "ab") as handle:
+                handle.write(edit)
+
+    os.replace = editing_replace
+    try:
+        expect("(g) a take-back of a file edited while it waits aside", ValueError, lambda: galaxy.unbirth(receipt))
+    finally:
+        os.replace = real_replace
+    if state() != before or not path.is_file() or path.read_bytes() != data + edit or waiting():
+        trouble.append("(g) a file edited while it waited aside did not go back with the edit")
+    path.write_bytes(data)
+
+    # (g) The same, and another program also made a new file at the old place: the new file is not written over,
+    # the error names the .taken place, the index is not touched.
+    def crowding_replace(source, destination, *args, **kwargs):
+        editing_replace(source, destination, *args, **kwargs)
+        if ".taken" in Path(destination).name:
+            Path(source).write_bytes(intruder)
+
+    os.replace = crowding_replace
+    try:
+        error = expect("(g) a changed file whose old place was taken", OSError, lambda: galaxy.unbirth(receipt))
+    finally:
+        os.replace = real_replace
+    if state() != before or not path.is_file() or path.read_bytes() != intruder:
+        trouble.append("(g) a new file at the old place was written over, or the index changed")
+    if error is not None and ".taken" not in str(error):
+        trouble.append(f"(g) the error does not name the .taken place: {error!r}")
+    path.unlink()
+    for file in waiting():
+        os.replace(file, path)
+    path.write_bytes(data)
+
+    # (g) The old place is taken while the note waits aside, and the save fails: the new file is not written over,
+    # the note stays aside, the error names that place, the index is as before.
+    saved = failing_save(first=lambda: path.write_bytes(intruder))
+    error = expect("(g) a take-back whose old place was taken", OSError, lambda: galaxy.unbirth(receipt))
+    working_save()
+    if state() != before or not path.is_file() or path.read_bytes() != intruder:
+        trouble.append("(g) a new file at the old place was written over, or the index is not as before")
+    named("(g)", error, ".taken", saved)
+    kept = [file for file in waiting() if file.read_bytes() == data]
+    if len(kept) != 1:
+        trouble.append("(g) the note is not waiting in one .taken file")
+    path.unlink()
+    for file in kept:
+        os.replace(file, path)
+
+    # (f) A clean take-back: the note is gone, no .taken file is left, the links are a full rebuild's.
+    galaxy.unbirth(receipt)
+    if path.exists() or waiting() or receipt["file"] in galaxy._born:
+        trouble.append("(f) after a clean take-back, the file, a .taken file or its fingerprint is left")
+    if receipt["title"] in [note.label for note in galaxy.notes]:
+        trouble.append("(f) after a clean take-back, the note is still in the index")
+    true_links("(f)")
+
+    # (d) A forget whose save fails: the index is as before, the file is back, the trash is empty.
+    capture = galaxy.remember("the till was short on Tuesday")
+    path = notes_dir / capture["file"]
+    trash = notes_dir / server.CAPTURES_DIR / server.TRASH_DIR
+    data, before = path.read_bytes(), state()
+    failing_save()
+    expect("(d) a forget whose save fails", OSError, lambda: galaxy.forget_last(capture["index"], capture["title"]))
+    working_save()
+    if state() != before or not path.is_file() or path.read_bytes() != data or any(trash.glob("*")):
+        trouble.append("(d) after a failed save, the index, the file or the trash is not as before")
+
+    # (h) A forget whose save fails while another program makes a new file at the old place: the new file is not
+    # written over, the note stays in the trash, the error names it, the index is as before.
+    saved = failing_save(first=lambda: path.write_bytes(intruder))
+    error = expect("(h) a forget whose old place was taken", OSError,
+                   lambda: galaxy.forget_last(capture["index"], capture["title"]))
+    working_save()
+    trashed = list(trash.glob("*"))
+    if state() != before or not path.is_file() or path.read_bytes() != intruder:
+        trouble.append("(h) a new file at the old place was written over, or the index is not as before")
+    if len(trashed) != 1 or trashed[0].read_bytes() != data:
+        trouble.append("(h) the note is not in the trash")
+    else:
+        named("(h)", error, trashed[0].name, saved)
+        path.unlink()
+        os.replace(trashed[0], path)
+    galaxy.forget_last(capture["index"], capture["title"])
+    true_links("(h)")
+
+    # (e) The file was changed after the birth (an editor plug-in): it stays, with the change, and so does the
+    # note. A note this run did not make (no fingerprint) stays too, and is not moved.
+    receipt = galaxy.birth_note("teardowns/Teardown edited.md", "# Teardown edited\n\nJarviz wrote this.\n")
+    path = notes_dir / receipt["file"]
+    path.write_bytes(path.read_bytes() + edit)
+    edited, before = path.read_bytes(), state()
+    expect("(e) a take-back of a changed file", ValueError, lambda: galaxy.unbirth(receipt))
+    if state() != before or not path.is_file() or path.read_bytes() != edited or waiting():
+        trouble.append("(e) a changed file or its note did not stay as it was")
+    galaxy._born.pop(receipt["file"], None)
+    path.write_bytes(b"# Teardown edited\n\nJarviz wrote this.\n")
+    expect("(e) a take-back of a note with no fingerprint", ValueError, lambda: galaxy.unbirth(receipt))
+    if state() != before or not path.is_file() or waiting():
+        trouble.append("(e) a note with no fingerprint did not stay")
+    true_links("(e)")
+
+
+def check_notes_dir_follows_config(report: Report) -> None:
+    """After "set notes_dir, run build.py", the running server loads the folder that config.json names NOW, when
+    that is a folder. Else the current folder stays. Pure: a test Galaxy, a fake build.build and a fake
+    load_config. For the length of the check, build.write_graph is a recorder: nothing may call it."""
+    name = "A new index is loaded from the notes folder that config.json names now"
+    trouble: list[str] = []
+    real_build, real_load, real_write = build.build, server.load_config, build.write_graph
+    writes, loaded = [], []
+
+    def fake_build(notes_dir, graph_path=None):         # the real one writes viewer/graph-data.js
+        loaded.append(Path(notes_dir))
+        return [], [], "test"
+
+    build.write_graph = lambda *args, **kwargs: writes.append(args)
+    build.build = fake_build
+    try:
+        with tempfile.TemporaryDirectory() as old, tempfile.TemporaryDirectory() as new:
+            old_dir, new_dir = Path(old).resolve(), Path(new).resolve()
+            cases = (("the folder that config.json names now", {"notes_dir": str(new_dir)}, new_dir),
+                     ("a folder that is not there", {"notes_dir": str(new_dir / "missing")}, old_dir),
+                     ("a config.json that cannot be read", {"notes_dir": str(new_dir), "_error": "A typing mistake."}, old_dir))
+            for what, config, wanted in cases:
+                galaxy = server.Galaxy()
+                galaxy.notes_dir, galaxy._stamp = old_dir, -1      # -1: "graph-data.js changed" (a real stamp is never -1)
+                server.load_config = lambda config=config: {**server.DEFAULT_CONFIG, **config}
+                loaded.clear()
+                galaxy.refresh_if_rebuilt()
+                if loaded != [wanted] or galaxy.notes_dir != wanted:
+                    trouble.append(f"{what}: it loaded {[p.name for p in loaded]}, not {wanted.name}")
+    except Exception as error:                          # noqa: BLE001 - a check that stops says so, it never crashes preflight
+        trouble.append(f"the check stopped: {type(error).__name__}: {error}")
+    finally:
+        build.build, server.load_config, build.write_graph = real_build, real_load, real_write
+    if writes:
+        trouble.append(f"build.write_graph was called {len(writes)} times: nothing may write here")
+    report.add(FAIL if trouble else PASS, name, "; ".join(trouble) or
+               "the folder named now; the old folder when the named one is not there or config.json cannot be read")
+
+
+def check_brain_choice_saved(report: Report) -> None:
+    """A change of brain changes only the text of the top-level "brain" entry of config.json: every other character
+    stays. A file that cannot be changed safely stays as it was. Pure: a TEMPORARY config.json, never the real one."""
+    name = "A change of brain changes only the \"brain\" text in config.json"
+    trouble: list[str] = []
+    cases = {
+        "odd spacing and blank lines": ('{\n\n   "brain"  :   "anthropic" ,\n\n\t"model": "x"\n}\n',
+                                        '{\n\n   "brain"  :   "deepseek" ,\n\n\t"model": "x"\n}\n'),
+        "the word brain in other values": ('{"notes_dir": "brain \\"brain\\": x", "brain": "openai", "extra": {"brain": "venice"}}',
+                                           '{"notes_dir": "brain \\"brain\\": x", "brain": "deepseek", "extra": {"brain": "venice"}}'),
+        "no brain line": ('{\n  "model": "x",\n  "notes_dir": "notes"\n}\n',
+                          '{\n  "brain": "deepseek",\n  "model": "x",\n  "notes_dir": "notes"\n}\n'),
+        "CRLF line ends": ('{\r\n  "brain": "anthropic",\r\n\r\n  "model": "x"\r\n}\r\n',
+                           '{\r\n  "brain": "deepseek",\r\n\r\n  "model": "x"\r\n}\r\n'),
+        "two brain lines": ('{"brain": "openai", "model": "x", "brain": "venice"}',
+                            '{"brain": "deepseek", "model": "x", "brain": "deepseek"}'),
+        "an empty object": ("{}", '{"brain": "deepseek"}'),
+        "a byte order mark": ('﻿{"brain": "openai"}', '﻿{"brain": "deepseek"}'),
+    }
+    broken = {"a typing mistake": '{"brain": "openai",, "model": "x"}', "a list, not an object": '["brain"]'}
+    real_path = server.CONFIG_PATH
+    try:
+        with tempfile.TemporaryDirectory() as folder:
+            server.CONFIG_PATH = Path(folder) / "config.json"
+            if server.CONFIG_PATH.resolve() == real_path.resolve() or server.CONFIG_PATH.parent == real_path.parent:
+                raise RuntimeError("the test file is the real config.json")
+            for what, (before, after) in cases.items():
+                server.CONFIG_PATH.write_bytes(before.encode("utf-8"))
+                try:
+                    server.save_brain_choice("deepseek")
+                except (OSError, ValueError) as error:
+                    trouble.append(f"{what}: it raised {error}")
+                    continue
+                if server.CONFIG_PATH.read_bytes() != after.encode("utf-8"):
+                    trouble.append(f"{what}: the file became {server.CONFIG_PATH.read_bytes()!r}")
+            for what, text in broken.items():
+                server.CONFIG_PATH.write_bytes(text.encode("utf-8"))
+                try:
+                    server.save_brain_choice("deepseek")
+                    trouble.append(f"{what}: no error")
+                except ValueError:
+                    pass
+                if server.CONFIG_PATH.read_bytes() != text.encode("utf-8"):
+                    trouble.append(f"{what}: the file was changed")
+            left = sorted(path.name for path in Path(folder).iterdir() if path.name != "config.json")
+            if left:
+                trouble.append(f"files left behind: {left}")
+    except Exception as error:                          # noqa: BLE001 - a check that stops says so, it never crashes preflight
+        trouble.append(f"the check stopped: {type(error).__name__}: {error}")
+    finally:
+        server.CONFIG_PATH = real_path
+    report.add(FAIL if trouble else PASS, name, "; ".join(trouble) or
+               f"{len(cases)} files kept every other character; {len(broken)} broken files were left as they were")
+
+
+class _FakeBay:
+    """For the pure checks: no thread, no browser. start() can refuse, end the job at once, or keep it running."""
+
+    def __init__(self, refuse: Exception | None = None, at_once: bool = False, ends_as: str = "cancelled"):
+        self.refuse, self.at_once, self.ends_as = refuse, at_once, ends_as
+        self.job, self.on_done, self.asked = None, None, []
+
+    def start(self, site, question, headless=False, on_done=None):
+        if self.refuse is not None:
+            raise self.refuse
+        self.job, self.on_done = teardown.Job(site, question, headless), on_done
+        if self.at_once:
+            self.end("failed")
+        return self.job
+
+    def end(self, state: str) -> None:
+        self.job.error = None if state == "cancelled" else {"code": "site_silent", "detail": "The site did not answer"}
+        self.job.state = state
+        if self.on_done:
+            self.on_done(self.job)
+
+    def cancel(self, job_id=None):
+        self.asked.append(job_id)
+        job = self.job
+        if job is None or job.state != "running" or (job_id is not None and job_id != job.id):
+            return None
+        job.state = self.ends_as                        # it ends at once: the route does not wait
+        job.error = {"code": "site_silent", "detail": "The site did not answer"} if self.ends_as == "failed" else None
+        return job
+
+
+def check_teardown_receipt_turn(report: Report) -> None:
+    """A teardown receipt goes on the turn that started the job (a question asked meanwhile does not get it), and
+    only while that turn is in the history. A start that BAY refuses leaves no turn: "busy" says busy, any other
+    refusal says the kit is not ready. Pure: a fake bay (no thread, no browser) and test sessions."""
+    name = "A teardown receipt goes on the turn that started it, and a refused start leaves no turn"
+    trouble: list[str] = []
+    real_bay, real_diag = server.BAY, teardown.diag
+    site = "localhost:1"            # the user's own localhost: no lookup. The fake bay opens nothing anyway.
+
+    def receipts(session) -> list[list[str]]:
+        return [list(turn[2]) for turn in session.turns]
+
+    def start(session, bay) -> tuple[int, dict]:
+        server.BAY = bay
+        if server.BAY is not bay:
+            raise RuntimeError("the fake bay is not in place")
+        return server.start_teardown(site, "how is it built", session, f"Tear down {site}", headless=True)
+
+    teardown.diag = lambda: {"problems": []}
+    try:
+        session = server.Session()          # (a) a job that fails at once: both receipts on its own turn
+        session.record("Good morning", "Good morning, sir.", ["morning"], [])
+        status, _ = start(session, _FakeBay(at_once=True))
+        got = receipts(session)
+        if status != 200 or len(got) != 2 or got[0] or len(got[1]) != 2 or "did not finish" not in got[1][1]:
+            trouble.append(f"(a) a job that failed at once: {got}")
+        session, bay = server.Session(), _FakeBay()     # (b) a question asked while the job runs does not get it
+        start(session, bay)
+        session.record("What is the time?", "Noon, sir.", ["time"], [])
+        bay.end("failed")
+        got = receipts(session)
+        if len(got) != 2 or len(got[0]) != 2 or "did not finish" not in got[0][1] or got[1]:
+            trouble.append(f"(b) a question asked meanwhile: {got}")
+        session, bay = server.Session(), _FakeBay()     # (c) the turn left the history: the receipt is dropped
+        start(session, bay)
+        for number in range(server.HISTORY_TURNS):
+            session.record(f"Question {number}", "An answer.", [], [])
+        bay.end("failed")
+        if any("did not finish" in line for lines in receipts(session) for line in lines):
+            trouble.append("(c) a turn that left the history still got a receipt")
+        for refusal, status_wanted, error_wanted in ((teardown.TeardownError("busy", "A teardown is already running."), 409,
+                                                      "teardown_busy"),
+                                                     (teardown.TeardownError("not_started", "The teardown could not start."),
+                                                      503, "teardown_not_started")):
+            session = server.Session()      # (d) a refused start leaves the session as it was, even a full one
+            for number in range(server.HISTORY_TURNS):
+                session.record(f"Question {number}", "An answer.", ["coffee"], [3], labels={3: "Coffee"})
+            before = (receipts(session), [turn[0] for turn in session.turns], session.last_tokens, session.last_sources)
+            status, body = start(session, _FakeBay(refuse=refusal))
+            after = (receipts(session), [turn[0] for turn in session.turns], session.last_tokens, session.last_sources)
+            if (status, body.get("error")) != (status_wanted, error_wanted) or after != before:
+                trouble.append(f"(d) a start refused as {refusal.code}: HTTP {status} {body.get('error')}, "
+                               f"session {'as before' if after == before else 'changed'}")
+            wording = server.LINES["teardown_busy" if refusal.code == "busy" else "teardown_not_ready"].split("{")[0]
+            if not str(body.get("answer", "")).startswith(wording):
+                trouble.append(f"(d) a start refused as {refusal.code} says {body.get('answer')!r}")
+    except Exception as error:                          # noqa: BLE001 - a check that stops says so, it never crashes preflight
+        trouble.append(f"the check stopped: {type(error).__name__}: {error}")
+    finally:
+        server.BAY, teardown.diag = real_bay, real_diag
+    report.add(FAIL if trouble else PASS, name, "; ".join(trouble) or
+               "a job that fails at once, a question asked meanwhile, a turn that left the history, two refusals")
+
+
+def check_teardown_cancel(report: Report) -> None:
+    """/teardown/cancel with a job id cancels only that job; without one, the job that runs ("cancel the
+    teardown"). A job that FAILED while the cancel waited gets the failed line of /teardown/status. Pure: the
+    route with a fake bay (no thread, no browser)."""
+    name = "A cancel that names a job stops only that job, and a failed job says why"
+    trouble: list[str] = []
+    real_bay = server.BAY
+    site = teardown.Site("http://localhost:1/", "localhost:1")
+    try:
+        for payload, ends_as, wanted in (({"job": "preflight-no-such-job"}, "cancelled", "no_such_job"),
+                                         ({"job": 5}, "cancelled", "no_such_job"),
+                                         ({"job": ""}, "cancelled", "no_such_job"),
+                                         ({}, "failed", "failed"),
+                                         ({"job": None}, "cancelled", "cancelled"),
+                                         ("own", "cancelled", "cancelled"),
+                                         ("own", "done", "too_late")):
+            server.BAY = bay = _FakeBay(ends_as=ends_as)
+            bay.job = teardown.Job(site, "q", True)
+            sent = {"job": bay.job.id} if payload == "own" else payload
+            _, body = server.teardown_cancel_route(sent)
+            got = body.get("error") or (body.get("action") or {}).get("type")
+            got = "cancelled" if got == "teardown_cancel" else got
+            still = bay.job.state == "running"
+            if got != wanted or (wanted == "no_such_job") != still:
+                trouble.append(f"{sent}: {got}, the job {'still runs' if still else 'stopped'}")
+            if wanted == "failed" and body.get("answer") != server.teardown_line(bay.job.view()):
+                trouble.append(f"a failed job: {body.get('answer')!r} is not the line of /teardown/status")
+        server.BAY = _FakeBay()
+        if server.teardown_cancel_route({})[1].get("error") != "none_running":
+            trouble.append("no job: it does not say that none is running")
+    except Exception as error:                          # noqa: BLE001 - a check that stops says so, it never crashes preflight
+        trouble.append(f"the check stopped: {type(error).__name__}: {error}")
+    finally:
+        server.BAY = real_bay
+    report.add(FAIL if trouble else PASS, name, "; ".join(trouble) or
+               "another id, a bad id and an empty id stop nothing; the own id and no id cancel; failed and done are said")
 
 
 def check_served_files(report: Report) -> None:
@@ -630,26 +973,37 @@ def check_config_hidden(report: Report, ctx: dict) -> None:
     config = ctx["config"]
     keys = [str(config[spec["key"]]).encode("utf-8") for name, spec in brains.PROVIDERS.items()
             if brains.describe(config, name)["has_key"]]
-    leaks = []
+    leaks, silent, unsent, refused = [], [], [], 0
     for probe in CONFIG_PROBES + TEARDOWN_PROBES:
-        try:
-            status, body = call("GET", probe, timeout=10)
-        except (http.client.HTTPException, OSError, ValueError):
-            continue                                 # refused before it was even sent: good
+        kind, got = try_probe(lambda probe=probe: call("GET", probe, timeout=10))
+        if kind == "not_sent":
+            unsent.append(probe)                     # the client would not send it: counted apart, not as refused
+            continue
+        if kind == "no_answer":
+            silent.append(f"{probe} ({got})")        # no answer proves nothing
+            continue
+        status, body = got
         if b"_api_key" in body or any(key in body for key in keys) or (status == 200 and b"<title>Jarviz</title>" not in body):
             leaks.append(f"{probe} -> {status}")
+        else:
+            refused += 1
     # The routes that talk about brains must name them, never show a key.
     for path in ("/status", "/search?q=key"):
-        _, body = call("GET", path, timeout=10)
-        if any(key in body for key in keys):
+        kind, got = try_probe(lambda path=path: call("GET", path, timeout=10))
+        if kind != "answer":
+            silent.append(f"{path} ({got})")
+        elif any(key in got[1] for key in keys):
             leaks.append(f"{path} shows a key")
     if leaks:
         banner = "!" * 72
         print(f"\n{banner}\n  DANGER: A PRIVATE FILE IS REACHABLE FROM THE BROWSER. STOP THE SERVER NOW.\n"
               f"  {'; '.join(leaks)}\n{banner}\n", flush=True)
         report.add(FAIL, name, "LEAK: " + "; ".join(leaks))
+    elif silent:
+        report.add(FAIL, name, f"NOT VERIFIED: {len(silent)} probes got no answer: " + short("; ".join(silent), 300))
     else:
-        report.add(PASS, name, f"{len(CONFIG_PROBES) + len(TEARDOWN_PROBES)} ways tried, all refused")
+        report.add(PASS, name, f"{refused} ways tried, all refused" +
+                   (f"; {len(unsent)} the client itself would not send: {', '.join(unsent)}" if unsent else ""))
 
 
 def check_other_sites(report: Report) -> None:
@@ -658,20 +1012,35 @@ def check_other_sites(report: Report) -> None:
     evil = "http://evil.example"
     nothing = {"message": "", "session": "preflight-outsider"}      # empty: it can never reach the brain
     attempts = {
-        "a POST from another website": call("POST", "/chat", nothing, extra_headers={"Origin": evil}),
-        "a POST marked cross-site": call("POST", "/chat", nothing, extra_headers={"Sec-Fetch-Site": "cross-site"}),
-        "a POST from another local port": call("POST", "/remember", {"text": ""}, extra_headers={"Origin": "http://127.0.0.1:9999"}),
-        "a request under another host name": call("GET", "/status", extra_headers={"Host": f"evil.example:{server.PORT}"}),
-        "a script tag on another website": call("GET", "/graph-data.js", extra_headers={"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Dest": "script"}),
-        "a form post (not JSON)": call("POST", "/chat", extra_headers={"Content-Type": "text/plain", "Content-Length": "0"}),
+        "a POST from another website": lambda: call("POST", "/chat", nothing, extra_headers={"Origin": evil}),
+        "a POST marked cross-site": lambda: call("POST", "/chat", nothing, extra_headers={"Sec-Fetch-Site": "cross-site"}),
+        "a POST from another local port": lambda: call("POST", "/remember", {"text": ""}, extra_headers={"Origin": "http://127.0.0.1:9999"}),
+        "a request under another host name": lambda: call("GET", "/status", extra_headers={"Host": f"evil.example:{server.PORT}"}),
+        "a script tag on another website": lambda: call("GET", "/graph-data.js", extra_headers={"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Dest": "script"}),
+        "a form post (not JSON)": lambda: call("POST", "/chat", extra_headers={"Content-Type": "text/plain", "Content-Length": "0"}),
         # INERT_SITE is not an address, so this can never start a job, even if the guard were broken.
-        "a teardown started by another website": call("POST", "/teardown/start", {"site": INERT_SITE}, extra_headers={"Origin": evil}),
-        "a teardown cancelled by another website": call("POST", "/teardown/cancel", {}, extra_headers={"Sec-Fetch-Site": "cross-site"}),
-        "a teardown note read by another website": call("GET", "/teardown/last", extra_headers={"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Dest": "empty"}),
+        "a teardown started by another website": lambda: call("POST", "/teardown/start", {"site": INERT_SITE}, extra_headers={"Origin": evil}),
+        # A made-up job id: this can never stop a real job, even if the guard were broken.
+        "a teardown cancelled by another website": lambda: call("POST", "/teardown/cancel", {"job": "preflight-no-such-job"},
+                                                                extra_headers={"Sec-Fetch-Site": "cross-site"}),
+        "a teardown note read by another website": lambda: call("GET", "/teardown/last", extra_headers={"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Dest": "empty"}),
     }
-    let_in = [what for what, (status, _) in attempts.items() if status not in (403, 415)]
-    report.add(FAIL if let_in else PASS, name,
-               "LET IN: " + "; ".join(let_in) if let_in else f"{len(attempts)} ways tried, all refused")
+    let_in, silent, unsent = [], [], []
+    for what, send in attempts.items():
+        kind, got = try_probe(send)
+        if kind == "not_sent":
+            unsent.append(what)                         # counted apart: the client itself would not send it
+        elif kind == "no_answer":
+            silent.append(f"{what} ({got})")            # no answer is not a refusal
+        elif got[0] not in (403, 415):
+            let_in.append(what)
+    if let_in:
+        report.add(FAIL, name, "LET IN: " + "; ".join(let_in))
+    elif silent:
+        report.add(FAIL, name, "NOT VERIFIED, no answer: " + "; ".join(silent))
+    else:
+        report.add(PASS, name, f"{len(attempts) - len(unsent)} ways tried, all refused" +
+                   (f"; the client itself would not send: {', '.join(unsent)}" if unsent else ""))
 
 
 def check_lock(report: Report) -> None:
@@ -711,37 +1080,51 @@ def check_lock(report: Report) -> None:
         except ValueError:
             return False
 
+    # A signature works once: the same signed request a second time is locked out. A newly signed one works.
+    once = signed(server.sign_request(key, instance, "GET", "/status"))
+    first_kind, first = try_probe(lambda: outsider("GET", "/status", headers=once))
     # Empty texts, empty names and a site that is no site: none of these could do anything if the lock were broken.
     attempts = {
-        "the page": outsider("GET", "/"),
-        "the page by its file name": outsider("GET", "/index.html"),
-        "the page script": outsider("GET", "/app.js"),
-        "the index of the notes": outsider("GET", "/graph-data.js"),
-        "the status": outsider("GET", "/status"),
-        "a search in the notes": outsider("GET", "/search?q=coffee"),
-        "a question to the brain": outsider("POST", "/chat", nothing),
-        "a new note": outsider("POST", "/remember", empty_note),
-        "a change of brain": outsider("POST", "/brain", {"brain": ""}),
-        "a teardown": outsider("POST", "/teardown/start", {"site": INERT_SITE}),
-        "the last teardown": outsider("GET", "/teardown/last"),
-        "a second try without a key": outsider("GET", f"/?{server.AGAIN_PARAM}=1"),
-        "a wrong key in the cookie": outsider("GET", "/status", headers={"Cookie": f"{server.KEY_COOKIE}={wrong}"}),
-        "a wrong key in the address": outsider("GET", f"/?{server.KEY_PARAM}={wrong}"),
-        "a wrong key in the old header": outsider("GET", "/status", headers={"X-Jarviz-Key": wrong}),
-        "a signature made with a wrong key": outsider("GET", "/status", headers=sign("GET", "/status", with_key=wrong)),
-        "a signature made for another address": outsider("GET", "/status", headers=sign("GET", "/search?q=x")),
-        "a signature made for another method": outsider("GET", "/status", headers=sign("POST", "/status")),
-        "a signature that is one hour old": outsider("GET", "/status", headers=sign("GET", "/status", now=time.time() - 3600)),
-        "a signature made for another body": outsider("POST", "/remember", empty_note, headers=sign("POST", "/remember", b"{}")),
-        "a signature made for another start of the server": outsider("GET", "/status", headers=sign("GET", "/status", start="s" * 16)),
-        "a signature with no parts": outsider("GET", "/status", headers=signed("")),
+        "the page": lambda: outsider("GET", "/"),
+        "the page by its file name": lambda: outsider("GET", "/index.html"),
+        "the page script": lambda: outsider("GET", "/app.js"),
+        "the index of the notes": lambda: outsider("GET", "/graph-data.js"),
+        "the status": lambda: outsider("GET", "/status"),
+        "a search in the notes": lambda: outsider("GET", "/search?q=coffee"),
+        "a question to the brain": lambda: outsider("POST", "/chat", nothing),
+        "a new note": lambda: outsider("POST", "/remember", empty_note),
+        "a change of brain": lambda: outsider("POST", "/brain", {"brain": ""}),
+        "a teardown": lambda: outsider("POST", "/teardown/start", {"site": INERT_SITE}),
+        "the last teardown": lambda: outsider("GET", "/teardown/last"),
+        "a second try without a key": lambda: outsider("GET", f"/?{server.AGAIN_PARAM}=1"),
+        "a wrong key in the cookie": lambda: outsider("GET", "/status", headers={"Cookie": f"{server.KEY_COOKIE}={wrong}"}),
+        "a wrong key in the address": lambda: outsider("GET", f"/?{server.KEY_PARAM}={wrong}"),
+        "a wrong key in the old header": lambda: outsider("GET", "/status", headers={"X-Jarviz-Key": wrong}),
+        "a signature made with a wrong key": lambda: outsider("GET", "/status", headers=sign("GET", "/status", with_key=wrong)),
+        "a signature made for another address": lambda: outsider("GET", "/status", headers=sign("GET", "/search?q=x")),
+        "a signature made for another method": lambda: outsider("GET", "/status", headers=sign("POST", "/status")),
+        "a signature that is one hour old": lambda: outsider("GET", "/status", headers=sign("GET", "/status", now=time.time() - 3600)),
+        "a signature made for another body": lambda: outsider("POST", "/remember", empty_note, headers=sign("POST", "/remember", b"{}")),
+        "a signature made for another start of the server": lambda: outsider("GET", "/status", headers=sign("GET", "/status", start="s" * 16)),
+        "a signature with no parts": lambda: outsider("GET", "/status", headers=signed("")),
+        "the same signed request a second time": lambda: outsider("GET", "/status", headers=once),
         # A good signature opens the routes, but it is never traded for the cookie (the cookie IS the key).
-        "a good signature at the door, to get the cookie": outsider(
+        "a good signature at the door, to get the cookie": lambda: outsider(
             "GET", f"/?{server.KEY_PARAM}={wrong}&mute=1", headers=sign("GET", f"/?{server.KEY_PARAM}={wrong}&mute=1")),
-        "a good signature at the second try, to get the cookie": outsider(
+        "a good signature at the second try, to get the cookie": lambda: outsider(
             "GET", f"/?{server.AGAIN_PARAM}=1", headers=sign("GET", f"/?{server.AGAIN_PARAM}=1")),
     }
-    trouble = ["LET IN: " + what for what, (status, headers, body) in attempts.items() if not refused(status, headers, body)]
+    trouble, unsent = [], []
+    for what, send in attempts.items():
+        kind, got = try_probe(send)
+        if kind == "not_sent":
+            unsent.append(what)                         # counted apart: the client itself would not send it
+        elif kind == "no_answer":
+            trouble.append(f"NOT VERIFIED (no answer, {got}): {what}")
+        elif not refused(*got):
+            trouble.append("LET IN: " + what)
+    if first_kind != "answer" or first[0] != 200:
+        trouble.append("a newly signed request is not let in the first time")
     if call("GET", "/status", timeout=10)[0] != 200:
         trouble.append("a call with a good signature is not let in")
 
@@ -806,7 +1189,9 @@ def check_lock(report: Report) -> None:
     if shown:
         trouble.append("THE KEY IS SHOWN in " + ", ".join(shown))
     report.add(FAIL if trouble else PASS, name,
-               "; ".join(trouble) if trouble else f"{len(attempts)} ways tried without it, all refused. With it, the page opens.")
+               "; ".join(trouble) if trouble else
+               f"{len(attempts) - len(unsent)} ways tried without it, all refused (a signature works once). With it, the "
+               "page opens." + (f" The client itself would not send: {', '.join(unsent)}." if unsent else ""))
 
 
 def check_persona_home(report: Report) -> None:
@@ -876,9 +1261,36 @@ def check_no_investigation_chrome(report: Report) -> None:
     if chromes is None:         # "could not look" is never a pass
         report.add(WARN, name, "Not checked: the list of running programs could not be read.")
         return
+    if profiles is None:
+        report.add(WARN, name, "Not checked: the profiles folder could not be listed, so the clean-up is not verified.")
+        return
     report.add(FAIL if chromes or profiles else PASS, name,
                f"{len(chromes)} Chrome processes and {len(profiles)} profile folders are left. Restart the server to sweep them."
                if chromes or profiles else "")
+
+
+def run_node_harness(node: str, core_text: str) -> tuple[dict | None, str]:
+    """Run NODE_HARNESS on one core.js text. (its JSON, "") or (None, why not): Node did not start, took too long,
+    exited with an error, or printed no JSON object."""
+    with tempfile.TemporaryDirectory() as folder:
+        core_file = Path(folder) / "core.js"
+        harness_file = Path(folder) / "harness.js"
+        core_file.write_text(core_text, encoding="utf-8")
+        harness_file.write_text(NODE_HARNESS, encoding="utf-8")
+        try:
+            run = subprocess.run([node, str(harness_file), str(core_file)], capture_output=True, text=True,
+                                 encoding="utf-8", errors="replace", timeout=30, check=False)
+        except subprocess.TimeoutExpired:
+            return None, "Node.js took longer than 30 seconds"
+        except (OSError, subprocess.SubprocessError) as error:
+            return None, f"Node.js did not start ({type(error).__name__})"
+    if run.returncode != 0:
+        return None, f"Node.js exited with code {run.returncode}: " + short(run.stderr or run.stdout or "no output", 200)
+    try:
+        result = json.loads(run.stdout)
+    except ValueError:
+        return None, "it printed no JSON: " + short(run.stderr or run.stdout or "no output", 200)
+    return (result, "") if isinstance(result, dict) else (None, "it printed JSON that is not an object")
 
 
 def check_voice_rules(report: Report, ctx: dict) -> None:
@@ -905,17 +1317,11 @@ def check_voice_rules(report: Report, ctx: dict) -> None:
         report.add(verdict, mute_name, "; ".join(problems) or "Read the code only. Install Node.js to run the rule for real.")
         report.add(WARN, finish_name, "Not checked: it needs Node.js.")
         return
-    with tempfile.TemporaryDirectory() as folder:
-        core_file = Path(folder) / "core.js"
-        harness_file = Path(folder) / "harness.js"
-        core_file.write_text(sources["core.js"], encoding="utf-8")
-        harness_file.write_text(NODE_HARNESS, encoding="utf-8")
-        run = subprocess.run([node, str(harness_file), str(core_file)], capture_output=True, text=True, timeout=30)
-    try:
-        result = json.loads(run.stdout)
-    except ValueError:
-        report.add(FAIL, mute_name, "The served core.js did not run: " + short(run.stderr or run.stdout or "no output", 200))
-        report.add(FAIL, finish_name, "Not checked: core.js did not run.")
+    result, reason = run_node_harness(node, sources["core.js"])
+    if result is None:                  # a harness that did not run proves nothing: both checks fail, with the reason
+        ctx["teardown_routes"] = [f"the voice routes were not checked: {reason}"]
+        report.add(FAIL, mute_name, "The served core.js did not run: " + reason)
+        report.add(FAIL, finish_name, "Not checked: " + reason)
         return
 
     if result["muted"] != 0 or result["mutedAmongOthers"] != 0:
@@ -943,6 +1349,9 @@ def check_voice_rules(report: Report, ctx: dict) -> None:
     if result.get("teardowns") != ["igloo.inc", "linear.app", "stripe.com", "example.com", "this", None, None, None,
                                    None, "Example.com/Docs"]:
         routes.append(f"the teardown route matched the wrong sentences: {result.get('teardowns')}")
+    # A question starts one only when its subject IS the site. A question about a teardown goes to the brain.
+    if result.get("questions") != [None, None, None, "stripe.com", "stripe.com", "igloo.inc", "this"]:
+        routes.append(f"the teardown questions matched the wrong sentences: {result.get('questions')}")
     if result.get("addresses") != ["igloo.inc", "stripe.com/pricing", "localhost:5001", None, "wikipedia.org"]:
         routes.append(f"spoken addresses are read wrong: {result.get('addresses')}")
     if result.get("commands") != [True, True, True, True, False]:
@@ -972,22 +1381,36 @@ def check_tag_intent(report: Report) -> None:
              "Show me a teardown of stripe.com", "I liked the last teardown. Now tear down stripe.com.",
              "Show me the last teardown, then tear down stripe.com", "What does stripe.com use? Tear it down.",
              "Do a teardown of the stripe.com homepage", "Run the teardown on igloo.inc again",
-             "What is igloo.inc? Tear it down.")
+             "What is igloo.inc? Tear it down.", "Show me the last teardown and tear down stripe.com",
+             "What is teardown.com built with?", "Redo my teardown of stripe.com", "Do the stripe.com teardown",
+             "Tear down stripe.com like the last teardown",
+             "How is the stripe.com homepage built compared to my last teardown?")
     about = ("What did my teardown of stripe.com say?", "What does the teardown note for igloo.inc say about the fonts?",
              "Show me the teardown of stripe.com", "Open the last teardown", "Read me my teardown of igloo.inc",
              "When did I tear down stripe.com?", "Have you already reverse engineered igloo.inc?",
              "Did you take igloo.inc apart yet?", "Is the teardown done?", "Did the teardown of stripe.com work?",
              "Cancel the teardown", "What is a teardown?", "What did the stripe.com teardown say?",
              "Open the igloo teardown", "Show me the stripe.com teardown", "Is the stripe.com teardown done?",
-             "Stop the igloo.inc teardown", "What does the last stripe.com teardown say about fonts?")
+             "Stop the igloo.inc teardown", "What does the last stripe.com teardown say about fonts?",
+             "Can you summarize my teardown of stripe.com?", "Compare the stripe.com teardown with the linear.app teardown",
+             "Delete the teardown of stripe.com", "Explain the last teardown to me",
+             "Show me the last teardown and its screenshots", "Tell me about my teardown of igloo.inc")
+    # A clause that says NOT to do it does not ask for one. A suggestion ("why don't you") and a request in
+    # another clause still count.
+    refused = ("Do not tear down stripe.com", "Don't tear down stripe.com", "Never reverse engineer igloo.inc",
+               "Please don't take igloo.inc apart", "No teardown of stripe.com today", "I do not want a teardown of stripe.com",
+               "You must not x-ray this site", "Tell me about stripe.com without tearing it down")
+    asks += ("Why don't you tear down stripe.com?", "Why not tear down stripe.com?", "Can't you tear down stripe.com?",
+             "Won't you reverse engineer igloo.inc?", "Don't forget to tear down stripe.com",
+             "Don't wait, tear down stripe.com", "Don't open the old note, tear down stripe.com")
     intent = server.TAG_INTENT["TEARDOWN"]
     trouble = [f"missed: {said!r}" for said in asks if not intent(said)]
-    trouble += [f"let in: {said!r}" for said in mentions + about if intent(said)]
+    trouble += [f"let in: {said!r}" for said in mentions + about + refused if intent(said)]
     if not server.TAG_INTENT["REMEMBER"]("remember that the homepage needs a new photo"):
         trouble.append("the REMEMBER intent no longer matches \"remember that the homepage needs a new photo\"")
     report.add(FAIL if trouble else PASS, name,
-               "; ".join(trouble) or f"{len(asks)} requests let in, {len(mentions)} mentions and "
-                                     f"{len(about)} sentences about a teardown kept out")
+               "; ".join(trouble) or f"{len(asks)} requests let in; {len(mentions)} mentions, {len(about)} sentences "
+                                     f"about a teardown and {len(refused)} refusals kept out")
 
 
 def main() -> int:
@@ -1005,6 +1428,10 @@ def main() -> int:
         check_remember(report, ctx)
         check_links_stay_true(report)
         check_take_back_safe(report)
+        check_notes_dir_follows_config(report)
+        check_brain_choice_saved(report)
+        check_teardown_receipt_turn(report)
+        check_teardown_cancel(report)
         check_served_files(report)
         check_config_hidden(report, ctx)
         check_other_sites(report)

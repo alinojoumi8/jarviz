@@ -208,10 +208,16 @@
     new RegExp('^' + POLITE + '(?:reverse[\\s-]*engineer|tear\\s*down|take\\s+apart|x-?ray)\\s+(.+)$', 'i'),
     new RegExp('^' + POLITE + 'take\\s+(.+?)\\s+apart$', 'i'),
     new RegExp('^' + POLITE + 'tear\\s+(.+?)\\s+down$', 'i'),
+  ];
+  // Questions start one only when their subject IS the site: "how does the stripe.com homepage work". In
+  // "how did my teardown of stripe.com work" the subject is a teardown, so the sentence goes to the brain.
+  const TEARDOWN_QUESTIONS = [
     /^how\s+(?:does|do|did|is|was)\s+(.+?)\s+(?:do|does|did|work|works|built|made|make|makes|done)\b.*$/i,
     /^what(?:\s+is|'s)\s+(.+?)\s+(?:built|made|written|running)\s+(?:with|on|in|of|from)\b.*$/i,
     /^what\s+(?:does|is)\s+(.+?)\s+(?:use|using|run\s+on)\b.*$/i,
   ];
+  // The small words that may stand around the address in a question's subject.
+  const SITE_WORDS_RE = /^(?:(?:the|a|site|website|web\s?page|home\s?page|landing\s+page|page|web\s?app|app|of|at|['’]s)(?:\s+|$))*$/i;
   const TEARDOWN_COMMANDS = {
     last: /^(?:show|open|bring up)\s+(?:me\s+)?(?:the\s+)?(?:last|latest|previous|newest)\s+tear\s?down[.!]?$/i,
     open: /^(?:open|read|show)\s+(?:me\s+)?(?:the\s+)?(?:full|whole|entire)\s+tear\s?down[.!]?$/i,
@@ -226,14 +232,37 @@
     return address.replace(/^[\s"'.,;!?]+|[\s"'.,;!?]+$/g, '');
   }
 
+  const bareWord = word => word.replace(/^["'(]+|["').,;!?]+$/g, '').replace(/['’]s$/, '');
+
+  // The word itself when it is a website address, else null. "server.py" is a file, not an address.
+  function addressOf(bare) {
+    const match = bare.match(ADDRESS_RE);
+    return match && (match[1] || !FILE_ENDINGS.has(match[2].split('.').pop().toLowerCase())) ? bare : null;
+  }
+
   // The first website address in a piece of speech, or null. "make it pop" -> null.
   function findAddress(text) {
     for (const word of spokenToAddress(text).split(' ')) {
-      const bare = word.replace(/^["'(]+|["').,;!?]+$/g, '').replace(/['’]s$/, '');
-      const match = bare.match(ADDRESS_RE);
-      if (match && (match[1] || !FILE_ENDINGS.has(match[2].split('.').pop().toLowerCase()))) return bare;
+      const site = addressOf(bareWord(word));
+      if (site) return site;
     }
     return null;
+  }
+
+  // The site that a question's subject IS: one address with only small site words around it ("the stripe.com
+  // homepage"), or "this" for "this site". Anything else ("my teardown of stripe.com") -> null.
+  function siteOfSubject(subject) {
+    if (THIS_SITE_RE.test(subject.toLowerCase())) return 'this';
+    let site = null;
+    const rest = [];
+    for (const word of spokenToAddress(subject).split(' ')) {
+      const bare = bareWord(word);
+      const found = addressOf(bare);
+      if (found && site) return null;                 // two addresses: not one site
+      if (found) site = found;
+      else if (bare) rest.push(bare);
+    }
+    return site && SITE_WORDS_RE.test(rest.join(' ')) ? site : null;
   }
 
   // -> { site: "igloo.inc" or "this", question: the whole sentence }, or null when no site is named.
@@ -245,6 +274,11 @@
       const named = match[1].trim();
       if (THIS_SITE_RE.test(named.toLowerCase())) return { site: 'this', question: text };
       const site = findAddress(named);
+      if (site) return { site, question: text };
+    }
+    for (const pattern of TEARDOWN_QUESTIONS) {
+      const match = text.match(pattern);
+      const site = match ? siteOfSubject(match[1].trim()) : null;
       if (site) return { site, question: text };
     }
     return null;

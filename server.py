@@ -127,6 +127,7 @@ LINES = {
                         "projects on localhost.",
     "teardown_plain": "{host} is taken apart, sir. The note is ready.",
     "teardown_none_running": "No teardown is running, sir.",
+    "teardown_no_such_job": "No such teardown is running, sir. I stopped nothing.",
     "teardown_none_saved": "I have no teardown on file yet, sir.",
     "teardown_last": "The last one on file, sir: {label}.",
     "server_error": "Something went wrong on my side, sir. The server window has the details.",
@@ -242,13 +243,26 @@ SECURITY_HEADERS = (
 
 # -------------------------------------------------------------------- config
 
+def write_starter_config() -> None:
+    """At start-up only (main): when there is no config.json yet, write one with the defaults, for the user to fill
+    in. It never writes over a file. When it cannot be written, Jarviz says so and runs on the defaults."""
+    try:
+        with open(CONFIG_PATH, "x", encoding="utf-8", newline="\n") as handle:
+            handle.write(json.dumps(DEFAULT_CONFIG, indent=2) + "\n")
+    except FileExistsError:
+        pass
+    except OSError as error:
+        print(f"Could not write a starter config.json ({error.strerror or error}). Jarviz runs on the defaults.",
+              file=sys.stderr, flush=True)
+
+
 def load_config() -> dict:
-    """Read config.json fresh each time, so a key typed into the file works without a restart."""
+    """Read config.json fresh each time, so a key typed into the file works without a restart. It never writes:
+    a missing file gives the defaults (main() writes the starter file once, at start-up)."""
     config = dict(DEFAULT_CONFIG)
     try:
         loaded = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
     except FileNotFoundError:
-        CONFIG_PATH.write_text(json.dumps(DEFAULT_CONFIG, indent=2) + "\n", encoding="utf-8")
         return config
     except OSError as error:
         config["_error"] = (error.strerror or "The file could not be opened") + "."
@@ -273,16 +287,75 @@ def brain_state(config: dict) -> str:
     return "bad_config" if config.get("_error") else brains.state(config)
 
 
+JSON_SPACE_RE = re.compile(r"[ \t\n\r]*")
+UTF8_BOM = b"\xef\xbb\xbf"
+
+
+def _brain_spans(text: str) -> tuple[int, list[tuple[int, int]], int]:
+    """Where the top-level object of a config text opens, the (start, end) of the value of each of its "brain"
+    entries, and where its first entry starts (the place for a new first entry). Raises ValueError for a text
+    that is not one JSON object."""
+    decoder = json.JSONDecoder()
+    at = JSON_SPACE_RE.match(text).end()
+    if not text.startswith("{", at):
+        raise ValueError("config.json must hold one JSON object")
+    opened, spans = at, []
+    at = JSON_SPACE_RE.match(text, at + 1).end()
+    first = at
+    while not text.startswith("}", at):
+        key, at = decoder.raw_decode(text, at)
+        if not isinstance(key, str):
+            raise ValueError("config.json has a key that is not text")
+        at = JSON_SPACE_RE.match(text, at).end()
+        if not text.startswith(":", at):
+            raise ValueError("config.json has a key without a value")
+        start = JSON_SPACE_RE.match(text, at + 1).end()
+        _, at = decoder.raw_decode(text, start)
+        if key == "brain":
+            spans.append((start, at))
+        at = JSON_SPACE_RE.match(text, at).end()
+        if text.startswith(",", at):
+            at = JSON_SPACE_RE.match(text, at + 1).end()
+        elif not text.startswith("}", at):
+            raise ValueError("config.json has a typing mistake")
+    return opened, spans, first
+
+
+def _with_brain(text: str, name: str) -> str:
+    """The same text with the top-level "brain" entry set to `name`. Every other character stays: blank lines,
+    indentation, the order of the lines, the line ends. With no "brain" entry, it becomes the first entry."""
+    opened, spans, first = _brain_spans(text)
+    value = json.dumps(name)
+    if spans:
+        for start, end in reversed(spans):
+            text = text[:start] + value + text[end:]
+        return text
+    gap = text[opened + 1:first]            # the space before the first entry: "\n  ", "\r\n    " or ""
+    if text.startswith("}", first):         # an empty object
+        return text[:first] + f'"brain": {value}' + text[first:]
+    return text[:opened + 1] + gap + f'"brain": {value},' + text[opened + 1:]
+
+
 def save_brain_choice(name: str) -> None:
-    """Write the chosen brain into config.json. Every other line of the file keeps its value."""
+    """Write the chosen brain into config.json. Only the TEXT of the top-level "brain" entry changes: every other
+    character of the file stays as it was. Before the file is replaced, the new text is read back: "brain" must be
+    the new name and every other key its old value. Else it raises, and the file is not changed."""
     with CONFIG_LOCK:
-        loaded = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
-        if not isinstance(loaded, dict):
+        raw = CONFIG_PATH.read_bytes()
+        bom = UTF8_BOM if raw.startswith(UTF8_BOM) else b""
+        text = raw[len(bom):].decode("utf-8")
+        old = json.loads(text)
+        if not isinstance(old, dict):
             raise ValueError("config.json must hold one JSON object")
-        loaded = {"brain": name, **{key: value for key, value in loaded.items() if key != "brain"}}
+        changed = _with_brain(text, name)
+        new = json.loads(changed)
+        if (not isinstance(new, dict) or new.get("brain") != name
+                or {key: value for key, value in new.items() if key != "brain"}
+                != {key: value for key, value in old.items() if key != "brain"}):
+            raise ValueError("config.json could not be changed safely, so it was left as it is")
         temp = CONFIG_PATH.with_name(f"{CONFIG_PATH.name}.{os.getpid()}.tmp")
         try:
-            temp.write_text(json.dumps(loaded, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+            temp.write_bytes(bom + changed.encode("utf-8"))
             os.replace(temp, CONFIG_PATH)
         finally:
             temp.unlink(missing_ok=True)
@@ -352,8 +425,9 @@ class Galaxy:
         self.build_id = ""
         self.rev = 0
         self._stamp: int | None = None
-        # The sha256 of the bytes that birth_note wrote, for each note it made (key: the note's path). unbirth
-        # deletes a file only when it still holds those bytes. It stays here: the receipt goes to the page.
+        # The sha256 of the bytes that birth_note wrote, for each note it made (key: the note's path). An entry says
+        # only "this run wrote these bytes at this path", so a new index (load) keeps it. unbirth deletes a file only
+        # when it still holds those bytes. It stays here: the receipt goes to the page. Only the two drops clear it.
         self._born: dict[str, str] = {}
 
     # -- loading
@@ -364,13 +438,23 @@ class Galaxy:
             self.notes_dir, self.notes, self.links = notes_dir, notes, set(links)
             self.build_id, self.rev = build_id, 0
             self._stamp = self._graph_stamp()
-            self._born = {}         # a new index: the notes of this run are no longer known as this run's
 
     def refresh_if_rebuilt(self) -> None:
-        """Someone ran build.py while the server was up: take the new index in."""
+        """Someone ran build.py while the server was up: take the new index in. It is loaded from the folder that
+        config.json names NOW ("set notes_dir, run build.py"), when that is a folder. Else the current one stays."""
         with self.lock:
             if self._graph_stamp() != self._stamp:
-                self.load(self.notes_dir)
+                self.load(self._configured_dir())
+
+    def _configured_dir(self) -> Path:
+        config = load_config()
+        if config.get("_error"):                # a file that cannot be read names no folder
+            return self.notes_dir
+        try:
+            wanted = build.resolve_notes_dir(config["notes_dir"])
+            return wanted if wanted.is_dir() else self.notes_dir
+        except (OSError, ValueError):
+            return self.notes_dir
 
     @staticmethod
     def _graph_stamp() -> int | None:
@@ -397,8 +481,9 @@ class Galaxy:
 
     # -- search
 
-    def search(self, tokens, follow_up=frozenset(), limit: int = RETRIEVE_TOP) -> list[tuple[int, float]]:
-        """The notes that best match the keywords, as (index, score), best first."""
+    def search(self, tokens, follow_up=frozenset(), limit: int = RETRIEVE_TOP) -> list[tuple[int, float, str]]:
+        """The notes that best match the keywords, as (index, score, label), best first. All three come from one
+        copy of the index, so a new index that comes in meanwhile cannot give an index another note's label."""
         with self.lock:
             notes = list(self.notes)
         extra = set(follow_up) - set(tokens)
@@ -406,8 +491,8 @@ class Galaxy:
         for index, note in enumerate(notes):
             score = build.keyword_score(tokens, note) + FOLLOW_UP_WEIGHT * build.keyword_score(extra, note)
             if score > 0:
-                scored.append((index, score))
-        scored.sort(key=lambda pair: (-pair[1], pair[0]))
+                scored.append((index, score, note.label))
+        scored.sort(key=lambda hit: (-hit[1], hit[0]))
         return scored[:limit]
 
     # -- new notes
@@ -520,7 +605,7 @@ class Galaxy:
                 copy += 1
                 destination = trash / f"{stamp}-{copy} {source.name}"
             os.replace(source, destination)
-            self._drop_newest(lambda: os.replace(destination, source), destination)
+            self._drop_newest(lambda: self._move_back(destination, source), destination)
             self._born.pop(note.path, None)
             return {"index": index, "title": note.label, "trash": destination.relative_to(self.notes_dir).as_posix()}
 
@@ -528,8 +613,8 @@ class Galaxy:
         """The mirror of birth_note, for a note that THIS run made a moment ago (a teardown that failed after it).
         Only the newest note, only when it is still the note on the receipt, and only when its file still holds
         the bytes that birth_note wrote. The file is seconds old, so it is deleted for good, not moved to the
-        trash. It is deleted only after the galaxy is saved without it: until then it waits under a name that
-        is not a note."""
+        trash. First it is moved aside, under a name that is not a note. The bytes checked are the bytes of that
+        file, the one that will be deleted. It is deleted only after the galaxy is saved without it."""
         with self.lock:
             self.refresh_if_rebuilt()
             index = receipt.get("index") if isinstance(receipt, dict) else None
@@ -539,14 +624,25 @@ class Galaxy:
                 raise ValueError("only the newest note, the one on the receipt, can be taken back")
             target = self._note_path(note.path)
             written = self._born.get(note.path)
-            if written is None or hashlib.sha256(target.read_bytes()).hexdigest() != written:
-                raise ValueError("the note was changed after it was made, so it stays")
+            if written is None:
+                raise ValueError("Jarviz did not make that note in this run, so it stays")
             aside, number = target.with_name(f"{target.name}.taken"), 1
             while aside.exists():
                 number += 1
                 aside = target.with_name(f"{target.name}.taken{number}")
             os.replace(target, aside)
-            self._drop_newest(lambda: os.replace(aside, target), aside)
+            try:
+                same = hashlib.sha256(aside.read_bytes()).hexdigest() == written
+            except OSError:
+                same = False                # bytes that cannot be read are not proven to be Jarviz's
+            if not same:                    # the index is not touched: the file goes back, and stays
+                try:
+                    self._move_back(aside, target)
+                except OSError as trouble:
+                    raise OSError(trouble.errno, "The note was changed after it was made, and it could not be put "
+                                                 f"back. Its file is now {self._place(aside)}") from trouble
+                raise ValueError("the note was changed after it was made, so it stays")
+            self._drop_newest(lambda: self._move_back(aside, target), aside)
             self._born.pop(note.path, None)
             try:
                 aside.unlink()
@@ -558,6 +654,33 @@ class Galaxy:
                     folder.rmdir()
             except OSError:
                 pass
+
+    def _place(self, path: Path) -> str:
+        """Where a file is, for an error: relative to the notes folder when it is inside it."""
+        return path.relative_to(self.notes_dir).as_posix() if path.is_relative_to(self.notes_dir) else str(path)
+
+    @staticmethod
+    def _move_back(staged: Path, home: Path) -> None:
+        """Put a file that waits under another name back at `home`. It never overwrites a file: when another
+        program made a file at `home` in the meantime, FileExistsError, and the staged file stays. A write that
+        fails half-way removes the half file it made, and the staged file stays then too."""
+        data = staged.read_bytes()
+        made = False
+        try:
+            with open(home, "xb") as handle:        # "x": only a new file, never over one that is there
+                made = True
+                handle.write(data)
+        except BaseException:
+            if made:
+                try:
+                    home.unlink(missing_ok=True)
+                except OSError:
+                    pass                            # the error that stopped the move is the one to report
+            raise
+        try:
+            staged.unlink()
+        except OSError:
+            pass            # the note is back. The staged name does not end in .md: it is no note.
 
     def _restore(self, before: tuple) -> None:
         """Put the index in memory back to a copy taken before a change: (notes, links, rev). The same list and
@@ -586,11 +709,9 @@ class Galaxy:
             self._restore(before)
             try:
                 put_file_back()
-            except OSError as trouble:
-                where = (kept_at.relative_to(self.notes_dir).as_posix() if kept_at.is_relative_to(self.notes_dir)
-                         else str(kept_at))
-                raise OSError(trouble.errno, f"The galaxy could not be saved, and the note could not be put back. "
-                                             f"Its file is now {where}") from error
+            except OSError as trouble:              # FileExistsError too: a new file at the old place stays
+                raise OSError(trouble.errno, "The galaxy could not be saved, and the note could not be put back. "
+                                             f"Its file is now {self._place(kept_at)}") from error
             raise
 
 
@@ -608,6 +729,7 @@ class Session:
         self.last_tokens: frozenset = frozenset()
         self.last_sources: list[tuple[int, str]] = []       # (index, title): a stale index is never trusted
         self.used = time.monotonic()
+        self._undo: tuple | None = None                     # what the newest record() changed, for take_back()
 
     def snapshot(self) -> tuple[list[dict], frozenset, list[int]]:
         """The history, the last keywords, and the last sources that still are the same notes."""
@@ -624,18 +746,48 @@ class Session:
                        if (note := GALAXY.note(index)) is not None and note.label == title]
         return history, tokens, still_there
 
-    def record(self, said: str, replied: str, tokens, nodes: list[int], receipt: str | None = None) -> None:
-        sources = [(index, note.label) for index in nodes if (note := GALAXY.note(index)) is not None]
+    def record(self, said: str, replied: str, tokens, nodes: list[int], receipt: str | None = None,
+               labels: dict[int, str] | None = None) -> list:
+        """Add one turn and return it. `labels`: the title each index had when the notes were offered (a source
+        is kept with that title). Without it, the title the index has now."""
+        if labels is None:
+            sources = [(index, note.label) for index in nodes if (note := GALAXY.note(index)) is not None]
+        else:
+            sources = [(index, labels[index]) for index in nodes if index in labels]
+        turn = [said, replied, [receipt] if receipt else []]
         with self.lock:
-            self.turns.append([said, replied, [receipt] if receipt else []])
+            dropped = self.turns[0] if len(self.turns) == self.turns.maxlen else None
+            self._undo = (turn, dropped, self.last_tokens, self.last_sources)
+            self.turns.append(turn)
             self.last_tokens = frozenset(tokens)
             self.last_sources = sources
+        return turn
 
-    def add_receipt(self, line: str) -> None:
-        """Proof of a later action on the newest turn (for example: the note was taken back)."""
+    def take_back(self, turn: list) -> None:
+        """Remove a turn that record() just made, for an action that did not start after all. When it is still the
+        newest record, the session is put back as it was before it. Else only the turn goes."""
         with self.lock:
-            if self.turns:
-                self.turns[-1][2].append(line)
+            undo, self._undo = self._undo, None
+            if undo is not None and undo[0] is turn and self.turns and self.turns[-1] is turn:
+                self.turns.pop()
+                if undo[1] is not None:
+                    self.turns.appendleft(undo[1])
+                self.last_tokens, self.last_sources = undo[2], undo[3]
+                return
+            for position, kept in enumerate(self.turns):
+                if kept is turn:
+                    del self.turns[position]
+                    return
+
+    def add_receipt(self, line: str, turn: list | None = None) -> None:
+        """Proof of a later action. With `turn`: on that turn, only while it is still in the history (else the line
+        is dropped). Without it: on the newest turn (for example: the note was taken back)."""
+        with self.lock:
+            if turn is None:
+                if self.turns:
+                    self.turns[-1][2].append(line)
+            elif any(kept is turn for kept in self.turns):
+                turn[2].append(line)
 
 
 SESSIONS: dict[str, Session] = {}
@@ -666,15 +818,18 @@ PROMPT_TAG_RE = re.compile(r"<(/?)(notes?|receipts|question)\b", re.IGNORECASE)
 # A sentence asks for a teardown when (A) it has a teardown verb, such as "reverse engineer" or "take apart",
 # or (B) it asks how a thing is built AND names something site-like ("website", "homepage", or an address such
 # as igloo.inc). "How does the loan work?" has no site, and a site word alone is never enough.
-# A sentence ABOUT a teardown does not ask FOR one. So the clauses about a teardown that is there, or about the
-# past, are taken out first, and (A) or (B) must hold on what is left. Three shapes are "about":
+# A sentence ABOUT a teardown does not ask FOR one. The sentence is cut into clauses. A clause ends at , ; : ? !
+# at a full stop (not at the dot in stripe.com), at "then", and at an "and" that a request follows ("and tear down
+# X", "and run one"). In each clause, the part about a teardown that is there, or about the past, is taken out,
+# from where it starts to the end of the clause. (A) or (B) must then hold on what is left. Four shapes start it:
 # (i) a question word and a helping verb, then the noun: "what did my teardown of X say", "what is a teardown";
 # (ii) did, have, had or has, then I, we, you or Jarviz, then a teardown verb: "when did I tear down X";
-# (iii) a verb that shows, asks after or stops a teardown named as one that is there (the, my, that, last, old...):
-# "open the last teardown", "is the teardown done", "cancel the teardown". "Show me A teardown" is not one.
-# In (i) and (iii) one name may stand after the, my, last...: "what did the stripe.com teardown say".
-# A clause ends at , ; : ? ! or a full stop (not at the dot in stripe.com), or at "then". So "Show me the last
-# teardown, then tear down stripe.com" still asks for one.
+# (iii) the noun with the, my, that, last, old... in front of it (one name may stand between: "the stripe.com
+# teardown"), and no start verb (do, run, redo...) before it in its clause: "can you summarize my teardown of X";
+# (iv) a refusal (do not, never, not to, can't, without, avoid...) before the verb or the noun: "don't tear down X".
+# So "redo my teardown of X", "show me A teardown of X" and "show me the last teardown and tear down X" ask for one.
+# The noun is never a part of an address: "teardown.com" is a site.
+# This is a pattern, not an understanding of English. The brain decides first; this gate can only refuse.
 REMEMBER_RE = re.compile(
     r"\b(?:remember|memori[sz]e|save|log|record|jot|store|remind|write\s+(?:\w+\s+)?down"
     r"|keep\s+(?:in\s+mind|track)|don'?t\s+(?:let\s+me\s+)?forget"
@@ -682,19 +837,31 @@ REMEMBER_RE = re.compile(
 TEARDOWN_VERB_RE = re.compile(
     r"reverse[\s-]*engineer|tear(?:ing)?[\s-]*(?:\S+\s+){0,4}?down|teardown|take\s+(?:\S+\s+){0,4}?apart|x-?ray",
     re.IGNORECASE)
+TEARDOWN_NOUN = r"(?<![\w.-])teardowns?(?![\w-]|\.\w)"      # the noun, never a part of an address (teardown.com)
+START_VERBS = r"do|run|start|begin|launch|make|perform|redo|repeat|rerun|refresh|update"
 EXISTING_WORDS = r"the|my|our|your|that|this|those|these|last|latest|previous|earlier|old|existing|saved|recent|full"
 NAME_WORD = r"(?!then\b)[^\W_]+(?:[.-][^\W_]+)*"      # one word such as stripe.com or igloo: letters, digits, . and -
-ABOUT_TEARDOWN_RE = re.compile(     # the clauses about a teardown (i, ii, iii above), each to the end of its clause
-    r"(?:\b(?:what|when|where|which|who|why|how)(?:['’]s|\s+(?:is|are|was|were|do|does|did|has|have|had))"
-    rf"\s+(?:(?:(?:a|an|{EXISTING_WORDS})\s+){{1,3}}(?:{NAME_WORD}\s+)?)?teardowns?\b"          # (i)
+CLAUSE_END_RE = re.compile(
+    r"[,;:?!\n]|\.(?!\w)|\bthen\b"
+    rf"|\band\b(?=\s+(?:(?:then|please|also|now|just)\s+)*(?:{TEARDOWN_VERB_RE.pattern}|(?:{START_VERBS})\b))",
+    re.IGNORECASE)
+ABOUT_TEARDOWN_RE = re.compile(     # where shape (i) or shape (ii) starts in a clause
+    r"\b(?:what|when|where|which|who|why|how)(?:['’]s|\s+(?:is|are|was|were|do|does|did|has|have|had))"
+    rf"\s+(?:(?:(?:a|an|{EXISTING_WORDS})\s+){{1,3}}(?:{NAME_WORD}\s+)?)?{TEARDOWN_NOUN}"        # (i)
     r"|\b(?:did|have|had|has)\s+(?:i|we|you|jarvi[sz])\s+"                                         # (ii)
     r"(?:(?:already|ever|yet|just|recently|once|before|previously|really|actually)\s+)*"
-    rf"(?={TEARDOWN_VERB_RE.pattern})"
-    r"|\b(?:show|open|read|find|get|see|view|display|close|is|are|was|were|did|does|has|had"
-    r"|cancel|stop|abort|halt|kill|end)(?:\s+(?:me|us))?"                                            # (iii)
-    rf"\s+(?:(?:{EXISTING_WORDS})\s+){{1,3}}(?:{NAME_WORD}\s+)?teardowns?\b)"
-    r"(?:(?!\bthen\b)(?:[^,;:?!.\n]|\.(?=\w)))*",          # ...and the rest of that clause
+    rf"(?={TEARDOWN_VERB_RE.pattern})",
     re.IGNORECASE)
+NAMED_TEARDOWN_RE = re.compile(     # shape (iii): the noun with the, my, last... in front of it
+    rf"\b(?:{EXISTING_WORDS})(?:\s+(?:{EXISTING_WORDS})){{0,2}}\s+(?:{NAME_WORD}\s+)?{TEARDOWN_NOUN}", re.IGNORECASE)
+START_VERB_RE = re.compile(rf"\b(?:{START_VERBS})\b", re.IGNORECASE)
+REFUSAL_RE = re.compile(            # shape (iv): a word that says NOT to do it
+    r"\b(?:do\s+not|don['’]?t|never|no\s+need\s+to|not\s+to|should\s+not|shouldn['’]?t|must\s+not|mustn['’]?t"
+    r"|cannot|will\s+not|(?:can|won)['’]?t(?!\s+(?:you|we)\b)"   # "can't you tear down X?" asks for one
+    r"|stop|without|avoid|no(?=\s+teardowns?\b))\b"
+    r"(?!\s+(?:forget|hesitate)\b)",                           # "don't forget to tear down X" asks for one
+    re.IGNORECASE)
+WHY_BEFORE_RE = re.compile(r"\bwhy\s*\Z", re.IGNORECASE)      # "why don't you tear down X?" asks for one
 TEARDOWN_QUESTION_RE = re.compile(r"""
     \bhow\s+(?:does|do|did|is|are|was|were)\b .{0,80}?
     \b(?:work|works|working|built|made|make|makes|do|does|done|animate|animates|animated
@@ -712,9 +879,33 @@ def asks_to_remember(sentence: str) -> bool:
     return bool(REMEMBER_RE.search(sentence))
 
 
+def _about_from(clause: str) -> int:
+    """Where the part about a teardown that is there, about the past, or refused, starts in one clause (its length:
+    none)."""
+    found = ABOUT_TEARDOWN_RE.search(clause)
+    starts = [found.start()] if found else []
+    named = NAMED_TEARDOWN_RE.search(clause)
+    if named and not START_VERB_RE.search(clause, 0, named.start()):
+        starts.append(named.start())
+    for refusal in REFUSAL_RE.finditer(clause):
+        if WHY_BEFORE_RE.search(clause, max(0, refusal.start() - 16), refusal.start()):
+            continue                        # "why don't you...": a suggestion, not a refusal
+        if TEARDOWN_VERB_RE.search(clause, refusal.end()):
+            starts.append(refusal.start())
+        break                               # a verb after a later refusal is after this one too
+    return min(starts, default=len(clause))
+
+
 def asks_for_teardown(sentence: str) -> bool:
-    """Rule (A) or rule (B) above, on what is left when the clauses about a teardown are taken out."""
-    rest = ABOUT_TEARDOWN_RE.sub(" ", sentence)
+    """Rule (A) or rule (B) above, on what is left when the parts about a teardown are taken out."""
+    kept, start = [], 0
+    for end in [*CLAUSE_END_RE.finditer(sentence), None]:
+        clause = sentence[start:end.start() if end else len(sentence)]
+        kept.append(clause[:_about_from(clause)])
+        if end:
+            kept.append(end.group())
+            start = end.end()
+    rest = " ".join(kept)
     return bool(TEARDOWN_VERB_RE.search(rest)
                 or (TEARDOWN_QUESTION_RE.search(rest) and SITE_WORD_RE.search(rest)))
 
@@ -782,15 +973,23 @@ def note_block(index: int, note: build.Note) -> str:
     return f'<note number="{index}" title="{title}" folder="{folder}">\n{text}\n</note>'
 
 
-def render_turn(question: str, offered: list[int]) -> str:
-    """What the brain reads for one question: the matching notes, then the question."""
-    parts = []
-    blocks = [note_block(index, note) for index in offered if (note := GALAXY.note(index)) is not None]
-    total = GALAXY.meta()["count"]
+def render_turn(question: str, offered: list[int]) -> tuple[str, dict[int, str]]:
+    """What the brain reads for one question: the matching notes, then the question. Also the title of each note
+    it was shown, by its number: from the same copy of the index as the text."""
+    with GALAXY.lock:
+        shown = [(index, note) for index in offered if (note := GALAXY.note(index)) is not None]
+        total = len(GALAXY.notes)
+    blocks = [note_block(index, note) for index, note in shown]
     body = "\n".join(blocks) if blocks else "No note matched this message."
-    parts.append(f'<notes total_in_second_brain="{total}">\n{body}\n</notes>')
-    parts.append(f"<question>\n{question}\n</question>")
-    return "\n\n".join(parts)
+    parts = [f'<notes total_in_second_brain="{total}">\n{body}\n</notes>', f"<question>\n{question}\n</question>"]
+    return "\n\n".join(parts), {index: note.label for index, note in shown}
+
+
+def still_the_same(index: int, labels: dict[int, str]) -> bool:
+    """True when the note at `index` is still the one that was offered under that number (a new index can come in
+    while the brain thinks)."""
+    note = GALAXY.note(index)
+    return note is not None and index in labels and note.label == labels[index]
 
 
 # -------------------------------------------------------------------- routes
@@ -804,11 +1003,11 @@ def chat_route(payload: dict) -> tuple[int, dict]:
 
     history, last_tokens, last_sources = session.snapshot()
     tokens = frozenset(build.tokenize(question))
-    offered = [index for index, _ in GALAXY.search(tokens, last_tokens)]
+    offered = [index for index, _, _ in GALAXY.search(tokens, last_tokens)]
     carried = [index for index in last_sources if index not in offered]
     offered += carried[: max(0, RETRIEVE_TOP - len(offered))]
 
-    turn = render_turn(question, offered)
+    turn, labels = render_turn(question, offered)       # labels: the title of each note the brain was shown
     try:
         text = ask_model("chat", history + [{"role": "user", "content": turn}])
     except BrainTrouble as error:
@@ -823,10 +1022,11 @@ def chat_route(payload: dict) -> tuple[int, dict]:
         answer, declared = LINES["not_asked"], []       # the user did not ask for this action
     elif LONE_TAG_RE.fullmatch(answer):
         answer = LINES["unknown_tag"]
-    # Only notes the brain says it used move the camera. No SOURCES line means the graph holds still.
-    nodes = list(dict.fromkeys(index for index in declared or [] if index in offered))
+    # Only notes the brain says it used move the camera. No SOURCES line means the graph holds still. A number
+    # whose note is not the one the brain was shown any more (a new index came in) is dropped.
+    nodes = list(dict.fromkeys(index for index in declared or [] if still_the_same(index, labels)))
     answer = answer or LINES["empty"]
-    session.record(question, answer, tokens, nodes)
+    session.record(question, answer, tokens, nodes, labels=labels)
     return 200, reply(answer, nodes, sources_declared=declared is not None)
 
 
@@ -899,9 +1099,8 @@ def search_route(query: dict) -> tuple[int, dict]:
     """What the search index finds for ?q=, without asking the brain."""
     GALAXY.refresh_if_rebuilt()
     question = clean_text((query.get("q") or [""])[0], MAX_MESSAGE_CHARS)
-    hits = GALAXY.search(frozenset(build.tokenize(question)))
-    results = [{"index": index, "label": note.label, "score": round(score, 2)}
-               for index, score in hits if (note := GALAXY.note(index)) is not None]
+    hits = GALAXY.search(frozenset(build.tokenize(question)))       # index, score and label from one copy
+    results = [{"index": index, "label": label, "score": round(score, 2)} for index, score, label in hits]
     return 200, {"ok": True, "results": results, "graph": GALAXY.meta()}
 
 
@@ -951,17 +1150,18 @@ def teardown_line(job: dict) -> str:
     return LINES["teardown_failed"].format(reason=reason_of(ValueError(error.get("detail") or "No reason was given")))
 
 
-def _teardown_done(job, session: Session) -> None:
-    """The receipt for the chat history, so the brain knows what really happened."""
+def _teardown_done(job, session: Session, turn: list) -> None:
+    """The receipt for the chat history, so the brain knows what really happened. It goes on the turn that started
+    the job, while that turn is still in the history (a question asked while the job ran must not get it)."""
     if job.state == "done":
-        session.add_receipt(f'TEARDOWN worked: {job.site.host} was taken apart and the note "{job.result["name"]}" was saved.')
-        return
-    stayed = [str(birth.get("title")) for birth in job.births if isinstance(birth, dict) and birth.get("title")]
-    if stayed:      # a note that could not be taken back is still there: the brain must not say there is none
-        session.add_receipt(f"TEARDOWN did not finish for {job.site.host} ({job.state}). No teardown note was saved. "
-                            f"These notes were made first and stay: {', '.join(stayed)}.")
+        line = f'TEARDOWN worked: {job.site.host} was taken apart and the note "{job.result["name"]}" was saved.'
+    elif stayed := [str(birth.get("title")) for birth in job.births if isinstance(birth, dict) and birth.get("title")]:
+        # a note that could not be taken back is still there: the brain must not say there is none
+        line = (f"TEARDOWN did not finish for {job.site.host} ({job.state}). No teardown note was saved. "
+                f"These notes were made first and stay: {', '.join(stayed)}.")
     else:
-        session.add_receipt(f"TEARDOWN did not finish for {job.site.host} ({job.state}). No note was saved.")
+        line = f"TEARDOWN did not finish for {job.site.host} ({job.state}). No note was saved."
+    session.add_receipt(line, turn)
 
 
 def named_by_user(host: str, sentence: str) -> bool:
@@ -987,21 +1187,30 @@ def start_teardown(site_text: str, question: str, session: Session, said: str, h
         if not address:
             return 200, reply(LINES["teardown_which_site"], error="which_site")
         wanted = address.split("?")[0].split("#")[0]                       # a query can hold private tokens
-    site = teardown.parse_site(wanted)
-    if site is None or site.host in ALLOWED_HOSTS:           # not an address, or Jarviz's own page
-        return 400, reply(LINES["teardown_bad_site"], ok=False, error="bad_site")
-    if teardown.resolves_to_private(site.host):              # a public-looking name that points at a private network
+    site, refused = teardown.check_site(wanted)             # the one rule, shared with `python teardown.py browser`
+    if refused == "private_site":                           # a public-looking name that points at a private network
         return 400, reply(LINES["teardown_private"], ok=False, error="private_site")
+    if site is None or site.host in ALLOWED_HOSTS:          # not an address, or Jarviz's own page
+        return 400, reply(LINES["teardown_bad_site"], ok=False, error="bad_site")
     problems = teardown.diag()["problems"]
     if problems:
         return 503, reply(LINES["teardown_not_ready"].format(reason=problems[0]), ok=False, error="teardown_not_ready")
     question = clean_text(question, 300) or "How is this site built?"
+    # The turn is there BEFORE the job starts: a job can fail at once, and its receipt goes on this turn.
+    turn = session.record(said or question, f"[TEARDOWN:{site.host}|{question}]",
+                          build.tokenize(f"{site.host} {question}"), [],
+                          receipt=f"TEARDOWN started for {site.host}. It takes about a minute. The result is not in yet.")
     try:
-        job = BAY.start(site, question, headless=headless, on_done=lambda done: _teardown_done(done, session))
-    except teardown.TeardownError:
-        return 409, reply(LINES["teardown_busy"], ok=False, error="teardown_busy")
-    session.record(said or question, f"[TEARDOWN:{site.host}|{question}]", build.tokenize(f"{site.host} {question}"), [],
-                   receipt=f"TEARDOWN started for {site.host}. It takes about a minute. The result is not in yet.")
+        job = BAY.start(site, question, headless=headless, on_done=lambda done: _teardown_done(done, session, turn))
+    except teardown.TeardownError as error:
+        session.take_back(turn)                             # no job: no turn is left behind
+        if error.code == "busy":
+            return 409, reply(LINES["teardown_busy"], ok=False, error="teardown_busy")
+        reason = reason_of(ValueError(error.detail or "No reason was given"))
+        return 503, reply(LINES["teardown_not_ready"].format(reason=reason), ok=False, error="teardown_not_started")
+    except Exception:
+        session.take_back(turn)
+        raise
     line = random.choice(LINES["teardown_started"]).format(host=site.host)
     return 200, reply(line, action={"type": "teardown", "job": job.view()})
 
@@ -1013,7 +1222,15 @@ def teardown_start_route(payload: dict) -> tuple[int, dict]:
 
 
 def teardown_cancel_route(payload: dict) -> tuple[int, dict]:
-    job = BAY.cancel() if BAY is not None else None
+    """{"job": id} cancels only that job, and only while it is the one running (a test names its own job, so it
+    can never stop another). Without "job": the job that runs now ("cancel the teardown")."""
+    wanted = payload.get("job")
+    if wanted is None:
+        job = BAY.cancel() if BAY is not None else None
+    else:
+        job = BAY.cancel(job_id=wanted) if BAY is not None and isinstance(wanted, str) and wanted else None
+        if job is None:
+            return 200, reply(LINES["teardown_no_such_job"], error="no_such_job")
     if job is None:
         return 200, reply(LINES["teardown_none_running"], error="none_running")
     deadline = time.monotonic() + 12.0          # say "closed" only when the browser really is closed
@@ -1021,6 +1238,8 @@ def teardown_cancel_route(payload: dict) -> tuple[int, dict]:
         time.sleep(0.2)
     if job.state == "done":                     # it finished while the cancel was on its way: the note IS saved
         return 200, reply(LINES["teardown_too_late"], error="too_late")
+    if job.state == "failed":                   # it failed while the cancel was on its way: say why, as /teardown/status does
+        return 200, reply(teardown_line(job.view()), error="failed")
     line = LINES["teardown_cancelled" if job.state == "cancelled" else "teardown_stopping"]
     return 200, reply(line, action={"type": "teardown_cancel"})
 
@@ -1096,7 +1315,8 @@ def tag_teardown(argument: str, question: str, session: Session, payload: dict) 
 #   - preflight.py and drill.py read the same file. They never SEND the key: they sign each request
 #     with it (X-Jarviz-Sign). A signature is good for one request, for two minutes, and only for
 #     THIS start of the server (INSTANCE). So another program that sits on port 4700 while Jarviz is
-#     stopped gets nothing that it can use, also not after Jarviz starts again.
+#     stopped gets nothing that it can use, also not after Jarviz starts again. A signature that is
+#     sent a second time is refused (claim_signature), so a caught one cannot be played again.
 #   - A signature is never traded for the cookie. The cookie IS the key: the door gives it only to
 #     a caller that brought the key itself.
 #   - `python server.py --link` shows the link only after the server PROVED that it holds the key
@@ -1204,6 +1424,25 @@ def signed_body_hash(value: str, method: str, path: str) -> str | None:
         return None
     wanted = _signature(PAGE_KEY, INSTANCE, method, path, stamp, nonce, body_hash)
     return body_hash if hmac.compare_digest(given.encode("utf-8", "replace"), wanted.encode("ascii")) else None
+
+
+USED_SIGNATURES: dict[str, int] = {}     # nonce -> the last second in which its signature still holds
+USED_LOCK = threading.Lock()
+MAX_USED_SIGNATURES = 4096              # only good signatures come in here. When it is full: refuse, never forget
+
+
+def claim_signature(value: str) -> bool:
+    """A signature works once. True the first time a good signature comes; False when its nonce was used before,
+    or when the table is full. A nonce is kept until the time window of its signature ends."""
+    stamp, nonce = value.split(".")[:2]
+    now = time.time()
+    with USED_LOCK:
+        for old in [old for old, until in USED_SIGNATURES.items() if until < now]:
+            del USED_SIGNATURES[old]
+        if nonce in USED_SIGNATURES or len(USED_SIGNATURES) >= MAX_USED_SIGNATURES:
+            return False
+        USED_SIGNATURES[nonce] = int(stamp) + SIGN_WINDOW_S + 1
+        return True
 
 
 def key_proof(key: str, nonce: str, instance: str) -> str:
@@ -1356,6 +1595,8 @@ class Handler(BaseHTTPRequestHandler):
             covered = signed_body_hash(signed, self.command, self.path)
             if covered is None or (self.command != "POST" and covered != EMPTY_BODY_HASH):
                 return False
+            if not claim_signature(signed):     # the same signature a second time: locked like any other request
+                return False
             self._signed_body = covered     # _read_json checks the body against it
             return True
         return self._cookie_ok()        # a browser: the cookie
@@ -1488,16 +1729,17 @@ def main(argv: list[str]) -> int:
             print("Jarviz is not running, or it has no key file yet. Start it first: start-jarviz.bat",
                   file=sys.stderr)
         return 1
+    try:                            # the port first: a second start must not rebuild graph-data.js under the first one
+        httpd = Server((HOST, PORT), Handler)
+    except OSError:
+        print(f"Port {PORT} is busy. Jarviz may already be running. Close it, then start again.", file=sys.stderr)
+        return 1
+    write_starter_config()          # the one place that makes config.json, once, when there is none
     config = load_config()
     notes_dir = build.resolve_notes_dir(config["notes_dir"])
     if not notes_dir.is_dir():
         print(f"Notes folder not found: {notes_dir}\nSet \"notes_dir\" in config.json.", file=sys.stderr)
     GALAXY.load(notes_dir)
-    try:
-        httpd = Server((HOST, PORT), Handler)
-    except OSError:
-        print(f"Port {PORT} is busy. Jarviz may already be running. Close it, then start again.", file=sys.stderr)
-        return 1
     lock = "on"                     # only now, as the one running Jarviz: read the key, or make the first one
     try:
         PAGE_KEY = page_key()

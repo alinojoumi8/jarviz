@@ -32,6 +32,7 @@ import teardown
 
 PASS, FAIL = "pass", "fail"
 LIVE_LIMIT_S = 240          # the whole live teardown must end inside this time
+CANCEL_WAIT_S = 30          # after a cancel at the limit, how long the job may take to stop
 GOOD_TIME_S = 150           # ...and a healthy one is faster than this
 call, call_json = preflight.call, preflight.call_json
 SERVER_GONE = (OSError, http.client.HTTPException)
@@ -55,19 +56,34 @@ def job_now() -> dict:
     return status.get("job") or {}
 
 
+def cancel(job_id: str | None) -> dict:
+    """Cancel the drill's OWN job. The id goes with it, so the server can never stop another job for the drill."""
+    return call_json("POST", "/teardown/cancel", {"job": job_id or "drill-no-job"})[1]
+
+
+def _poll(job_id: str | None, limit: float) -> dict:
+    """The last view of OUR job within `limit` seconds: as soon as it is not running, or the running view at the end.
+    {} when the job is not ours."""
+    deadline, job = time.monotonic() + limit, {}
+    while time.monotonic() < deadline:
+        job = job_now()
+        if job.get("id") != job_id:
+            return {}
+        if job.get("state") != "running":
+            return job
+        time.sleep(0.5)
+    return job
+
+
 def wait_for_end(job_id: str | None, limit: float) -> dict:
     """Poll the job like the panel does. Returns the last view of OUR job ({} when it is not ours or
-    the server is gone). A job that is still running at the limit is cancelled."""
-    deadline, job = time.monotonic() + limit, {}
+    the server is gone). A job that is still running at the limit is cancelled, and polled again for
+    CANCEL_WAIT_S. A view whose state is still "running" then means: the job did not end."""
     try:
-        while time.monotonic() < deadline:
-            job = job_now()
-            if job.get("id") != job_id:
-                return {}
-            if job.get("state") != "running":
-                return job
-            time.sleep(0.5)
-        call_json("POST", "/teardown/cancel", {})
+        job = _poll(job_id, limit)
+        if job.get("state") == "running":
+            cancel(job_id)
+            job = _poll(job_id, CANCEL_WAIT_S)
     except SERVER_GONE:
         return {}
     return job
@@ -100,6 +116,8 @@ def nothing_left(report: Report, when: str) -> None:
     name = f"No investigation Chrome and no profile folder is left {when}"
     if chromes is None:         # "could not look" is never a pass
         report.add(FAIL, name, "The list of running programs could not be read, so this is not proven.")
+    elif profiles is None:
+        report.add(FAIL, name, "The profiles folder could not be listed, so this is not proven.")
     else:
         report.add(FAIL if chromes or profiles else PASS, name,
                    f"{len(chromes)} Chrome processes, {len(profiles)} profile folders" if chromes or profiles else "")
@@ -220,7 +238,7 @@ def live(report: Report, site: str, keep: Path | None) -> None:
             status, second, extra = start("example.org", session)
             if extra:                                   # it was let in: stop it, and count its files as ours
                 ours.append(extra)
-                call_json("POST", "/teardown/cancel", {})
+                cancel(extra)
                 made += made_by(wait_for_end(extra, 60))
             report.add(PASS if status == 409 and "already taking one apart" in second.get("answer", "") else FAIL,
                        "A second request while one runs is refused in one line", teardown._clean(second.get("answer"), 120))
@@ -294,7 +312,7 @@ def live(report: Report, site: str, keep: Path | None) -> None:
         if status == 200 and third:
             ours.append(third)
             time.sleep(4.0)
-            _, cancelled = call_json("POST", "/teardown/cancel", {})
+            cancelled = cancel(third)
             stopped = wait_for_end(third, 60)
             made += made_by(stopped)
             report.add(PASS if stopped.get("state") == "cancelled" and tree(folder) == tree_after_run else FAIL,
@@ -322,13 +340,19 @@ def live(report: Report, site: str, keep: Path | None) -> None:
             report.add(FAIL, failing, f"it did not start: HTTP {status}")
     finally:
         # -- put everything back, whatever happened above. Only the files of this drill's own jobs go.
+        not_ended = ""
         try:
             last = job_now()
             if last.get("id") in ours:
-                made += made_by(wait_for_end(last["id"], 90))
+                ended = wait_for_end(last["id"], 90)
+                made += made_by(ended)
+                if ended.get("state") == "running":     # it can still write a note after the put-back
+                    not_ended = last["id"]
         except SERVER_GONE:
             pass
         clean, detail = put_back(before, list(dict.fromkeys(made)))
+        if not_ended:
+            clean, detail = False, f"the job {not_ended} did not end, so the put-back is not confirmed. {detail}"
         report.add(PASS if clean else FAIL, "Everything is put back: the test note is gone and the galaxy is as before", detail)
 
 
