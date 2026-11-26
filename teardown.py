@@ -52,6 +52,8 @@ WINDOW = (1280, 820)
 BROWSER_START_S = 25.0              # how long Chrome may take to answer on the port
 PAGE_LOAD_S = 30.0                  # how long the page may take to finish loading
 SETTLE_S = 2.5                      # extra time for the intro animation
+PAGE_ASKS = 3                       # how often the browser is asked where the page is, before the job stops
+PAGE_ASK_PAUSE_S = 0.3              # the pause between two of those asks
 MAX_REA_BYTES = 200 * 1024 * 1024  # REA's answer for one command. More than this is not read.
 SECRET_ENV = re.compile(r"KEY|TOKEN|SECRET|PASSW|CREDENTIAL|AUTH", re.IGNORECASE)
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -1335,22 +1337,37 @@ def _evidence_id(data: dict) -> str:
     return value if isinstance(value, str) and re.fullmatch(r"ev_[0-9a-f]{16,80}", value) else ""
 
 
-def _refuse_local_turn(browser: Browser) -> str:
+def _refuse_local_turn(browser: Browser, resolves=resolves_to_private, pause: float = PAGE_ASK_PAUSE_S) -> str:
     """Where is the page now? A public site that sends the browser to this computer or to a private network
     is stopped at once. The browser's own answer is checked first: safe_url() falls back to the first address,
-    and that would hide the turn. A job that started on the user's own localhost is not checked."""
-    raw = browser.current_url()
+    and that would hide the turn. No answer, an address that cannot be read, and an address that is not http(s)
+    with a host cannot be proven public: they stop the job too. The first name is looked up again, because a
+    public name can come to point at a private address. A job that started on the user's own localhost is not
+    checked. `resolves` is the lookup (the offline checks give a stub).
+    What this does NOT prove: it reads where the PAGE is after the browser went there. It does not see each
+    connection that Chrome makes, so one request to a private address can happen before the job stops. A name
+    that Chrome resolves to another address than Python does is not seen either."""
     first = urlsplit(browser.url).hostname or ""
-    if raw and not is_local_name(first):
-        try:
-            host = urlsplit(raw).hostname or ""
-            unread = False
-        except ValueError:                  # an address that cannot be read cannot be proven public
-            host, unread = "", True
-        if (unread or is_local_name(host) or is_private_address(host)
-                or (host and host != first and ip_literal(host) is None and resolves_to_private(host))):
-            raise TeardownError("redirected", "The site sent the browser to an address on this computer or on a "
-                                              "private network. Jarviz stopped there.")
+    if is_local_name(first):
+        return safe_url(browser.current_url(), browser.url)
+    raw = ""
+    for ask in range(PAGE_ASKS):            # an empty answer can be a slow moment of the browser: ask again
+        raw = browser.current_url()
+        if raw or ask == PAGE_ASKS - 1:
+            break
+        time.sleep(pause)
+    if not raw:
+        raise TeardownError("page_lost", "Jarviz could not see where the page is now, so it stopped.")
+    try:
+        parts = urlsplit(raw)
+        scheme, host = parts.scheme, parts.hostname or ""
+    except ValueError:                      # an address that cannot be read cannot be proven public
+        scheme, host = "", ""
+    if scheme not in ("http", "https") or not host:
+        raise TeardownError("page_lost", "The page is not on a web address that Jarviz can check, so it stopped.")
+    if is_local_name(host) or is_private_address(host) or (ip_literal(host) is None and resolves(host)):
+        raise TeardownError("redirected", "The site sent the browser to an address on this computer or on a "
+                                          "private network. Jarviz stopped there.")
     return safe_url(raw, browser.url)
 
 
@@ -2121,7 +2138,10 @@ class Bay:
             births.append(self._birth(f"{TEARDOWNS_DIR}/{name}.md", content))
         except Exception:
             if not births or births[-1].get("title") != name:
-                image_path.unlink(missing_ok=True)          # no picture without its note
+                try:
+                    image_path.unlink(missing_ok=True)      # no picture without its note
+                except OSError:
+                    pass                    # a locked file: the notes must still be taken back below
             for path in made_folders:       # rmdir takes only an empty folder, and these are only the job's own
                 try:
                     path.rmdir()
@@ -2278,6 +2298,25 @@ def offline_checks() -> list[tuple[str, bool, str]]:
     kept = [birth.get("file") for birth in job.births] == [OWNER_PATH] and job.view()["births"] == job.births
     results.append(("without a way to take it back, the note stays on the job's list, and no picture is left",
                     raised and kept and not left, f"raised {raised}, births {job.births}, left {left}"))
+    # The picture cannot be removed (a locked file on Windows). The note is still taken back, and the error
+    # that stopped the job is still the one raised. Only Path.unlink of a .png fails, and only for this call.
+    real_unlink, tried = Path.unlink, []
+
+    def locked_unlink(self, *args, **kwargs):
+        if self.suffix == ".png":
+            tried.append(self.name)
+            raise PermissionError(13, "The file is in use")
+        return real_unlink(self, *args, **kwargs)
+
+    taken = []
+    Path.unlink = locked_unlink
+    try:
+        job, raised, left = failed_write(taken.append)
+    finally:
+        Path.unlink = real_unlink
+    results.append(("a picture that cannot be removed does not stop the take-back, nor hide the first error",
+                    raised and bool(tried) and job.births == [] and taken == [{"file": OWNER_PATH, "title": OWNER_NAME}],
+                    f"raised {raised}, tried {tried}, births {job.births}, taken back {taken}"))
     # A public site may not send the clean browser to this computer or to a private network. No lookups here.
     private = ("192.168.1.1", "10.0.0.5", "172.16.0.9", "169.254.169.254", "127.0.0.1", "::1", "[fd00::1]",
                "::ffff:10.0.0.1", "0.0.0.0", "100.64.0.1", "fe80::1%eth0")
@@ -2286,27 +2325,53 @@ def offline_checks() -> list[tuple[str, bool, str]]:
     results.append(("private IP addresses are known, and a name or a public address is not one", not wrong, f"wrong: {wrong}"))
 
     class StubBrowser:
-        url = "https://example.com/"
+        """Gives the answers in turn, then the last one again. It counts the asks."""
 
-        def __init__(self, now: str):
-            self.now = now
+        def __init__(self, *answers: str, url: str = "https://example.com/"):
+            self.url, self.answers, self.asked = url, answers, 0
 
         def current_url(self) -> str:
-            return self.now
+            self.asked += 1
+            return self.answers[min(self.asked, len(self.answers)) - 1]
 
-    stopped, let_through = [], []
-    for turn in ("http://192.168.1.1/admin", "http://[fd00::1]/", "http://router.lan/", "http://[::ffff:127.0.0.1]:8080/"):
+    looked_up: list[str] = []
+
+    def turn(browser: StubBrowser, private: bool = False) -> str:
+        """The address the check lets through, or the code it stops with. The lookup is a stub."""
+        def lookup(host: str) -> bool:
+            looked_up.append(host)
+            return private
         try:
-            _refuse_local_turn(StubBrowser(turn))
-            let_through.append(turn)
+            return _refuse_local_turn(browser, resolves=lookup, pause=0)
         except TeardownError as error:
-            stopped.append(error.code == "redirected")
-    try:
-        same_site = _refuse_local_turn(StubBrowser("https://example.com/next")) == "https://example.com/next"
-    except TeardownError:
-        same_site = False
+            return error.code
+
+    stopped = [turn(StubBrowser(address)) for address in ("http://192.168.1.1/admin", "http://[fd00::1]/",
+                                                         "http://router.lan/", "http://[::ffff:127.0.0.1]:8080/")]
+    same_site = turn(StubBrowser("https://example.com/next"))
     results.append(("a redirect to a private address stops the teardown, a move on the same site does not",
-                    all(stopped) and not let_through and same_site, f"let through {let_through}, same site {same_site}"))
+                    stopped == ["redirected"] * 4 and same_site == "https://example.com/next",
+                    f"got {stopped}, same site {same_site}"))
+    lost = StubBrowser("")
+    got = turn(lost)
+    results.append(("the teardown stops when the browser cannot say where the page is",
+                    got == "page_lost" and lost.asked == PAGE_ASKS, f"got {got}, asked {lost.asked} times"))
+    once = StubBrowser("", "https://example.com/next")
+    got = turn(once)
+    results.append(("one empty answer from the browser is asked again, not taken as a stop",
+                    got == "https://example.com/next" and once.asked == 2, f"got {got}, asked {once.asked} times"))
+    odd = [turn(StubBrowser(address)) for address in ("about:blank", "chrome-error://chromewebdata/", "https://[bad/",
+                                                      "https:///no-host")]
+    results.append(("a page that is not on a web address with a host stops the teardown", odd == ["page_lost"] * 4, str(odd)))
+    looked_up.clear()
+    moved = turn(StubBrowser("https://example.com/next"), private=True)
+    results.append(("the first name is looked up again, and a private answer stops the teardown",
+                    moved == "redirected" and looked_up == ["example.com"], f"got {moved}, looked up {looked_up}"))
+    looked_up.clear()
+    home = StubBrowser("", url="http://localhost:3000/")
+    got = turn(home, private=True)
+    results.append(("a job on the user's own localhost is not checked", got == "http://localhost:3000/" and not looked_up,
+                    f"got {got}, looked up {looked_up}"))
     results.append(("the REA note and the Jarviz note link to each other",
                     f"[[{OWNER_NAME}]]" in concept_note(OWNER_NAME) and f"[[{CONCEPT_NAME}]]" in owner_note()
                     and "[[" not in concept_note(None).split("\n\n")[1], concept_note(None)))

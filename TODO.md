@@ -32,7 +32,7 @@ Jarviz has five brains. One is active. The screen shows it at the top (`brain: .
 | Claude (`anthropic`) | `anthropic_api_key` | `model` | `claude-opus-5-5` |
 | OpenAI (`openai`) | `openai_api_key` | `openai_model` | `gpt-6.2-sol` |
 | DeepSeek (`deepseek`) | `deepseek_api_key` | `deepseek_model` | `deepseek-flash` |
-| Venice (`venice`) | `venice_api_key` | `venice_model` | `venice-uncensored-1-2` |
+| Venice (`venice`) | `venice_api_key` | `venice_model` | `deepseek-v4-1-flash-1017-uncensored` |
 | OpenRouter (`openrouter`) | `openrouter_api_key` | `openrouter_model` | `openrouter/auto` |
 
 - **Add a key:** open `config.json`, replace `PUT-YOUR-KEY-HERE` on that brain's key line, save. No restart.
@@ -42,8 +42,8 @@ Jarviz has five brains. One is active. The screen shows it at the top (`brain: .
 - Your notes go to the company of the brain that you choose.
 - After you add a key, run `python preflight.py`. It makes one real call to every brain that has a key.
 - [x] Claude: tested with the real key.
-- [x] OpenAI, DeepSeek, OpenRouter: tested with real keys. Each one answered one real call in preflight.
-- [ ] Venice: its key is in `config.json`, but Venice refuses it ("Authentication failed"). The other brains use the same code and work. Make a new key at Venice and type it into `venice_api_key`. Then run `python preflight.py`.
+- [x] OpenAI, DeepSeek, Venice, OpenRouter: tested with real keys. Each one answered one real call in preflight.
+- Venice refused its key in one earlier run ("Authentication failed"). In the last run it answered. If it refuses again, make a new key at Venice and type it into `venice_api_key`.
 
 ## Part One: the foundation
 
@@ -79,7 +79,7 @@ Still to prove:
 
 Proven with the real brain and a real public site (igloo.inc):
 
-- [x] Last run: `PREFLIGHT: 22 pass, 1 fail, 0 warn` and `DRILL: 54 pass, 0 fail`. The one fail is the Venice key (see "Brains"). Preflight has 23 checks now, because four more brains have a key.
+- [x] Last run: `PREFLIGHT: 24 pass, 0 fail, 0 warn` and `DRILL: 60 pass, 0 fail`. Preflight has 24 checks now: four more brains have a key, and one check is new (a save that fails).
 - [x] The drill passed with a hidden browser, and also with the Chrome window on screen (`python drill.py --visible`). The snapshot from the visible window is a real picture.
 - [x] A full teardown in about one minute: 96 files, 14.7 MB, Three.js r165, GSAP 3.12.5, postprocessing 6.35.5.
 - [x] The card shows the 8 steps live, then the snapshot, the stack and the totals. The reader shows the whole note.
@@ -103,6 +103,14 @@ Review:
   - After a note is born or taken back, the live links are the same as after a full rebuild (`build.relink`).
   - A teardown tag from the brain runs only for a sentence that asks for a teardown, not one that only mentions a site.
   - A teardown that fails takes back the Jarviz and REA notes it made (`Galaxy.unbirth`).
+- [x] CodeRabbit then read those 4 fixes and gave 8 findings. 6 are fixed:
+  - The teardown stops when the browser cannot say where the page is, or when the page is not on a web address. Before, it went on.
+  - A take-back deletes a note for good only when the file still holds what Jarviz wrote. A file that someone changed stays.
+  - A save that fails puts the index in memory back first, then the file. The galaxy and the files cannot disagree after it.
+  - A picture that cannot be deleted no longer stops the take-back of the notes.
+  - A `[[link]]` that thousands of notes use can no longer make the server freeze when a note with that name is born.
+  - "What did my teardown of stripe.com say?" does not ask for a new teardown.
+- The other 2 findings are one limit that is not closed. It is written under "Not proven" below.
 
 The page lock (it was the known gap, it is closed now):
 
@@ -128,6 +136,7 @@ Not proven:
 
 - [ ] "This site" on a Mac (it reads the front Chrome tab). This computer has Windows, so Jarviz asks for the name.
 - [ ] A teardown written by a brain other than Claude.
+- [ ] The clean Chrome and your private network. Jarviz checks where the PAGE is. It does not see each connection that Chrome makes. So a hostile public site can make the clean Chrome send one request to an address on your home network before Jarviz stops the job. Jarviz reads nothing from that page, and the clean Chrome has no logins. An ordinary browser has the same weak point with such a site. To stop the request itself, Jarviz needs a filter between Chrome and the network (a small proxy). That is not built: it is your decision.
 
 ## Try it
 

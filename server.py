@@ -352,6 +352,9 @@ class Galaxy:
         self.build_id = ""
         self.rev = 0
         self._stamp: int | None = None
+        # The sha256 of the bytes that birth_note wrote, for each note it made (key: the note's path). unbirth
+        # deletes a file only when it still holds those bytes. It stays here: the receipt goes to the page.
+        self._born: dict[str, str] = {}
 
     # -- loading
 
@@ -361,6 +364,7 @@ class Galaxy:
             self.notes_dir, self.notes, self.links = notes_dir, notes, set(links)
             self.build_id, self.rev = build_id, 0
             self._stamp = self._graph_stamp()
+            self._born = {}         # a new index: the notes of this run are no longer known as this run's
 
     def refresh_if_rebuilt(self) -> None:
         """Someone ran build.py while the server was up: take the new index in."""
@@ -426,8 +430,10 @@ class Galaxy:
             if target.exists():
                 raise FileExistsError(17, "A note with that name already exists")
             target.parent.mkdir(parents=True, exist_ok=True)
+            data = content.encode("utf-8")
+            before = (list(self.notes), set(self.links), self.rev)     # the vault is small: a copy is cheap
             try:
-                target.write_text(content, encoding="utf-8", newline="\n")
+                target.write_bytes(data)
                 note = build.make_note(target, self.notes_dir)
                 index = len(self.notes)
                 new_links = build.links_for_new(note, self.notes)
@@ -439,20 +445,16 @@ class Galaxy:
                 added, removed = build.relink(self.notes, self.links, flipped)
                 self.links |= added
                 self.links -= removed
-                steps = 2 if added or removed else 1     # the page expects one step, so it reads the whole file
-                self.rev += steps
+                self.rev += 2 if added or removed else 1     # the page expects one step, so it reads the whole file
+                self._save_graph()
+            except BaseException:
+                self._restore(before)               # any error: the index in memory is what it was
                 try:
-                    self._save_graph()
+                    target.unlink(missing_ok=True)  # no half-born notes: the file goes if the index failed
                 except OSError:
-                    self.notes.pop()
-                    self.links -= added
-                    self.links |= removed
-                    self.links.difference_update(new_links)
-                    self.rev -= steps
-                    raise
-            except Exception:
-                target.unlink(missing_ok=True)      # no half-born notes: the file goes if the index failed
+                    pass                            # the error that stopped the birth is the one to report
                 raise
+            self._born[note.path] = hashlib.sha256(data).hexdigest()
             return {
                 "index": index,
                 "title": note.label,
@@ -518,13 +520,16 @@ class Galaxy:
                 copy += 1
                 destination = trash / f"{stamp}-{copy} {source.name}"
             os.replace(source, destination)
-            self._drop_newest(lambda: os.replace(destination, source))
+            self._drop_newest(lambda: os.replace(destination, source), destination)
+            self._born.pop(note.path, None)
             return {"index": index, "title": note.label, "trash": destination.relative_to(self.notes_dir).as_posix()}
 
     def unbirth(self, receipt: dict) -> None:
         """The mirror of birth_note, for a note that THIS run made a moment ago (a teardown that failed after it).
-        Only the newest note, and only when it is still the note on the receipt. The file is seconds old, so it
-        is deleted for good, not moved to the trash."""
+        Only the newest note, only when it is still the note on the receipt, and only when its file still holds
+        the bytes that birth_note wrote. The file is seconds old, so it is deleted for good, not moved to the
+        trash. It is deleted only after the galaxy is saved without it: until then it waits under a name that
+        is not a note."""
         with self.lock:
             self.refresh_if_rebuilt()
             index = receipt.get("index") if isinstance(receipt, dict) else None
@@ -533,9 +538,20 @@ class Galaxy:
                     or note.label != receipt.get("title") or note.path != receipt.get("file")):
                 raise ValueError("only the newest note, the one on the receipt, can be taken back")
             target = self._note_path(note.path)
-            content = target.read_bytes()
-            target.unlink()
-            self._drop_newest(lambda: target.write_bytes(content))
+            written = self._born.get(note.path)
+            if written is None or hashlib.sha256(target.read_bytes()).hexdigest() != written:
+                raise ValueError("the note was changed after it was made, so it stays")
+            aside, number = target.with_name(f"{target.name}.taken"), 1
+            while aside.exists():
+                number += 1
+                aside = target.with_name(f"{target.name}.taken{number}")
+            os.replace(target, aside)
+            self._drop_newest(lambda: os.replace(aside, target), aside)
+            self._born.pop(note.path, None)
+            try:
+                aside.unlink()
+            except OSError:
+                pass        # the note is out of the galaxy. The file left behind does not end in .md: it is no note.
             folder = target.parent
             try:
                 if folder != self.notes_dir and folder.is_relative_to(self.notes_dir) and not any(folder.iterdir()):
@@ -543,26 +559,38 @@ class Galaxy:
             except OSError:
                 pass
 
-    def _drop_newest(self, put_file_back) -> None:
+    def _restore(self, before: tuple) -> None:
+        """Put the index in memory back to a copy taken before a change: (notes, links, rev). The same list and
+        set objects are kept."""
+        notes, links, rev = before
+        self.notes[:] = notes
+        self.links.clear()
+        self.links.update(links)
+        self.rev = rev
+
+    def _drop_newest(self, put_file_back, kept_at: Path) -> None:
         """Take the newest note out of the index and save. The links it changed among the other notes are
-        mended (see birth_note). If the save fails, everything is put back, the file too (`put_file_back`)."""
-        index = len(self.notes) - 1
-        note = self.notes.pop()
-        dropped = {link for link in self.links if index in link}
-        self.links -= dropped
-        added, removed = build.relink(self.notes, self.links, build.flipped_wikilinks(note, self.notes))
-        self.links |= added
-        self.links -= removed
-        steps = 2 if added or removed else 1
-        self.rev += steps
+        mended (see birth_note). On any error the index in memory is put back first, then the file
+        (`put_file_back`). `kept_at` is where the file waits: when it cannot be put back, the error names that place."""
+        before = (list(self.notes), set(self.links), self.rev)
         try:
+            index = len(self.notes) - 1
+            note = self.notes.pop()
+            self.links -= {link for link in self.links if index in link}
+            added, removed = build.relink(self.notes, self.links, build.flipped_wikilinks(note, self.notes))
+            self.links |= added
+            self.links -= removed
+            self.rev += 2 if added or removed else 1
             self._save_graph()
-        except OSError:
-            put_file_back()
-            self.notes.append(note)
-            self.links -= added
-            self.links |= removed | dropped
-            self.rev -= steps
+        except BaseException as error:
+            self._restore(before)
+            try:
+                put_file_back()
+            except OSError as trouble:
+                where = (kept_at.relative_to(self.notes_dir).as_posix() if kept_at.is_relative_to(self.notes_dir)
+                         else str(kept_at))
+                raise OSError(trouble.errno, f"The galaxy could not be saved, and the note could not be put back. "
+                                             f"Its file is now {where}") from error
             raise
 
 
@@ -638,12 +666,34 @@ PROMPT_TAG_RE = re.compile(r"<(/?)(notes?|receipts|question)\b", re.IGNORECASE)
 # A sentence asks for a teardown when (A) it has a teardown verb, such as "reverse engineer" or "take apart",
 # or (B) it asks how a thing is built AND names something site-like ("website", "homepage", or an address such
 # as igloo.inc). "How does the loan work?" has no site, and a site word alone is never enough.
+# A sentence ABOUT a teardown does not ask FOR one. So the clauses about a teardown that is there, or about the
+# past, are taken out first, and (A) or (B) must hold on what is left. Three shapes are "about":
+# (i) a question word and a helping verb, then the noun: "what did my teardown of X say", "what is a teardown";
+# (ii) did, have, had or has, then I, we, you or Jarviz, then a teardown verb: "when did I tear down X";
+# (iii) a verb that shows, asks after or stops a teardown named as one that is there (the, my, that, last, old...):
+# "open the last teardown", "is the teardown done", "cancel the teardown". "Show me A teardown" is not one.
+# In (i) and (iii) one name may stand after the, my, last...: "what did the stripe.com teardown say".
+# A clause ends at , ; : ? ! or a full stop (not at the dot in stripe.com), or at "then". So "Show me the last
+# teardown, then tear down stripe.com" still asks for one.
 REMEMBER_RE = re.compile(
     r"\b(?:remember|memori[sz]e|save|log|record|jot|store|remind|write\s+(?:\w+\s+)?down"
     r"|keep\s+(?:in\s+mind|track)|don'?t\s+(?:let\s+me\s+)?forget"
     r"|(?:make|take|add|leave|write)\s+(?:\w+\s+){0,3}?note|note\s+(?:that|this|it|down|to\s+self))\b", re.IGNORECASE)
 TEARDOWN_VERB_RE = re.compile(
     r"reverse[\s-]*engineer|tear(?:ing)?[\s-]*(?:\S+\s+){0,4}?down|teardown|take\s+(?:\S+\s+){0,4}?apart|x-?ray",
+    re.IGNORECASE)
+EXISTING_WORDS = r"the|my|our|your|that|this|those|these|last|latest|previous|earlier|old|existing|saved|recent|full"
+NAME_WORD = r"(?!then\b)[^\W_]+(?:[.-][^\W_]+)*"      # one word such as stripe.com or igloo: letters, digits, . and -
+ABOUT_TEARDOWN_RE = re.compile(     # the clauses about a teardown (i, ii, iii above), each to the end of its clause
+    r"(?:\b(?:what|when|where|which|who|why|how)(?:['’]s|\s+(?:is|are|was|were|do|does|did|has|have|had))"
+    rf"\s+(?:(?:(?:a|an|{EXISTING_WORDS})\s+){{1,3}}(?:{NAME_WORD}\s+)?)?teardowns?\b"          # (i)
+    r"|\b(?:did|have|had|has)\s+(?:i|we|you|jarvi[sz])\s+"                                         # (ii)
+    r"(?:(?:already|ever|yet|just|recently|once|before|previously|really|actually)\s+)*"
+    rf"(?={TEARDOWN_VERB_RE.pattern})"
+    r"|\b(?:show|open|read|find|get|see|view|display|close|is|are|was|were|did|does|has|had"
+    r"|cancel|stop|abort|halt|kill|end)(?:\s+(?:me|us))?"                                            # (iii)
+    rf"\s+(?:(?:{EXISTING_WORDS})\s+){{1,3}}(?:{NAME_WORD}\s+)?teardowns?\b)"
+    r"(?:(?!\bthen\b)(?:[^,;:?!.\n]|\.(?=\w)))*",          # ...and the rest of that clause
     re.IGNORECASE)
 TEARDOWN_QUESTION_RE = re.compile(r"""
     \bhow\s+(?:does|do|did|is|are|was|were)\b .{0,80}?
@@ -663,9 +713,10 @@ def asks_to_remember(sentence: str) -> bool:
 
 
 def asks_for_teardown(sentence: str) -> bool:
-    """Rule (A) or rule (B) above."""
-    return bool(TEARDOWN_VERB_RE.search(sentence)
-                or (TEARDOWN_QUESTION_RE.search(sentence) and SITE_WORD_RE.search(sentence)))
+    """Rule (A) or rule (B) above, on what is left when the clauses about a teardown are taken out."""
+    rest = ABOUT_TEARDOWN_RE.sub(" ", sentence)
+    return bool(TEARDOWN_VERB_RE.search(rest)
+                or (TEARDOWN_QUESTION_RE.search(rest) and SITE_WORD_RE.search(rest)))
 
 
 TAG_INTENT = {"REMEMBER": asks_to_remember, "TEARDOWN": asks_for_teardown}     # tag -> (the user's sentence) -> bool

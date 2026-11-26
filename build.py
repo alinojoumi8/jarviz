@@ -214,12 +214,13 @@ def flipped_wikilinks(note: Note, others: list[Note]) -> set[str]:
 
     `others` is the list WITHOUT `note`. A link that exactly MAX_SHARED_LINK_NOTES of them use gets crowded
     when the note comes, and stops being crowded when it goes. The note's own title is a wikilink target too:
-    while the note is there, a shared [[link]] to it does not join the notes that share it.
+    while the note is there, a shared [[link]] to it does not join the notes that share it. A title that more
+    than MAX_SHARED_LINK_NOTES of them use is crowded with the note and without it, so it changes no link.
     """
     title = note.folded_title
     counts = Counter(link for other in others for link in other.wikilinks if link in note.wikilinks or link == title)
     flipped = {link for link in note.wikilinks if counts[link] == MAX_SHARED_LINK_NOTES}
-    if counts[title] and not any(other.folded_title == title for other in others):
+    if 0 < counts[title] <= MAX_SHARED_LINK_NOTES and not any(other.folded_title == title for other in others):
         flipped.add(title)
     return flipped
 

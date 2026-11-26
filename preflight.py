@@ -11,6 +11,7 @@ import email.message
 import hashlib
 import http.client
 import json
+import os
 import re
 import secrets
 import shutil
@@ -428,10 +429,179 @@ def check_links_stay_true(report: Report) -> None:
         same("a note named Topic is born")
         take_back()
         same("the note named Topic is taken back")
+        # A title that more notes use than MAX_SHARED_LINK_NOTES is crowded with the note and without it: it
+        # changes no link, so it must not make relink() look at every pair of its users.
+        for number in range(build.MAX_SHARED_LINK_NOTES + 2):
+            birth(make(f"Big card {number}", "Filed under [[Big Topic]]."))
+        same(f"{build.MAX_SHARED_LINK_NOTES + 2} notes share [[Big Topic]]")
+        big = make("Big Topic", "What the big cards are filed under.")
+        if "big topic" in build.flipped_wikilinks(big, notes):
+            trouble.append("a note named Big Topic marks the crowded [[Big Topic]] as flipped when it comes")
+        birth(big)
+        same("a note named Big Topic is born")
+        if "big topic" in build.flipped_wikilinks(notes[-1], notes[:-1]):
+            trouble.append("a note named Big Topic marks the crowded [[Big Topic]] as flipped when it goes")
+        take_back()
+        same("the note named Big Topic is taken back")
     if not trouble and not mended:
         trouble.append("no link among the other notes changed, so the check proved nothing")
     report.add(FAIL if trouble else PASS, name,
                "; ".join(trouble) or f"{checked} steps, each equal to a full rebuild; {mended} links among the other notes mended")
+
+
+def check_take_back_safe(report: Report) -> None:
+    """A birth, a take-back (unbirth) or a forget that fails leaves the index in memory as it was, and the note's
+    file where it was. A take-back deletes only the bytes that Jarviz wrote. Pure: a test Galaxy over a temporary
+    folder, with a fake save. It never builds and never writes the real viewer/graph-data.js. No server."""
+    name = "A note that fails to be born or taken back leaves the index and its file as they were"
+    trouble: list[str] = []
+    stamp = build.GRAPH_PATH.stat().st_mtime_ns if build.GRAPH_PATH.exists() else None
+    with tempfile.TemporaryDirectory() as folder:
+        notes_dir = Path(folder).resolve()
+        galaxy = server.Galaxy()
+        galaxy.notes_dir = notes_dir
+        galaxy.refresh_if_rebuilt = lambda: None        # Galaxy.load() would run build.build(): it writes the real file
+        save = {"error": None}
+
+        def fake_save() -> None:                        # the real one writes viewer/graph-data.js
+            if save["error"] is not None:
+                raise save["error"]
+
+        galaxy._save_graph = fake_save
+        state = lambda: ([note.path for note in galaxy.notes], set(galaxy.links), galaxy.rev)   # noqa: E731
+
+        def expect(step: str, error_type, action) -> BaseException | None:
+            try:
+                action()
+            except error_type as error:
+                return error
+            except Exception as error:                  # noqa: BLE001 - the wrong error is a finding
+                trouble.append(f"{step}: {type(error).__name__} instead of {error_type.__name__}")
+                return error
+            trouble.append(f"{step}: no {error_type.__name__}")
+            return None
+
+        def true_links(step: str) -> None:
+            if galaxy.links != set(build.compute_links(galaxy.notes)):
+                trouble.append(f"{step}: the links differ from a full rebuild")
+
+        try:
+            galaxy.birth_note("Card one.md", "# Card one\n\nFiled under [[Shared Idea]].\n")
+            galaxy.birth_note("Card two.md", "# Card two\n\nFiled under [[Shared Idea]].\n")
+            idea = "# Shared Idea\n\nWhat the cards are filed under.\n"     # its birth changes the link between the cards
+
+            # (a) The save fails after the note is in the index: the index is as before, and no file is left.
+            for error in (OSError(28, "No space left on device"), RuntimeError("a bug in the index")):
+                before, save["error"] = state(), error
+                expect(f"(a) a birth whose save fails with {type(error).__name__}", type(error),
+                       lambda: galaxy.birth_note("captures/Shared Idea.md", idea))
+                save["error"] = None
+                if state() != before:
+                    trouble.append(f"(a) after a {type(error).__name__} in the save, the index is not as before")
+                if (notes_dir / "captures" / "Shared Idea.md").exists():
+                    trouble.append(f"(a) after a {type(error).__name__} in the save, the file is still there")
+            # ...and when the file cannot be removed either, the error of the save is still the one raised.
+            real_unlink = Path.unlink
+
+            def stuck_unlink(self, *args, **kwargs):
+                if self.name == "Shared Idea.md":
+                    raise PermissionError(13, "The file is in use")
+                return real_unlink(self, *args, **kwargs)
+
+            before, save["error"] = state(), OSError(28, "No space left on device")
+            Path.unlink = stuck_unlink
+            try:
+                error = expect("(a) a birth whose save fails and whose file cannot be removed", OSError,
+                               lambda: galaxy.birth_note("captures/Shared Idea.md", idea))
+            finally:
+                Path.unlink = real_unlink
+                save["error"] = None
+            if state() != before or getattr(error, "errno", None) != 28:
+                trouble.append(f"(a) a file that cannot be removed changed the index or hid the first error: {error!r}")
+            (notes_dir / "captures" / "Shared Idea.md").unlink(missing_ok=True)
+            true_links("(a)")
+
+            # (b) A take-back whose save fails: the index is as before, and the file is back with the same bytes.
+            receipt = galaxy.birth_note("teardowns/Shared Idea.md", idea)
+            path = notes_dir / "teardowns" / "Shared Idea.md"
+            data, before = path.read_bytes(), state()
+            save["error"] = OSError(28, "No space left on device")
+            expect("(b) a take-back whose save fails", OSError, lambda: galaxy.unbirth(receipt))
+            save["error"] = None
+            if state() != before or not path.is_file() or path.read_bytes() != data:
+                trouble.append("(b) after a failed save, the index or the file is not as before")
+            if list(path.parent.glob("*.taken*")):
+                trouble.append("(b) a .taken file was left")
+
+            # (c) The save fails AND the file cannot be put back: the index is as before, the error says so, and the
+            # bytes are still in the folder. Only a move back from a .taken name fails, and only in this step.
+            real_replace = os.replace
+
+            def stuck_replace(source, destination, *args, **kwargs):
+                if str(source).endswith(".taken"):
+                    raise PermissionError(13, "The file is in use")
+                return real_replace(source, destination, *args, **kwargs)
+
+            save["error"] = OSError(28, "No space left on device")
+            os.replace = stuck_replace
+            try:
+                error = expect("(c) a take-back whose save and put-back fail", OSError, lambda: galaxy.unbirth(receipt))
+            finally:
+                os.replace = real_replace
+                save["error"] = None
+            if state() != before:
+                trouble.append("(c) after a failed save and put-back, the index is not as before")
+            if error is not None and (".taken" not in str(error) or error.__cause__ is None):
+                trouble.append(f"(c) the error does not say where the file is, or hides the first error: {error}")
+            kept = [file for file in notes_dir.rglob("*") if file.is_file() and file.read_bytes() == data]
+            if not kept:
+                trouble.append("(c) the bytes of the note are gone from the folder")
+            for file in kept:                               # put the file back by hand, as a person would
+                if file != path:
+                    os.replace(file, path)
+
+            # (f) A clean take-back: the note is gone, no .taken file is left, the links are a full rebuild's.
+            galaxy.unbirth(receipt)
+            if path.exists() or list(notes_dir.rglob("*.taken*")) or receipt["file"] in galaxy._born:
+                trouble.append("(f) after a clean take-back, the file, a .taken file or its fingerprint is left")
+            if receipt["title"] in [note.label for note in galaxy.notes]:
+                trouble.append("(f) after a clean take-back, the note is still in the index")
+            true_links("(f)")
+
+            # (d) A forget whose save fails: the index is as before, the file is back, the trash is empty.
+            capture = galaxy.remember("the till was short on Tuesday")
+            path = notes_dir / capture["file"]
+            data, before = path.read_bytes(), state()
+            save["error"] = OSError(28, "No space left on device")
+            expect("(d) a forget whose save fails", OSError, lambda: galaxy.forget_last(capture["index"], capture["title"]))
+            save["error"] = None
+            trash = notes_dir / server.CAPTURES_DIR / server.TRASH_DIR
+            if state() != before or not path.is_file() or path.read_bytes() != data or any(trash.glob("*")):
+                trouble.append("(d) after a failed save, the index, the file or the trash is not as before")
+            galaxy.forget_last(capture["index"], capture["title"])
+
+            # (e) The file was changed after the birth (an editor plug-in): it stays, with the change, and so does
+            # the note. A note this run did not make (no fingerprint) stays too.
+            receipt = galaxy.birth_note("teardowns/Teardown edited.md", "# Teardown edited\n\nJarviz wrote this.\n")
+            path = notes_dir / receipt["file"]
+            path.write_bytes(path.read_bytes() + b"An editor added this.\n")
+            edited, before = path.read_bytes(), state()
+            expect("(e) a take-back of a changed file", ValueError, lambda: galaxy.unbirth(receipt))
+            if state() != before or not path.is_file() or path.read_bytes() != edited:
+                trouble.append("(e) a changed file or its note did not stay as it was")
+            galaxy._born.pop(receipt["file"], None)
+            path.write_bytes(b"# Teardown edited\n\nJarviz wrote this.\n")
+            expect("(e) a take-back of a note with no fingerprint", ValueError, lambda: galaxy.unbirth(receipt))
+            if state() != before or not path.is_file():
+                trouble.append("(e) a note with no fingerprint did not stay")
+            true_links("(e)")
+        except Exception as error:                  # noqa: BLE001 - a check that stops says so, it never crashes preflight
+            trouble.append(f"the check stopped: {type(error).__name__}: {error}")
+    if (build.GRAPH_PATH.stat().st_mtime_ns if build.GRAPH_PATH.exists() else None) != stamp:
+        trouble.append("the real viewer/graph-data.js was written")
+    report.add(FAIL if trouble else PASS, name,
+               "; ".join(trouble) or "birth, take-back and forget: the index and the file came back each time; "
+                                     "a changed file stays")
 
 
 def check_served_files(report: Report) -> None:
@@ -795,13 +965,29 @@ def check_tag_intent(report: Report) -> None:
                 "Is the website launch in my notes?", "Remember that the homepage needs a new photo", "Good morning",
                 "What do we use for invoicing?", "How do I make cold brew?", "How does the loan work?",
                 "How does the roaster maintenance work?", "What is the Wi-Fi password?")
+    # A sentence ABOUT a teardown (one that is there, or one in the past) does not ask for a new one. A request
+    # next to such a clause still counts.
+    asks += ("Tear down stripe.com", "tear stripe.com down", "Reverse engineer igloo.inc", "Do a teardown of stripe.com",
+             "Teardown stripe.com", "Can you run a teardown on igloo.inc?", "How about a teardown of stripe.com?",
+             "Show me a teardown of stripe.com", "I liked the last teardown. Now tear down stripe.com.",
+             "Show me the last teardown, then tear down stripe.com", "What does stripe.com use? Tear it down.",
+             "Do a teardown of the stripe.com homepage", "Run the teardown on igloo.inc again",
+             "What is igloo.inc? Tear it down.")
+    about = ("What did my teardown of stripe.com say?", "What does the teardown note for igloo.inc say about the fonts?",
+             "Show me the teardown of stripe.com", "Open the last teardown", "Read me my teardown of igloo.inc",
+             "When did I tear down stripe.com?", "Have you already reverse engineered igloo.inc?",
+             "Did you take igloo.inc apart yet?", "Is the teardown done?", "Did the teardown of stripe.com work?",
+             "Cancel the teardown", "What is a teardown?", "What did the stripe.com teardown say?",
+             "Open the igloo teardown", "Show me the stripe.com teardown", "Is the stripe.com teardown done?",
+             "Stop the igloo.inc teardown", "What does the last stripe.com teardown say about fonts?")
     intent = server.TAG_INTENT["TEARDOWN"]
     trouble = [f"missed: {said!r}" for said in asks if not intent(said)]
-    trouble += [f"let in: {said!r}" for said in mentions if intent(said)]
+    trouble += [f"let in: {said!r}" for said in mentions + about if intent(said)]
     if not server.TAG_INTENT["REMEMBER"]("remember that the homepage needs a new photo"):
         trouble.append("the REMEMBER intent no longer matches \"remember that the homepage needs a new photo\"")
     report.add(FAIL if trouble else PASS, name,
-               "; ".join(trouble) or f"{len(asks)} requests let in, {len(mentions)} mentions kept out")
+               "; ".join(trouble) or f"{len(asks)} requests let in, {len(mentions)} mentions and "
+                                     f"{len(about)} sentences about a teardown kept out")
 
 
 def main() -> int:
@@ -818,6 +1004,7 @@ def main() -> int:
         check_other_brains(report, ctx)
         check_remember(report, ctx)
         check_links_stay_true(report)
+        check_take_back_safe(report)
         check_served_files(report)
         check_config_hidden(report, ctx)
         check_other_sites(report)

@@ -63,7 +63,8 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
 - Voice routes are checked before the brain. Add a command with `router.add`, do not edit the core.
 - A control tag runs only when the user's own sentence asks for that action. Every tag in
   `TAG_HANDLERS` needs an entry in `TAG_INTENT` (`server.py`). Text inside a note can never order an action.
-  A sentence that only mentions a website does not ask for a teardown.
+  A sentence that only mentions a website does not ask for a teardown. A sentence about a teardown that is there
+  ("what did my teardown of stripe.com say") does not ask for a new one (`ABOUT_TEARDOWN_RE`).
 - Note text is never HTML. The viewer uses `textContent` only. Labels given to the 3D library go
   through `Core.escapeHtml`.
 - The two outside libraries are pinned in three places that must agree: `GRAPH_LIB_URL` and
@@ -86,10 +87,16 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
   Public names and the user's own `localhost` only: no private-network names (`PRIVATE_ENDINGS`,
   `resolves_to_private`). The `[TEARDOWN:site|question]` tag runs only for a site whose own name is a word in the
   user's sentence (`named_by_user`), and "this" only when the user said "this site".
+- During a teardown, `_refuse_local_turn` reads where the page is. A private address, an address that is not a web
+  address, or no answer from the browser stops the job. It does not see each connection that Chrome makes: that
+  limit is written in `TODO.md` under "Not proven". Do not write that Jarviz blocks private-network requests.
 - A note never shows the brain a ready-made control tag: `note_block` turns `[WORD:` into `(WORD:`.
 - The REA note links to the Jarviz note. When the notes have no note called Jarviz or Jarvis, the first teardown
   makes `captures/Jarviz.md` first (`owner_note` in `teardown.py`). The births go in this order: Jarviz, REA, the teardown.
-- A teardown that fails takes back the notes it made (`Galaxy.unbirth`), newest first.
+- A teardown that fails takes back the notes it made (`Galaxy.unbirth`), newest first. `unbirth` deletes a file only
+  when it still holds the bytes that `birth_note` wrote (`Galaxy._born`). A file that someone changed stays.
+- A birth, a take-back or a forget that fails puts the index in memory back first (`Galaxy._restore`), then the file.
+  A clean-up that fails never hides the error that stopped the work.
 - Every evidence line in the digest starts with who captured it (`EVIDENCE_TAGS`). The brain writes the note text.
   Code writes the Evidence section and the facts block on top.
 - Everything that comes out of the inspected website is data from a stranger: REA's output, the page reads (they
