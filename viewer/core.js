@@ -221,6 +221,15 @@
   ];
   // The small words that may stand around the address in a question's subject.
   const SITE_WORDS_RE = /^(?:(?:the|a|site|website|web\s?page|home\s?page|landing\s+page|page|web\s?app|app|of|at|['’]s)(?:\s+|$))*$/i;
+  // A refusal with a teardown word after it, anywhere in the sentence: "how does example.com work? Do not tear it
+  // down." Such a sentence never starts one here; it goes to the brain as a question. The same idea as REFUSAL_RE
+  // in server.py, smaller: "don't forget to tear down X" and "don't hesitate to ..." are no refusal.
+  const REFUSAL_RE = /\b(?:do\s+not|don['’]?t|never|not\s+to|no\s+need\s+to|(?:should|must|will|can)\s*not|(?:shouldn|mustn|won|can)['’]?t|without|avoid|no(?=\s+tear\s*downs?\b))\b(?!\s+(?:forget|hesitate)\b)/i;
+  const TEARDOWN_WORD_RE = /reverse[\s-]*engineer|tear(?:ing)?[\s-]*(?:\S+\s+){0,4}?down|tak(?:e|ing)\s+(?:\S+\s+){0,4}?apart|x-?ray/i;
+  function refusesTeardown(text) {
+    const refusal = text.search(REFUSAL_RE);          // a teardown word after a later refusal is after this one too
+    return refusal >= 0 && TEARDOWN_WORD_RE.test(text.slice(refusal));
+  }
   const TEARDOWN_COMMANDS = {
     last: /^(?:show|open|bring up)\s+(?:me\s+)?(?:the\s+)?(?:last|latest|previous|newest)\s+tear\s?down[.!]?$/i,
     open: /^(?:open|read|show)\s+(?:me\s+)?(?:the\s+)?(?:full|whole|entire)\s+tear\s?down[.!]?$/i,
@@ -268,9 +277,11 @@
     return site && SITE_WORDS_RE.test(rest.join(' ')) ? site : null;
   }
 
-  // -> { site: "igloo.inc" or "this", question: the whole sentence }, or null when no site is named.
+  // -> { site: "igloo.inc" or "this", question: the whole sentence }, or null when no site is named, or when
+  // the sentence refuses a teardown.
   function matchTeardown(sentence) {
     const text = String(sentence || '').replace(/\s+/g, ' ').trim().replace(/[.!?]+$/, '');
+    if (refusesTeardown(text)) return null;
     for (const pattern of TEARDOWN_ASKS) {
       const match = text.match(pattern);
       if (!match) continue;

@@ -152,10 +152,14 @@ def version_in_range(version: tuple[int, int, int], wanted: str) -> bool:
     return False
 
 
+def _rea_package() -> Path:
+    return REA_SCRIPT.parent.parent / "package.json"
+
+
 def installed_rea() -> dict:
     """What is in the tools folder: {"version": "6.7.0", "node_range": "..."} or {} when nothing is."""
     try:
-        package = json.loads((REA_SCRIPT.parent.parent / "package.json").read_text(encoding="utf-8"))
+        package = json.loads(_rea_package().read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
     if not isinstance(package, dict) or package.get("name") != REA_PACKAGE or not REA_SCRIPT.is_file():
@@ -167,7 +171,7 @@ def installed_rea() -> dict:
 def diag() -> dict:
     """Is the kit ready? Plain facts and a plain-English list of what is missing. Never raises."""
     problems: list[str] = []
-    rea_now = installed_rea()
+    rea_now = rea_reading()             # the same reading run_rea uses: the two never disagree
     node = find_node()
     version = node_version(node)
     wanted = rea_now.get("node_range") or NODE_FALLBACK_RANGE
@@ -201,17 +205,32 @@ def quiet_env() -> dict:
     return {name: value for name, value in os.environ.items() if not SECRET_ENV.search(name)}
 
 
-_REA_FOUND: list[str] = []      # the REA version found the first time it was needed, once per process
+_REA_READ: list[tuple] = []     # the last reading of the installed REA: [(stamp of its files, installed_rea())]
 
 
-def rea_version_once() -> str:
-    """The installed REA version, read once per process ("" while none is installed: then it is read again)."""
-    if not _REA_FOUND:
-        version = installed_rea().get("version", "")
-        if not version:
-            return ""
-        _REA_FOUND.append(version)
-    return _REA_FOUND[0]
+def _rea_stamp() -> tuple | None:
+    """What decides the installed version: the size and the change time of the REA script and of its package.json.
+    None when one of them cannot be read: then no reading is kept, and the version is read again."""
+    try:
+        return tuple((info.st_size, info.st_mtime_ns) for info in (REA_SCRIPT.stat(), _rea_package().stat()))
+    except OSError:
+        return None
+
+
+def rea_reading() -> dict:
+    """installed_rea(), read again whenever the files that decide it changed: a new install while Jarviz runs is
+    seen at once, by run_rea and by diag() alike. A reading is kept only when the files did not change while it was
+    read."""
+    stamp = _rea_stamp()
+    kept = _REA_READ[0] if _REA_READ else None
+    if stamp is not None and kept is not None and kept[0] == stamp:
+        return dict(kept[1])
+    found = installed_rea()
+    if stamp is not None and _rea_stamp() == stamp:
+        _REA_READ[:] = [(stamp, dict(found))]
+    else:
+        _REA_READ.clear()
+    return found
 
 
 def run_rea(command: str, *args: str, timeout: float = 90.0, on_start=None) -> dict:
@@ -219,11 +238,10 @@ def run_rea(command: str, *args: str, timeout: float = 90.0, on_start=None) -> d
     REA version runs: every caller (the bay and the command line) is covered here."""
     if command not in REA_COMMANDS:
         raise TeardownError("rea_command_refused", f"Jarviz does not run the REA command {command}.")
-    found = rea_version_once()
+    found = rea_reading().get("version", "")
     if found != REA_PIN:
         raise TeardownError("rea_not_pinned", f"REA {found or 'is not installed'}{' is installed' if found else ''}, "
-                                              f"but Jarviz is pinned to {REA_PIN}. Install {REA_PACKAGE}@{REA_PIN} "
-                                              "and start Jarviz again.")
+                                              f"but Jarviz is pinned to {REA_PIN}. Install {REA_PACKAGE}@{REA_PIN}.")
     node = find_node()
     if not node or not REA_SCRIPT.is_file():
         raise TeardownError("kit_missing", "REA or Node.js is missing.")
@@ -360,13 +378,21 @@ def is_chrome_program(program: str, names) -> bool:
     return executable in CRASH_HELPERS
 
 
+def profile_path(path, windows: bool) -> str:
+    """A profile path as it is compared. Case is folded on Windows only: its paths ignore case. A Mac or Linux
+    volume can tell case apart: there, two profiles that differ only by case are two folders."""
+    text = str(path).replace("\\", "/").rstrip("/")
+    return text.casefold() if windows else text
+
+
 def _profile_option(command: str, needle: str, database: bool) -> bool:
     """True when an option of the command line names the profile: --user-data-dir=<the folder or inside it>, or,
-    when `database`, --database=<inside the folder> (the crash helper)."""
+    when `database`, --database=<inside the folder> (the crash helper). For a Mac or Linux only: the path is
+    compared as it is (`needle` from profile_path)."""
     _, _, rest = command.replace("\\", "/").partition(" --")
     for option in ("--" + part for part in rest.split(" --")) if rest else ():
         name, equals, value = option.partition("=")
-        value = value.strip().strip("\"'").rstrip("/").casefold()
+        value = profile_path(value.strip().strip("\"'"), windows=False)
         if not equals or not value:
             continue
         if name.casefold() == "--user-data-dir" and (value == needle or value.startswith(needle + "/")):
@@ -385,9 +411,9 @@ def names_profile(command: str, folder, windows: bool | None = None, program: st
         --database=<inside the folder>.
     Anything else (an editor that opens chrome_debug.log, a script called chrome_tools.py) is never ours."""
     windows = os.name == "nt" if windows is None else windows
-    needle = str(folder).replace("\\", "/").rstrip("/").casefold()
+    needle = profile_path(folder, windows)
     if windows:
-        return needle in command.replace("\\", "/").casefold()
+        return needle in profile_path(command, windows=True)
     if not is_chrome_program(program, names):
         return False
     executable = str(program).replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
@@ -403,7 +429,7 @@ def pids_on_profile(table, folder, names, windows: bool | None = None) -> list[i
     windows = os.name == "nt" if windows is None else windows
     if not windows and not names:
         return None
-    needle = str(folder).replace("\\", "/").rstrip("/").casefold()
+    needle = profile_path(folder, windows)
     pids = []
     for pid, command, program in table:
         if not program and not windows:
@@ -1951,13 +1977,17 @@ def valid_name(name) -> bool:
             and not name.endswith((".", "-")) and name.split(".")[0] not in RESERVED)
 
 
-def note_name(host: str, taken) -> str:
-    """HOST-DATE, made safe for a file name, and never one that is already used."""
+def today() -> str:
+    return time.strftime("%Y-%m-%d")
+
+
+def note_name(host: str, taken, day: str | None = None) -> str:
+    """HOST-DATE, made safe for a file name, and never one that is already used. `day`: the DATE (default: today)."""
     safe = re.sub(r"[^a-z0-9.-]+", "-", host.lower()).strip("-.") or "site"
     safe = re.sub(r"\.{2,}", ".", safe)[:80]
     if safe.split(".")[0] in RESERVED:
         safe = "site-" + safe
-    base = f"{safe}-{time.strftime('%Y-%m-%d')}"
+    base = f"{safe}-{day or today()}"
     name, number = base, 1
     while name.casefold() in taken:
         number += 1
@@ -2094,11 +2124,18 @@ class Job:
 class Bay:
     """Runs teardowns one at a time. server.py hands in the few things it needs from the rest of Jarviz."""
 
-    def __init__(self, *, notes_dir, ask, birth, note_titles, writer_name, voice: str, plain_line: str, unbirth=None):
+    def __init__(self, *, notes_dir, ask, birth, note_titles, writer_name, voice: str, plain_line: str, unbirth=None,
+                 notes_folder=None, day=today):
         self._notes_dir = notes_dir         # () -> Path of the notes folder
+        # () -> (Path, its fingerprint): the folder now, after a look for a rebuild. A job binds itself to it for the
+        # whole write. None: notes_dir(), and the births name no folder.
+        self._notes_folder = notes_folder
         self._ask = ask                     # (system, user_message) -> the brain's text
-        self._birth = birth                 # (relative path, content) -> receipt. THE ONE DOOR for notes.
+        # (relative path, content, vault=fingerprint or None) -> receipt. THE ONE DOOR for notes. It refuses to write
+        # when the notes folder is no longer the one the job bound itself to.
+        self._birth = birth
         self._unbirth = unbirth             # (receipt) -> None: takes back a note this job made. None: they stay
+        self._day = day                     # () -> the date in a new note's name (a test gives a fixed one)
         self._note_titles = note_titles     # () -> the titles of every note, lower case
         self._writer_name = writer_name     # () -> "Claude (claude-opus-5-5)"
         self._voice = voice
@@ -2264,12 +2301,16 @@ class Bay:
         reply = parse_reply(self._ask_or_cancel(job, digest))
         if risky_spoken(reply["spoken"]):   # the brain read a website: its line for the voice is checked
             reply["spoken"] = self._plain_line.format(host=job.site.host)
+        # ONE notes folder for the whole write, asked for before any name is chosen: the picture goes there, and
+        # every birth names it. When the galaxy moves to another folder meanwhile, the birth refuses, and the job
+        # fails and takes back what it made, the picture too. So a picture and its note never end in two folders.
+        root, vault = self._notes_folder() if self._notes_folder else (self._notes_dir(), None)
         titles = set(self._note_titles())
-        folder = self.folder()
+        folder = (root / TEARDOWNS_DIR).resolve()
         taken = titles | ({path.stem.casefold() for path in folder.glob("*.md")} if folder.is_dir() else set())
         pictures = folder / ASSETS_DIR      # a picture on disk takes its name too: a new one never lands on it
         taken |= {path.stem.casefold() for path in pictures.glob("*.png")} if pictures.is_dir() else set()
-        name = note_name(job.site.host, taken)
+        name = note_name(job.site.host, taken, day=self._day())
         seconds = int(time.monotonic() - job.started)
         image = evidence.get("snapshot") or b""
         image_path = pictures / f"{name}.png"
@@ -2283,25 +2324,25 @@ class Bay:
                 with open(image_path, "xb") as handle:      # "x": a new file only, never over one that is there
                     wrote_image = True
                     handle.write(image)
-            concept_file = self._notes_dir() / CONCEPT_PATH
+            concept_file = root / CONCEPT_PATH
             if CONCEPT_NAME.casefold() not in titles and not concept_file.exists():
                 # REA first if it is new, then the teardown. (A REA note made by hand is left as it is.)
                 # The REA note is linked to the Jarviz note. When the notes have none, it is made first.
                 owner = next((title.capitalize() for title in OWNER_TITLES if title in titles), None)
                 if owner is None:
                     try:
-                        births.append(self._birth(OWNER_PATH, owner_note()))
+                        births.append(self._birth(OWNER_PATH, owner_note(), vault=vault))
                         owner = OWNER_NAME
                     except FileExistsError:
                         pass                    # a file with that name is there but it is not in the galaxy: no link
                 try:
-                    births.append(self._birth(CONCEPT_PATH, concept_note(owner)))
+                    births.append(self._birth(CONCEPT_PATH, concept_note(owner), vault=vault))
                 except FileExistsError:
                     pass
             content = render_note(name=name, label=job.label, site=job.site, question=job.question, seconds=seconds,
                                   evidence=evidence, reply=reply, digest=digest, writer=self._writer_name(),
                                   has_snapshot=bool(image))
-            births.append(self._birth(f"{TEARDOWNS_DIR}/{name}.md", content))
+            births.append(self._birth(f"{TEARDOWNS_DIR}/{name}.md", content, vault=vault))
         except Exception:
             if wrote_image and (not births or births[-1].get("title") != name):
                 try:
@@ -2438,7 +2479,7 @@ def offline_checks() -> list[tuple[str, bool, str]]:
     # take it back, it stays on the job's list, so a test can remove it. No picture is left either way.
     def failed_write(unbirth) -> tuple[Job, bool, list[str]]:
         with tempfile.TemporaryDirectory() as temp:
-            def failing_birth(path: str, content: str) -> dict:
+            def failing_birth(path: str, content: str, vault=None) -> dict:
                 if path == CONCEPT_PATH:
                     raise OSError("no room")
                 return {"file": path, "title": Path(path).stem}
@@ -2630,6 +2671,17 @@ def _offline_bay_checks(reply: str, evidence: dict) -> list[tuple[str, bool, str
     # With no browser found there is nothing to compare a program with: on a Mac or Linux that is "could not look".
     if pids_on_profile(table_of(groups[0][1]), root, frozenset(), windows=False) is not None:
         wrong.append("with no browser found, the answer was not 'could not look'")
+    # A Mac or Linux volume can tell case apart: a profile that differs only by case is another folder, for a known
+    # program (not ours) and for an unknown one (not "could not look"). Windows folds case.
+    other_case = root.replace(".jarvis-tools", ".Jarvis-Tools")
+    cased = groups[0][1] + [(112, f"/opt/google/chrome/chrome --user-data-dir={other_case}/job1", "chrome", False),
+                            (113, f"/opt/google/chrome/chrome --user-data-dir={other_case}/job2", "", False)]
+    if pids_on_profile(table_of(cased), root, linux_chrome, windows=False) != [101, 102]:
+        wrong.append("on a Mac or Linux, a profile that differs only by case counted as ours or as 'could not look'")
+    if not names_profile(r'"C:\Program Files\Google\Chrome\Application\chrome.exe" '
+                         r'--user-data-dir=C:\USERS\U\.JARVIS-TOOLS\REA\PROFILES\job1',
+                         r"C:\Users\u\.jarvis-tools\rea\profiles", windows=True):
+        wrong.append("on Windows, the profile in other case was not ours")
     windows = [(r'"C:\Program Files\Google\Chrome\Application\chrome.exe" --type=gpu-process '
                 r'--user-data-dir=C:\Users\u\.jarvis-tools\rea\profiles\job1', True),
                (r'"C:\Program Files\Google\Chrome\Application\chrome.exe" "--user-data-dir=C:\Users\u\.jarvis-tools\rea\profiles\job1"', True),
@@ -2657,24 +2709,35 @@ def _offline_bay_checks(reply: str, evidence: dict) -> list[tuple[str, bool, str
                     got == ["private_site", "", "", "not_a_site", "private_site"]
                     and asked == ["intranet.example.com", "example.com", "www.example.com"],
                     f"got {got}, looked up {asked}"))
-    # Only the pinned REA runs, and its version is read once per process. No REA process is started here.
-    saved, real_installed, real_find_node = list(_REA_FOUND), globals()["installed_rea"], globals()["find_node"]
-    codes = []
-    try:
-        _REA_FOUND.clear()
-        globals()["find_node"] = lambda: None       # if the pin check ever broke, REA still could not start here
-        for version in ("0.0.1", "0.0.2"):          # the second version is not read: the first one stays
-            globals()["installed_rea"] = lambda version=version: {"version": version, "node_range": ""}
-            try:
-                run_rea("inspect-web-page", "http://127.0.0.1:1/")
-                codes.append("ran")
-            except TeardownError as error:
-                codes.append(f"{error.code} {'0.0.1' in error.detail}")
-    finally:
-        globals()["installed_rea"], globals()["find_node"] = real_installed, real_find_node
-        _REA_FOUND[:] = saved
-    results.append(("REA that is not the pinned version is never run, and the version is read once",
-                    codes == ["rea_not_pinned True", "rea_not_pinned True"], str(codes)))
+    # Only the pinned REA runs. Its version is read again when its files change (a new install while Jarviz runs),
+    # and diag() reads it the same way. In ONE process: pinned, then another version, then pinned again. A made-up
+    # tools folder, and no Node.js: no REA process is started here, so the pinned one stops at "kit_missing".
+    saved = (globals()["REA_SCRIPT"], globals()["find_node"], list(_REA_READ))
+    codes, said = [], []
+    with tempfile.TemporaryDirectory() as temp:
+        script = Path(temp) / "node_modules" / REA_PACKAGE / "scripts" / "rea.mjs"
+        script.parent.mkdir(parents=True)
+        script.write_text("// a stand-in, never run\n", encoding="utf-8")
+        package = script.parent.parent / "package.json"
+        try:
+            globals()["REA_SCRIPT"], globals()["find_node"] = script, lambda: None
+            _REA_READ.clear()
+            for number, version in enumerate((REA_PIN, "0.0.1", REA_PIN)):
+                package.write_text(json.dumps({"name": REA_PACKAGE, "version": version}), encoding="utf-8")
+                changed = 1_700_000_000_000_000_000 + number * 1_000_000_000     # each install has its own time
+                os.utime(package, ns=(changed, changed))
+                try:
+                    run_rea("inspect-web-page", "http://127.0.0.1:1/")
+                    codes.append("ran")
+                except TeardownError as error:
+                    codes.append(error.code)
+                said.append(diag()["rea"]["installed"])
+        finally:
+            globals()["REA_SCRIPT"], globals()["find_node"] = saved[0], saved[1]
+            _REA_READ[:] = saved[2]
+    results.append(("only the pinned REA runs; a new install while Jarviz runs is read again, and diag() says the same",
+                    codes == ["kit_missing", "rea_not_pinned", "kit_missing"] and said == [REA_PIN, "0.0.1", REA_PIN],
+                    f"run_rea {codes}, diag {said}"))
     # A profiles folder that is there but cannot be listed is "could not look" (None), never "clean".
     real_dir, real_iterdir = globals()["PROFILES_DIR"], Path.iterdir
     with tempfile.TemporaryDirectory() as temp:
@@ -2700,13 +2763,16 @@ def _offline_bay_checks(reply: str, evidence: dict) -> list[tuple[str, bool, str
                     missing == [] and listed == ["job1"] and unreadable is None,
                     f"missing {missing}, listed {listed}, unreadable {unreadable}"))
 
+    fixed_day = "2026-01-02"        # the fixture and the writer name the same day, also across a midnight
+
     def throwaway_bay(folder: Path, birth) -> Bay:
         return Bay(notes_dir=lambda: folder, ask=lambda system, message: reply, birth=birth, note_titles=lambda: set(),
-                   writer_name=lambda: "test", voice="plain", plain_line="{host} is done.", unbirth=lambda receipt: None)
+                   writer_name=lambda: "test", voice="plain", plain_line="{host} is done.", unbirth=lambda receipt: None,
+                   day=lambda: fixed_day)
 
     site = Site("https://a.test/", "a.test")
     # A job whose thread cannot start gives its reservation back, so the next start is let in.
-    bay = throwaway_bay(Path(tempfile.gettempdir()), lambda path, content: {})
+    bay = throwaway_bay(Path(tempfile.gettempdir()), lambda path, content, vault=None: {})
     bay._run = lambda job, on_done: None           # even a thread that did start would open no browser
     real_start, held = threading.Thread.start, []
 
@@ -2757,20 +2823,20 @@ def _offline_bay_checks(reply: str, evidence: dict) -> list[tuple[str, bool, str
     # write made, and a write that works takes the next name.
     with tempfile.TemporaryDirectory() as temp:
         folder = Path(temp)
-        old_name = note_name(site.host, set())
+        old_name = note_name(site.host, set(), day=fixed_day)
         pictures = folder / TEARDOWNS_DIR / ASSETS_DIR
         pictures.mkdir(parents=True)
         old_bytes = PNG_SIGNATURE + b"old picture"
         (pictures / f"{old_name}.png").write_bytes(old_bytes)
 
-        def birth(path: str, content: str, fail_at: str = "") -> dict:
+        def birth(path: str, content: str, vault=None, fail_at: str = "") -> dict:
             if path == fail_at:
                 raise OSError("no room")
             return {"file": path, "title": Path(path).stem}
 
         raised = False
         try:
-            throwaway_bay(folder, lambda path, content: birth(path, content, CONCEPT_PATH))._write(
+            throwaway_bay(folder, lambda path, content, vault=None: birth(path, content, fail_at=CONCEPT_PATH))._write(
                 Job(site, "q", True), dict(evidence, snapshot=PNG_SIGNATURE + b"new picture"))
         except OSError:
             raised = True
@@ -2781,6 +2847,34 @@ def _offline_bay_checks(reply: str, evidence: dict) -> list[tuple[str, bool, str
         kept = kept and (pictures / f"{old_name}.png").read_bytes() == old_bytes
     results.append(("an old picture keeps its bytes when a teardown fails, and a new one takes the next name",
                     raised and kept and not left and named, f"raised {raised}, kept {kept}, left {left}, named {named}"))
+    # A job binds ONE notes folder for the whole write: the picture goes there, and every birth names that folder's
+    # fingerprint. When the door refuses (the galaxy shows another folder now), the job fails and leaves no picture.
+    with tempfile.TemporaryDirectory() as temp:
+        bound, elsewhere, named = Path(temp) / "bound", Path(temp) / "elsewhere", []
+
+        def door(path: str, content: str, vault=None) -> dict:
+            named.append(vault)
+            return {"file": path, "title": Path(path).stem}
+
+        def moved(path: str, content: str, vault=None) -> dict:
+            raise TeardownError("notes_moved", "The notes folder changed while the teardown ran")
+
+        def bound_bay(birth) -> Bay:
+            return Bay(notes_dir=lambda: elsewhere, notes_folder=lambda: (bound, "bound-vault"), ask=lambda s, m: reply,
+                       birth=birth, note_titles=lambda: set(), writer_name=lambda: "test", voice="plain",
+                       plain_line="{host} is done.", unbirth=lambda receipt: None, day=lambda: fixed_day)
+
+        made = bound_bay(door)._write(Job(site, "q", True), dict(evidence, snapshot=PNG_SIGNATURE + b"bound"))
+        there = (bound / TEARDOWNS_DIR / ASSETS_DIR / f"{made['name']}.png").is_file() and not elsewhere.exists()
+        code = None
+        try:
+            bound_bay(moved)._write(Job(site, "q", True), dict(evidence, snapshot=PNG_SIGNATURE + b"moved"))
+        except TeardownError as error:
+            code = error.code
+        left = [path.name for path in Path(temp).rglob("*.png") if path.stem != made["name"]]
+    results.append(("a teardown writes its picture and its notes into ONE notes folder, and a refused birth leaves no picture",
+                    there and named == ["bound-vault"] * 3 and code == "notes_moved" and not left,
+                    f"picture in the bound folder {there}, births named {named}, refused as {code}, left {left}"))
     return results
 
 

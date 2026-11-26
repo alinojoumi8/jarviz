@@ -145,6 +145,16 @@ def _skipped_folder(error: OSError) -> None:
     print(f"Skipped folder {name}: {error.strerror or error}", file=sys.stderr)
 
 
+def _regular_file(path: Path) -> bool:
+    """True for a regular file. An entry that cannot be looked at (Python 3.13 and older can raise here, for
+    example PermissionError) is skipped and said, like a folder that cannot be listed, and the build goes on."""
+    try:
+        return path.is_file()
+    except OSError as error:
+        print(f"Skipped {path.name}: {error.strerror or error}", file=sys.stderr)
+        return False
+
+
 def note_files(notes_dir: Path) -> list[Path]:
     """Every .md file under the folder, in a stable order. Hidden folders are skipped.
     Only a regular file is a note: a named pipe called x.md would stop the build when it is read."""
@@ -154,7 +164,7 @@ def note_files(notes_dir: Path) -> list[Path]:
         found.extend(
             Path(folder) / name
             for name in files
-            if name.lower().endswith(".md") and not name.startswith(".") and (Path(folder) / name).is_file()
+            if name.lower().endswith(".md") and not name.startswith(".") and _regular_file(Path(folder) / name)
         )
 
     def order(path: Path) -> tuple[str, str]:      # two names that differ only in case still have a fixed order
@@ -349,8 +359,17 @@ def main(argv: list[str]) -> int:
     notes, links, _ = build(notes_dir)
     folders = len({note.group for note in notes})
     print(f"Indexed {len(notes)} notes in {folders} folders, {len(links)} links -> viewer/graph-data.js")
-    if len(argv) > 1 and notes_dir != configured_notes_dir():
-        print("Jarviz follows \"notes_dir\" in config.json, so a running Jarviz loads that folder, not this one.")
+    if len(argv) > 1:
+        # Only advice: the build is done, so nothing here may change its result. A configured folder that cannot be
+        # worked out (Path.expanduser raises RuntimeError for "~nouser/x") is said, not raised.
+        try:
+            configured = configured_notes_dir()
+        except (OSError, RuntimeError, ValueError):
+            configured = None
+        if configured is None:
+            print("The \"notes_dir\" in config.json could not be worked out, so it was not compared with this folder.")
+        elif notes_dir != configured:
+            print("Jarviz follows \"notes_dir\" in config.json, so a running Jarviz loads that folder, not this one.")
     return 0 if notes else 1
 
 

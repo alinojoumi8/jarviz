@@ -76,91 +76,117 @@ def job_of(status: int, raw: bytes) -> dict:
     return job
 
 
-def job_now() -> dict:
-    return job_of(*call("GET", "/teardown/status"))
+def job_now(timeout: float = 150) -> dict:
+    return job_of(*call("GET", "/teardown/status", timeout=timeout))
 
 
-def cancel(job_id: str | None) -> dict:
+def cancel(job_id: str | None, timeout: float = 150) -> dict:
     """Cancel the drill's OWN job. The id goes with it, so the server can never stop another job for the drill."""
-    return call_json("POST", "/teardown/cancel", {"job": job_id or "drill-no-job"})[1]
+    return call_json("POST", "/teardown/cancel", {"job": job_id or "drill-no-job"}, timeout=timeout)[1]
 
 
-ENDED, NOT_OURS, NOT_CONFIRMED = "ended", "not ours", "not confirmed"
+ENDED, NOT_CONFIRMED = "ended", "not confirmed"
 END_STATES = ("done", "failed", "cancelled")     # the only states that end a job; "running" goes on
 SILENT_RETRY_S = 10         # a status request that gets no answer is tried again for this long, then the drill gives up
 POLL_S = 0.5
+REQUEST_FLOOR_S = 1.0       # the shortest timeout one request gets, also when its budget is nearly spent
+
+
+def request_timeout(left: float) -> float:
+    """The timeout of one request: never longer than what its budget has left, and never below REQUEST_FLOOR_S."""
+    return max(REQUEST_FLOOR_S, left)
 
 
 def follow_job(job_id: str | None, limit: float, ask, ask_cancel, clock=time.monotonic, sleep=time.sleep) -> tuple[str, dict]:
-    """Poll OUR job until its end is CONFIRMED. Pure: `ask` gives the status view of the job (it raises SERVER_GONE
-    when no answer comes), `ask_cancel` asks for the cancel, `clock` and `sleep` are the time. Returns (verdict, the
-    last view of our job):
+    """Poll OUR job until its end is CONFIRMED. Pure: `ask(timeout)` gives the status view of the job (it raises
+    SERVER_GONE when no answer comes), `ask_cancel(timeout)` asks for the cancel, `clock` and `sleep` are the time.
+    Each request gets a timeout that is no longer than its budget has left: a status request the silence budget
+    (SILENT_RETRY_S, counted from the send of the first request that got no answer) and the time to the deadline, the
+    cancel the wait after it (CANCEL_WAIT_S). Returns (verdict, the LAST view of our job, {} when none came):
       ENDED          a view of our job with an end state (done, failed, cancelled);
-      NOT_OURS       another job's id answers (or none);
-      NOT_CONFIRMED  no answer for SILENT_RETRY_S in a row, or still running after the cancel at `limit` and
-                     CANCEL_WAIT_S more. An end that is not confirmed is NOT an end: the job can still write.
+      NOT_CONFIRMED  no answer for SILENT_RETRY_S in a row; still running after the cancel at `limit` and
+                     CANCEL_WAIT_S more; or another job's id answers (or none): our job is gone and its end was never
+                     seen. An end that is not confirmed is NOT an end: the job can still have written. The receipts of
+                     the last view still count: they are files the job made.
     A view of our job with a missing or unknown state is no answer: it is tried again like one."""
     job, cancelled, silent_since = {}, False, None
     deadline = clock() + limit
     while True:
+        sent = clock()
+        left = min(SILENT_RETRY_S - (sent - silent_since if silent_since is not None else 0), deadline - sent)
         try:
-            view = ask()
+            view = ask(request_timeout(left))
             if view.get("id") == job_id and view.get("state") not in ("running", *END_STATES):
                 raise BadAnswer(f"the state {view.get('state')!r}")     # an unknown or missing state ends nothing
             silent_since = None
         except SERVER_GONE:
-            view, silent_since = None, clock() if silent_since is None else silent_since
+            view, silent_since = None, sent if silent_since is None else silent_since
             if clock() - silent_since >= SILENT_RETRY_S:
                 return NOT_CONFIRMED, job
         if view is not None:
             if view.get("id") != job_id:
-                return NOT_OURS, view
+                return NOT_CONFIRMED, job       # our job is gone: its end was never seen, and its last view counts
             job = view
             if view.get("state") in END_STATES:
                 return ENDED, view
         if clock() >= deadline:
             if cancelled:
                 return NOT_CONFIRMED, job
+            cancelled, deadline = True, clock() + CANCEL_WAIT_S     # the wait after the cancel starts at its send
             try:
-                ask_cancel()
+                ask_cancel(request_timeout(deadline - clock()))
             except SERVER_GONE:
                 pass                    # the next answers say whether it ended
-            cancelled, deadline = True, clock() + CANCEL_WAIT_S
         sleep(POLL_S)
 
 
 def wait_for_end(job_id: str | None, limit: float) -> tuple[str, dict]:
-    """Poll the job like the panel does: (verdict, the last view of OUR job; {} when another job answers). See
-    follow_job. A job that is still running at the limit is cancelled (with its own id) and polled again for
-    CANCEL_WAIT_S. The receipts in a view that is not a confirmed end still count: they are files the job made."""
-    verdict, view = follow_job(job_id, limit, job_now, lambda: cancel(job_id))
-    return verdict, ({} if verdict == NOT_OURS else view)
+    """Poll the job like the panel does: (verdict, the last view of OUR job, {} when none came). See follow_job. A
+    job that is still running at the limit is cancelled (with its own id) and polled again for CANCEL_WAIT_S. The
+    receipts in a view that is not a confirmed end still count: they are files the job made."""
+    return follow_job(job_id, limit, job_now, lambda timeout: cancel(job_id, timeout))
 
 
 def follow_checks() -> list[tuple[str, bool, str]]:
     """Offline: follow_job with made-up status answers and a made-up clock. No server."""
     results = []
 
-    def follow(answers: list, limit: float) -> tuple[str, dict, int]:
-        now, cancels, asked = [0.0], [], [0]
+    def follow(answers: list, limit: float, cancel_hangs: bool = False) -> tuple[str, dict, int, float, list]:
+        """(verdict, view, number of cancels, the time at the end, [(request, sent at, timeout)]). "gone": no answer
+        at once. "hang": no answer until the request's timeout (150 s, preflight's default, when it has none)."""
+        now, cancels, asked, requests = [0.0], [], [0], []
 
-        def ask() -> dict:                  # as job_now: one (status, body) answer, read by job_of
+        def hang(timeout) -> None:
+            now[0] += 150 if timeout is None else timeout
+            raise TimeoutError("timed out")
+
+        def ask(timeout=None) -> dict:      # as job_now: one (status, body) answer, read by job_of
+            requests.append(("status", now[0], timeout))
             answer = answers[min(asked[0], len(answers) - 1)]
             asked[0] += 1
             if answer == "gone":
                 raise ConnectionResetError("no answer")
+            if answer == "hang":
+                hang(timeout)
             return job_of(*answer)
+
+        def ask_cancel(timeout=None) -> None:
+            requests.append(("cancel", now[0], timeout))
+            cancels.append(now[0])
+            if cancel_hangs:
+                hang(timeout)
 
         def sleep(seconds: float) -> None:
             now[0] += seconds
 
-        verdict, view = follow_job("job1", limit, ask, lambda: cancels.append(now[0]), lambda: now[0], sleep)
-        return verdict, view, len(cancels)
+        verdict, view = follow_job("job1", limit, ask, ask_cancel, lambda: now[0], sleep)
+        return verdict, view, len(cancels), now[0], requests
 
     def good(job) -> tuple[int, bytes]:
         return 200, json.dumps({"ok": True, "job": job}).encode("utf-8")
 
     running, done, other = {"id": "job1", "state": "running"}, {"id": "job1", "state": "done"}, {"id": "job2", "state": "running"}
+    made = {"id": "job1", "state": "running", "births": [{"file": teardown.CONCEPT_PATH, "title": teardown.CONCEPT_NAME}]}
     error_500 = (500, b'{"ok": false, "error": "server_error"}')
     html = (502, b"<html><body>Bad gateway</body></html>")
     refused = (200, b'{"ok": false}')
@@ -170,8 +196,14 @@ def follow_checks() -> list[tuple[str, bool, str]]:
              ("a job that still runs after the cancel and its wait is not a confirmed end", [good(running)], 5,
               (NOT_CONFIRMED, running, 1)),
              ("a job that ends after the cancel is a confirmed end", [good(running)] * 12 + [good(done)], 5, (ENDED, done, 1)),
-             ("another job's id is \"not ours\"", [good(running), good(other)], 60, (NOT_OURS, other, 0)),
-             ("a good answer with no job is \"not ours\"", [good(running), good(None)], 60, (NOT_OURS, {}, 0))]
+             # Our job ended between two polls and another one started: its end was never seen. Not confirmed, and
+             # the last view of OUR job comes back, so its receipts are still removed.
+             ("our job gone and another job's id answering is not a confirmed end, with our last view",
+              [good(made), good(other)], 60, (NOT_CONFIRMED, made, 0)),
+             ("our job gone and a good answer with no job is not a confirmed end, with our last view",
+              [good(running), good(None)], 60, (NOT_CONFIRMED, running, 0)),
+             ("another job's id from the first answer is not a confirmed end, with no view", [good(other)], 60,
+              (NOT_CONFIRMED, {}, 0))]
     no_job_key = (200, b"{}")                       # a good answer has the key "job"
     stateless, weird = good({"id": "job1"}), good({"id": "job1", "state": "weird"})
     for what, bad in (("an HTTP 500", error_500), ("an HTML error page", html), ('{"ok": false}', refused),
@@ -182,8 +214,38 @@ def follow_checks() -> list[tuple[str, bool, str]]:
         cases.append((f"{what} until the retry limit is not a confirmed end", [good(running), bad], 60,
                       (NOT_CONFIRMED, running, 0)))
     for name, answers, limit, wanted in cases:
-        got = follow(answers, limit)
+        got = follow(answers, limit)[:3]
         results.append((f"drill: {name}", got == wanted, f"got {got}"))
+    # Each request gets a timeout no longer than its budget has left, so a server that does not answer cannot stretch
+    # the 10 s silence budget, or the 30 s wait after a cancel, by much (at most the floor of one request).
+    verdict, _, _, ended, requests = follow([good(running), "hang"], 60)
+    silent_from = next((sent for what, sent, _ in requests[1:2]), 0.0)
+    within = all(isinstance(timeout, (int, float)) and REQUEST_FLOOR_S <= timeout <= SILENT_RETRY_S
+                 for _, _, timeout in requests)
+    results.append(("drill: a status request that hangs gets a timeout inside the silence budget, and the budget holds",
+                    verdict == NOT_CONFIRMED and within and ended - silent_from <= SILENT_RETRY_S + REQUEST_FLOOR_S,
+                    f"{verdict} after {ended - silent_from:.1f} s of silence, timeouts {[t for _, _, t in requests]}"))
+    verdict, _, cancels, ended, requests = follow([good(running)], 5, cancel_hangs=True)
+    sent_cancel = [(sent, timeout) for what, sent, timeout in requests if what == "cancel"]
+    after = [(sent, timeout) for what, sent, timeout in requests if what == "status" and sent_cancel and sent > sent_cancel[0][0]]
+    # After the wait, one last look may still go out (a poll pause later, with the floor timeout).
+    within = (len(sent_cancel) == 1 and isinstance(sent_cancel[0][1], (int, float)) and sent_cancel[0][1] <= CANCEL_WAIT_S
+              and all(isinstance(timeout, (int, float))
+                      and sent + timeout <= sent_cancel[0][0] + CANCEL_WAIT_S + POLL_S + REQUEST_FLOOR_S
+                      for sent, timeout in after))
+    results.append(("drill: a cancel that hangs gets a timeout inside the wait after it, and the wait holds",
+                    verdict == NOT_CONFIRMED and cancels == 1 and within
+                    and ended <= 5 + POLL_S + CANCEL_WAIT_S + REQUEST_FLOOR_S,
+                    f"{verdict} at {ended:.1f} s, cancel {sent_cancel}, status after it {after[:3]}"))
+    # The put-back counts only a good status answer with valid graph numbers: anything else proves nothing about
+    # what the server holds.
+    graph = {"build_id": "b1", "rev": 0, "count": 3}
+    bad = [(500, {"ok": False, "error": "server_error"}), (200, {"ok": True}), (200, {"ok": False, "graph": graph}),
+           (200, {"ok": True, "graph": {**graph, "count": None}}), (200, {"ok": True, "graph": {**graph, "count": True}}),
+           (200, {"ok": True, "graph": {**graph, "build_id": ""}}), (0, {}), (200, [])]
+    taken = [answer for answer in bad if served_graph(*answer) is not None]
+    results.append(("drill: the put-back takes only a good status answer with valid graph numbers",
+                    not taken and served_graph(200, {"ok": True, "graph": graph}) == graph, f"taken: {taken}"))
     return results
 
 
@@ -268,6 +330,20 @@ def made_by(job: dict) -> list[str]:
     return files
 
 
+def served_graph(status: int, body) -> dict | None:
+    """The graph numbers in ONE /status answer, or None. Only a good answer counts: HTTP 200, a JSON object, "ok" not
+    false, and "graph" with a text build_id and whole numbers for rev and count. Anything else is no answer: it
+    proves nothing about the galaxy the server holds."""
+    graph = body.get("graph") if isinstance(body, dict) else None
+    if status != 200 or not isinstance(graph, dict) or body.get("ok") is False:
+        return None
+    numbers = (graph.get("rev"), graph.get("count"))
+    if not (isinstance(graph.get("build_id"), str) and graph["build_id"]
+            and all(isinstance(n, int) and not isinstance(n, bool) and n >= 0 for n in numbers)):
+        return None
+    return graph
+
+
 def put_back(state: dict, made: list[str]) -> tuple[bool, str]:
     """Remove the files in `made` (the test's own), remove folders that the test made and left empty,
     and build the galaxy again from the notes on disk. It never raises: it reports."""
@@ -292,11 +368,13 @@ def put_back(state: dict, made: list[str]) -> tuple[bool, str]:
     except (OSError, ValueError) as error:
         trouble.append(f"the galaxy file could not be written ({error})")
     try:
-        _, now = call_json("GET", "/status")            # the server sees the new file and loads the notes again
-        count = now.get("graph", {}).get("count")
+        status, now = call_json("GET", "/status")       # the server sees the new file and loads the notes again
     except SERVER_GONE:
-        count = None
-        trouble.append("the server did not answer, so it still holds the old galaxy. Restart it")
+        status, now = 0, {}
+    served = served_graph(status, now)
+    if served is None:                                  # no good answer: the server may still hold the old galaxy
+        trouble.append(f"the server gave no good status answer ({f'HTTP {status}' if status else 'no answer'}), so it is "
+                       "not proven that it holds the galaxy as it was put back. Restart it")
     graph = build.read_graph()
     labels = [node.get("label") for node in graph.get("nodes", [])]
     notes, links = shape(graph)
@@ -304,8 +382,9 @@ def put_back(state: dict, made: list[str]) -> tuple[bool, str]:
         trouble.append(f"the galaxy does not hold the same notes ({len(labels)} now, {len(state['labels'])} before)")
     elif links != state["shape"][1]:
         trouble.append(f"the galaxy does not hold the same links ({len(links)} now, {len(state['shape'][1])} before)")
-    elif count is not None and count != len(labels):
-        trouble.append(f"the server holds {count} notes, the file has {len(labels)}")
+    elif served is not None and (served["count"] != len(labels) or served["build_id"] != graph.get("build_id")):
+        trouble.append(f"the server holds {served['count']} notes of build {served['build_id']}, the file has "
+                       f"{len(labels)} of build {graph.get('build_id')}. Restart it")
     if tree(folder) != state["tree"]:
         trouble.append("the teardowns folder is not as it was")
     return not trouble, "; ".join(trouble) or f"{len(labels)} notes and {len(links)} links, as before"
@@ -326,6 +405,15 @@ def live(report: Report, site: str, keep: Path | None) -> None:
     session = "drill-" + secrets.token_hex(4)
     ours: list[str] = []            # the ids of the jobs this drill started
     made: list[str] = []            # the files those jobs made
+    ends: dict[str, str] = {}       # job id -> the verdict of its newest follow: only ENDED is a confirmed end
+
+    def follow(job_id: str, limit: float) -> dict:
+        """wait_for_end. The files in the last view of the job are the drill's own, also when its end was not seen."""
+        verdict, view = wait_for_end(job_id, limit)
+        ends[job_id] = verdict
+        made.extend(made_by(view))
+        return view
+
     try:
         status, started, first = start(site, session, f"How does {site} work?")
         if not report.add(PASS if status == 200 and first else FAIL, "A teardown starts from one request",
@@ -337,15 +425,14 @@ def live(report: Report, site: str, keep: Path | None) -> None:
             if extra:                                   # it was let in: stop it, and count its files as ours
                 ours.append(extra)
                 cancel(extra)
-                made += made_by(wait_for_end(extra, 60)[1])
+                follow(extra, 60)
             report.add(PASS if status == 409 and "already taking one apart" in second.get("answer", "") else FAIL,
                        "A second request while one runs is refused in one line", teardown._clean(second.get("answer"), 120))
         else:
             report.add(FAIL, "A second request while one runs is refused in one line",
                        "Not checked: the first teardown ended before the second request could be sent.")
 
-        job = wait_for_end(first, LIVE_LIMIT_S)[1]
-        made += made_by(job)
+        job = follow(first, LIVE_LIMIT_S)
         result = job.get("result") or {}
         name = result.get("name")
         done = job.get("state") == "done" and bool(name)
@@ -411,8 +498,7 @@ def live(report: Report, site: str, keep: Path | None) -> None:
             ours.append(third)
             time.sleep(4.0)
             cancelled = cancel(third)
-            stopped = wait_for_end(third, 60)[1]
-            made += made_by(stopped)
+            stopped = follow(third, 60)
             report.add(PASS if stopped.get("state") == "cancelled" and tree(folder) == tree_after_run else FAIL,
                        "A cancelled teardown stops and writes nothing",
                        f"state {stopped.get('state')}: {teardown._clean(cancelled.get('answer'), 80)}")
@@ -426,8 +512,7 @@ def live(report: Report, site: str, keep: Path | None) -> None:
         status, started, fourth = start(f"localhost:{closed_port()}", session)
         if status == 200 and fourth:
             ours.append(fourth)
-            failed = wait_for_end(fourth, 90)[1]
-            made += made_by(failed)
+            failed = follow(fourth, 90)
             error = failed.get("error") or {}
             report.add(PASS if failed.get("state") == "failed" and error.get("code") == "site_silent"
                        and tree(folder) == tree_after_run else FAIL, failing,
@@ -439,16 +524,15 @@ def live(report: Report, site: str, keep: Path | None) -> None:
     finally:
         # -- put everything back, whatever happened above. Only the files of this drill's own jobs go.
         # The newest job of the drill is the only one that can still run: a later start was let in only after the
-        # one before it ended. Its end must be CONFIRMED; a status request that fails is no end.
-        not_ended = ""
-        if ours:
-            verdict, ended = wait_for_end(ours[-1], 90)
-            made += made_by(ended)                      # the receipts it has count, also when the end is not confirmed
-            if verdict == NOT_CONFIRMED:                # it can still write a note after the put-back
-                not_ended = ours[-1]
+        # one before it ended. Its end must be CONFIRMED; a status request that fails is no end, and neither is
+        # another job in its place. A job whose end was never seen may have made files after its last view.
+        if ours and ends.get(ours[-1]) != ENDED:
+            follow(ours[-1], 90)
+        unseen = [job_id for job_id in ours if ends.get(job_id) != ENDED]
         clean, detail = put_back(before, list(dict.fromkeys(made)))
-        if not_ended:
-            clean, detail = False, f"the job {not_ended} did not end, so the put-back is not confirmed. {detail}"
+        if unseen:
+            clean, detail = False, (f"the end of {', '.join(unseen)} was not seen, so the clean-up may be incomplete: "
+                                    f"only the files in the last view of each job were removed. {detail}")
         report.add(PASS if clean else FAIL, "Everything is put back: the test note is gone and the galaxy is as before", detail)
 
 

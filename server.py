@@ -18,6 +18,7 @@ import os
 import random
 import re
 import secrets
+import stat
 import sys
 import threading
 import time
@@ -364,12 +365,44 @@ def save_brain_choice(name: str) -> None:
                 or {key: value for key, value in new.items() if key != "brain"}
                 != {key: value for key, value in old.items() if key != "brain"}):
             raise ValueError("config.json could not be changed safely, so it was left as it is")
+        # The new text is staged in a file of its own and then put in place in one step: a half-written config.json
+        # would lose the keys. The staging file holds the keys too, so it is made new ("x": never over a file that is
+        # there, it is not ours) and always removed. A crash between the two steps leaves it: main() sweeps it.
         temp = CONFIG_PATH.with_name(f"{CONFIG_PATH.name}.{os.getpid()}.tmp")
+        made = False
         try:
-            temp.write_bytes(bom + changed.encode("utf-8"))
+            with open(temp, "xb") as handle:
+                made = True
+                handle.write(bom + changed.encode("utf-8"))
             os.replace(temp, CONFIG_PATH)
         finally:
-            temp.unlink(missing_ok=True)
+            if made:
+                temp.unlink(missing_ok=True)
+
+
+def sweep_config_staging() -> list[str]:
+    """At start-up (main), once the port is ours: remove the staging files of save_brain_choice that a crash left
+    beside config.json (they hold the keys). Only a regular file whose name is exactly config.json.<digits>.tmp.
+    Its content is never read. A removal that fails is said in one line, and the start goes on. Returns the names
+    removed."""
+    staged = re.compile(re.escape(CONFIG_PATH.name) + r"\.[0-9]+\.tmp")
+    removed = []
+    try:
+        entries = [entry for entry in CONFIG_PATH.parent.iterdir() if staged.fullmatch(entry.name)]
+    except OSError as error:
+        print(f"Could not look for leftover copies of config.json ({error.strerror or error}).",
+              file=sys.stderr, flush=True)
+        return removed
+    for entry in entries:
+        try:
+            if not stat.S_ISREG(entry.lstat().st_mode):     # lstat: a link or a folder of that name is not ours
+                continue
+            entry.unlink()
+            removed.append(entry.name)
+        except OSError as error:
+            print(f"Could not remove a leftover copy of config.json, {entry.name} ({error.strerror or error}). "
+                  "Delete it by hand: it can hold your keys.", file=sys.stderr, flush=True)
+    return removed
 
 
 # --------------------------------------------------------------------- brain
@@ -418,6 +451,16 @@ def make_title(fact: str) -> str:
     return "Note " + title if title.split(".")[0].upper() in WINDOWS_RESERVED else title
 
 
+def vault_of(notes_dir: Path) -> str:
+    """A short fingerprint of a notes folder (16 hex characters of a sha256 of its path). A receipt carries it, never
+    the path: receipts go to the page."""
+    return hashlib.sha256(os.fsencode(notes_dir)).hexdigest()[:16]
+
+
+class NotesMoved(ValueError):
+    """The galaxy now shows another notes folder than the one a writer bound itself to (birth_note's `vault`)."""
+
+
 def render_capture(title: str, fact: str, related_title: str | None, source: str) -> str:
     lines = [f"# {title}", "", fact, "", f"- Captured: {datetime.now():%Y-%m-%d %H:%M}", f"- Source: {source}"]
     if related_title:
@@ -464,7 +507,7 @@ class Galaxy:
         try:
             wanted = build.resolve_notes_dir(config["notes_dir"])
             return wanted if wanted.is_dir() else self.notes_dir
-        except (OSError, ValueError):
+        except (OSError, RuntimeError, ValueError):     # RuntimeError: Path.expanduser for "~nouser/x"
             return self.notes_dir
 
     @staticmethod
@@ -514,14 +557,25 @@ class Galaxy:
             raise ValueError("a note must be a .md file inside the notes folder")
         return target
 
-    def birth_note(self, rel_path: str, content: str) -> dict:
+    def current_folder(self) -> tuple[Path, str]:
+        """The notes folder now, after a look for a rebuild, and its fingerprint (vault_of). A teardown binds itself to
+        it: its picture goes there, and each of its births names the fingerprint (birth_note refuses another folder)."""
+        with self.lock:
+            self.refresh_if_rebuilt()
+            return self.notes_dir, vault_of(self.notes_dir)
+
+    def birth_note(self, rel_path: str, content: str, vault: str | None = None) -> dict:
         """THE ONE DOOR for new notes on the server.
 
         Writes the file, adds the note to the live search index, appends its node to
         graph-data.js, and returns the receipt. Captures and teardowns both come through here.
+        `vault`: the fingerprint of the notes folder the writer bound itself to (current_folder). When the galaxy
+        shows another folder now, nothing is written (NotesMoved). None: the folder the galaxy has now.
         """
         with self.lock:
             self.refresh_if_rebuilt()
+            if vault is not None and vault != vault_of(self.notes_dir):
+                raise NotesMoved("the notes folder changed while the note was being made, so it was not written")
             target = self._note_path(rel_path)
             if target.exists():
                 raise FileExistsError(17, "A note with that name already exists")
@@ -559,6 +613,7 @@ class Galaxy:
                 "file": note.path,
                 "build": self.build_id,     # the galaxy this number belongs to, read under the same lock (/forget)
                 "born": born,               # the sha256 (hex, all 64 characters) of the bytes written (/forget)
+                "vault": vault_of(self.notes_dir),   # the notes folder it was written in, as a fingerprint (unbirth)
                 "related": self._nearest(note, [a for a, _ in new_links]),
                 "node": {"id": index, "label": note.label, "group": note.group, "excerpt": note.excerpt},
                 "links": [{"source": a, "target": b} for a, b in sorted(new_links)],
@@ -637,10 +692,15 @@ class Galaxy:
         Only the newest note, only when it is still the note on the receipt, and only when its file still holds
         the bytes that birth_note wrote. The file is seconds old, so it is deleted for good, not moved to the
         trash. First it is moved aside, under a name that is not a note. The bytes checked are the bytes of that
-        file, the one that will be deleted. It is deleted only after the galaxy is saved without it."""
+        file, the one that will be deleted. It is deleted only after the galaxy is saved without it.
+        The receipt names its creation fully: the notes folder ("vault") and the bytes ("born"). Another folder can
+        hold a note that Jarviz made at the same path: it is never touched. A rebuild of the SAME folder keeps the
+        take-back working (_born survives a load)."""
         with self.lock:
             self.refresh_if_rebuilt()
-            index = receipt.get("index") if isinstance(receipt, dict) else None
+            if not isinstance(receipt, dict) or receipt.get("vault") != vault_of(self.notes_dir):
+                raise ValueError("that note was made in another notes folder, so nothing there is touched")
+            index = receipt.get("index")
             note = self.note(index) if isinstance(index, int) else None
             if (note is None or index != len(self.notes) - 1
                     or note.label != receipt.get("title") or note.path != receipt.get("file")):
@@ -649,6 +709,8 @@ class Galaxy:
             written = self._born.get(note.path)
             if written is None:
                 raise ValueError("Jarviz did not make that note in this run, so it stays")
+            if written != receipt.get("born"):     # Jarviz made a note here, but not the one on this receipt
+                raise ValueError("that is not the note this receipt was made for, so it stays")
             aside, number = target.with_name(f"{target.name}.taken"), 1
             while aside.exists():
                 number += 1
@@ -752,7 +814,9 @@ class Session:
         self.last_tokens: frozenset = frozenset()
         self.last_sources: list[tuple[int, tuple]] = []     # (index, note_id): a stale index is never trusted
         self.used = time.monotonic()
-        self._undo: tuple | None = None                     # what the newest record() changed, for take_back()
+        # Turns that are not in the history yet (draft), by id: (the turn, its keywords, its sources). An action that may
+        # be refused enters the history only once it started (publish), so a refusal has nothing to take back.
+        self._drafts: dict[int, tuple[list, frozenset, list]] = {}
 
     def snapshot(self) -> tuple[list[dict], frozenset, list[int]]:
         """The history, the last keywords, and the last sources that still are the same notes: the note at that
@@ -774,6 +838,14 @@ class Session:
                ids: dict[int, tuple] | None = None) -> list:
         """Add one turn and return it. `ids`: the note_id of each note the brain was shown, by its number (a source
         is kept with that identity). Without it, the identity the index has now."""
+        turn = self.draft(said, replied, tokens, nodes, receipt, ids)
+        self.publish(turn)
+        return turn
+
+    def draft(self, said: str, replied: str, tokens, nodes: list[int], receipt: str | None = None,
+              ids: dict[int, tuple] | None = None) -> list:
+        """A turn as record() makes it, but NOT in the history yet: publish() puts it there, forget() drops it. A
+        receipt for it (add_receipt) is kept on it meanwhile, so a job that ends at once keeps its receipt."""
         if ids is None:
             with GALAXY.lock:
                 sources = [(index, note_id(note)) for index in nodes if (note := GALAXY.note(index)) is not None]
@@ -781,37 +853,38 @@ class Session:
             sources = [(index, ids[index]) for index in nodes if index in ids]
         turn = [said, replied, [receipt] if receipt else []]
         with self.lock:
-            dropped = self.turns[0] if len(self.turns) == self.turns.maxlen else None
-            self._undo = (turn, dropped, self.last_tokens, self.last_sources)
-            self.turns.append(turn)
-            self.last_tokens = frozenset(tokens)
-            self.last_sources = sources
+            self._drafts[id(turn)] = (turn, frozenset(tokens), sources)
         return turn
 
-    def take_back(self, turn: list) -> None:
-        """Remove a turn that record() just made, for an action that did not start after all. When it is still the
-        newest record, the session is put back as it was before it. Else only the turn goes."""
+    def publish(self, turn: list) -> None:
+        """Put a draft in the history: the turn, its keywords and its sources. A draft that is not pending any more
+        (published, or forgotten) changes nothing."""
         with self.lock:
-            undo, self._undo = self._undo, None
-            if undo is not None and undo[0] is turn and self.turns and self.turns[-1] is turn:
-                self.turns.pop()
-                if undo[1] is not None:
-                    self.turns.appendleft(undo[1])
-                self.last_tokens, self.last_sources = undo[2], undo[3]
+            if not self._pending(turn):
                 return
-            for position, kept in enumerate(self.turns):
-                if kept is turn:
-                    del self.turns[position]
-                    return
+            _, tokens, sources = self._drafts.pop(id(turn))
+            self.turns.append(turn)
+            self.last_tokens = tokens
+            self.last_sources = sources
+
+    def forget(self, turn: list) -> None:
+        """A draft that will never be published (its action was refused): it is dropped, and the session is as it was."""
+        with self.lock:
+            if self._pending(turn):
+                del self._drafts[id(turn)]
+
+    def _pending(self, turn: list) -> bool:
+        entry = self._drafts.get(id(turn))
+        return entry is not None and entry[0] is turn
 
     def add_receipt(self, line: str, turn: list | None = None) -> None:
-        """Proof of a later action. With `turn`: on that turn, only while it is still in the history (else the line
-        is dropped). Without it: on the newest turn (for example: the note was taken back)."""
+        """Proof of a later action. With `turn`: on that turn, while it is still in the history or still a pending
+        draft (else the line is dropped). Without it: on the newest turn (for example: the note was taken back)."""
         with self.lock:
             if turn is None:
                 if self.turns:
                     self.turns[-1][2].append(line)
-            elif any(kept is turn for kept in self.turns):
+            elif self._pending(turn) or any(kept is turn for kept in self.turns):
                 turn[2].append(line)
 
 
@@ -844,7 +917,8 @@ PROMPT_TAG_RE = re.compile(r"<(/?)(notes?|receipts|question)\b", re.IGNORECASE)
 # or (B) it asks how a thing is built AND names something site-like ("website", "homepage", or an address such
 # as igloo.inc). "How does the loan work?" has no site, and a site word alone is never enough.
 # A sentence ABOUT a teardown does not ask FOR one. The sentence is cut into clauses. A clause ends at , ; : ? !
-# at a full stop (not at the dot in stripe.com), at "then", and at an "and" that a request follows ("and tear down
+# (not at the colon inside an address: https://x.com, x.com:8080), at a full stop (not at the dot in stripe.com),
+# at "then", and at an "and" that a request follows ("and tear down
 # X", "and run one"). In each clause, the part about a teardown that is there, or about the past, is taken out,
 # from where it starts to the end of the clause. (A) or (B) must then hold on what is left. Four shapes start it:
 # (i) a question word and a helping verb, then the noun: "what did my teardown of X say", "what is a teardown";
@@ -867,7 +941,7 @@ START_VERBS = r"do|run|start|begin|launch|make|perform|redo|repeat|rerun|refresh
 EXISTING_WORDS = r"the|my|our|your|that|this|those|these|last|latest|previous|earlier|old|existing|saved|recent|full"
 NAME_WORD = r"(?!then\b)[^\W_]+(?:[.-][^\W_]+)*"      # one word such as stripe.com or igloo: letters, digits, . and -
 CLAUSE_END_RE = re.compile(
-    r"[,;:?!\n]|\.(?!\w)|\bthen\b"
+    r"[,;?!\n]|:(?!//|[0-9])|\.(?!\w)|\bthen\b"
     rf"|\band\b(?=\s+(?:(?:then|please|also|now|just)\s+)*(?:{TEARDOWN_VERB_RE.pattern}|(?:{START_VERBS})\b))",
     re.IGNORECASE)
 ABOUT_TEARDOWN_RE = re.compile(     # where shape (i) or shape (ii) starts in a clause
@@ -1189,8 +1263,18 @@ def _writer_name() -> str:
     return f"{active['label']} ({active['model']})"
 
 
-BAY = teardown.Bay(notes_dir=lambda: GALAXY.notes_dir, ask=_teardown_ask,
-                   birth=lambda path, content: GALAXY.birth_note(path, content),
+def _teardown_birth(path: str, content: str, vault: str | None = None) -> dict:
+    """A teardown's note goes through THE ONE DOOR (birth_note), in the folder the job bound itself to. When the
+    galaxy shows another folder now, the job fails with a line Jarviz can say, and takes back what it made."""
+    try:
+        return GALAXY.birth_note(path, content, vault=vault)
+    except NotesMoved:
+        raise teardown.TeardownError("notes_moved", "The notes folder changed while the teardown ran, so its note "
+                                                    "was not saved") from None
+
+
+BAY = teardown.Bay(notes_dir=lambda: GALAXY.notes_dir, notes_folder=lambda: GALAXY.current_folder(),
+                   ask=_teardown_ask, birth=_teardown_birth,
                    unbirth=lambda receipt: GALAXY.unbirth(receipt),
                    note_titles=lambda: GALAXY.titles(), writer_name=_writer_name, voice=VOICE,
                    plain_line=LINES["teardown_plain"]) if teardown else None
@@ -1216,7 +1300,8 @@ def teardown_line(job: dict) -> str:
 
 def _teardown_done(job, session: Session, turn: list) -> None:
     """The receipt for the chat history, so the brain knows what really happened. It goes on the turn that started
-    the job, while that turn is still in the history (a question asked while the job ran must not get it)."""
+    the job, while that turn is still in the history or still a draft that waits for the start to be published (a
+    question asked while the job ran must not get it)."""
     if job.state == "done":
         line = f'TEARDOWN worked: {job.site.host} was taken apart and the note "{job.result["name"]}" was saved.'
     elif stayed := [str(birth.get("title")) for birth in job.births if isinstance(birth, dict) and birth.get("title")]:
@@ -1260,21 +1345,23 @@ def start_teardown(site_text: str, question: str, session: Session, said: str, h
     if problems:
         return 503, reply(LINES["teardown_not_ready"].format(reason=problems[0]), ok=False, error="teardown_not_ready")
     question = clean_text(question, 300) or "How is this site built?"
-    # The turn is there BEFORE the job starts: a job can fail at once, and its receipt goes on this turn.
-    turn = session.record(said or question, f"[TEARDOWN:{site.host}|{question}]",
-                          build.tokenize(f"{site.host} {question}"), [],
-                          receipt=f"TEARDOWN started for {site.host}. It takes about a minute. The result is not in yet.")
+    # The turn is a DRAFT until BAY accepted the job: a refused start publishes nothing, so there is nothing to take
+    # back (also when two starts overlap). A job can end at once, before the publish: its receipt waits on the draft.
+    turn = session.draft(said or question, f"[TEARDOWN:{site.host}|{question}]",
+                         build.tokenize(f"{site.host} {question}"), [],
+                         receipt=f"TEARDOWN started for {site.host}. It takes about a minute. The result is not in yet.")
     try:
         job = BAY.start(site, question, headless=headless, on_done=lambda done: _teardown_done(done, session, turn))
     except teardown.TeardownError as error:
-        session.take_back(turn)                             # no job: no turn is left behind
+        session.forget(turn)                                # no job: the turn never enters the history
         if error.code == "busy":
             return 409, reply(LINES["teardown_busy"], ok=False, error="teardown_busy")
         reason = reason_of(ValueError(error.detail or "No reason was given"))
         return 503, reply(LINES["teardown_not_ready"].format(reason=reason), ok=False, error="teardown_not_started")
-    except Exception:
-        session.take_back(turn)
+    except BaseException:
+        session.forget(turn)
         raise
+    session.publish(turn)
     line = random.choice(LINES["teardown_started"]).format(host=site.host)
     return 200, reply(line, action={"type": "teardown", "job": job.view()})
 
@@ -1287,25 +1374,28 @@ def teardown_start_route(payload: dict) -> tuple[int, dict]:
 
 def teardown_cancel_route(payload: dict) -> tuple[int, dict]:
     """{"job": id} cancels only that job, and only while it is the one running (a test names its own job, so it
-    can never stop another). Without "job": the job that runs now ("cancel the teardown")."""
-    wanted = payload.get("job")
-    if wanted is None:
+    can never stop another). Only a MISSING "job" means the job that runs now ("cancel the teardown"). A "job" that
+    is there but not a non-empty text (null, a number, "", a list) names no job: it stops nothing (no_such_job).
+    Every answer about a job carries its id ("job_id"), so the page knows which job it is about."""
+    if "job" not in payload:
         job = BAY.cancel() if BAY is not None else None
+        if job is None:
+            return 200, reply(LINES["teardown_none_running"], error="none_running")
     else:
+        wanted = payload["job"]
         job = BAY.cancel(job_id=wanted) if BAY is not None and isinstance(wanted, str) and wanted else None
         if job is None:
             return 200, reply(LINES["teardown_no_such_job"], error="no_such_job")
-    if job is None:
-        return 200, reply(LINES["teardown_none_running"], error="none_running")
     deadline = time.monotonic() + 12.0          # say "closed" only when the browser really is closed
     while job.state == "running" and time.monotonic() < deadline:
         time.sleep(0.2)
+    about = {"job_id": job.id}
     if job.state == "done":                     # it finished while the cancel was on its way: the note IS saved
-        return 200, reply(LINES["teardown_too_late"], error="too_late")
+        return 200, reply(LINES["teardown_too_late"], error="too_late", **about)
     if job.state == "failed":                   # it failed while the cancel was on its way: say why, as /teardown/status does
-        return 200, reply(teardown_line(job.view()), error="failed")
+        return 200, reply(teardown_line(job.view()), error="failed", **about)
     line = LINES["teardown_cancelled" if job.state == "cancelled" else "teardown_stopping"]
-    return 200, reply(line, action={"type": "teardown_cancel"})
+    return 200, reply(line, action={"type": "teardown_cancel"}, **about)
 
 
 def teardown_diag_route(query: dict) -> tuple[int, dict]:
@@ -1861,6 +1951,7 @@ def main(argv: list[str]) -> int:
     except OSError:
         print(f"Port {PORT} is busy. Jarviz may already be running. Close it, then start again.", file=sys.stderr)
         return 1
+    sweep_config_staging()          # the port is ours: a staging copy of config.json beside it is a crash's leftover
     write_starter_config()          # the one place that makes config.json, once, when there is none
     config = load_config()
     notes_dir = build.resolve_notes_dir(config["notes_dir"])

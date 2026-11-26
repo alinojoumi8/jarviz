@@ -58,8 +58,9 @@ Jarviz has seven brains. One is active. The screen shows it at the top (`brain: 
 - **How it works:** Jarviz starts the tool on your computer for each question. The tool uses its own sign-in. Jarviz never reads or copies the sign-in.
 - **The lock:** these tools are coding agents. They can run commands and read files. Jarviz starts them locked, so they can only talk. A real trap test proves the lock: Jarviz asks the brain to read a trap file, to run a command and to write a file. All three must fail. Jarviz does this test by itself for each new version of a tool, before the first question. The proof is kept in `%USERPROFILE%\.jarvis-tools\brain-locks.json`.
 - **If a brain reaches for a tool,** Jarviz throws that answer away and tells you.
-- [x] Codex (`codex-cli 0.171.0`): the lock held in a real trap, and it answered real questions about the notes on the page.
-- [x] Antigravity (`agy 1.5.18`): the lock held in a real trap, and it answered real questions about the notes on the page.
+- [x] Codex (`codex-cli 0.171.0`): a strong proof. In the trap it tried to write a file, and the sandbox refused. It answered real questions about the notes on the page.
+- [x] Antigravity (`agy 1.5.18`): a strong proof. In the trap it tried to call one of your MCP tools, and the deny rule refused. It answered real questions about the notes on the page.
+- **Strong and weak proof:** a strong proof saw a real attempt that the lock refused. A weak proof saw no word come back, no file and no tool, but also no attempt. Jarviz works with both. Preflight shows a weak proof as a warning. (Antigravity gives a strong proof only when you have an MCP server, because that is the attempt it can make.)
 - **Slower than a key brain.** Codex needs about 6 to 10 seconds for an answer. Antigravity needs about 15 to 30 seconds.
 - **Each question uses your plan.** The tool sends its own long instructions with every question: about 23,000 tokens for Codex and about 31,000 for Antigravity. This counts against the allowance of your ChatGPT plan or Google plan.
 - **History:** Codex keeps nothing (`--ephemeral`). Antigravity keeps each question as one conversation in its own history (`agy`, then `/resume` shows them). Jarviz cannot turn that off and does not delete it.
@@ -100,8 +101,8 @@ Still to prove:
 
 Proven with the real brain and a real public site (igloo.inc):
 
-- [x] Last run: `PREFLIGHT: 35 pass, 1 fail, 0 warn`. The one fail is the OpenAI account: it has no credit (see "Brains"). Preflight has 36 checks now: 5 are new for the sign-in brains (the offline checks, one lock trap for each tool, one "ready to switch to" for each tool).
-- [x] Last drill: `DRILL: 91 pass, 0 fail`. The drill was not run again for the sign-in brains, because the teardown code did not change.
+- [x] Last run: `PREFLIGHT: 37 pass, 1 fail, 0 warn` and `DRILL: 96 pass, 0 fail`. The one fail is the OpenAI account: it has no credit (see "Brains"). Preflight has 38 checks now.
+- [ ] The page in the test browser was not opened in the last run: the test browser lost its unlock. The page rules (`page_checks.js`, 108 rules) ran against the files that the server gives out.
 - [x] The drill passed with a hidden browser, and also with the Chrome window on screen (`python drill.py --visible`). The snapshot from the visible window is a real picture.
 - [x] A full teardown in about one minute: 96 files, 14.7 MB, Three.js r165, GSAP 3.12.5, postprocessing 6.35.5.
 - [x] The card shows the 8 steps live, then the snapshot, the stack and the totals. The reader shows the whole note.
@@ -121,7 +122,7 @@ Review:
 - The six reviews above ran from this computer with CodeRabbit's free review. The pull request on GitHub gets CodeRabbit's full review when CodeRabbit is installed for the repository.
 - [x] The code is on GitHub, in the public repository `alinojoumi8/jarviz`. The work is on the branch `first-build`, with a pull request to `master`.
 - [x] The Codex review on the GitHub pull request found 4 problems. All 4 are fixed:
-  - A public site can no longer send the clean browser to a private IP address (`is_private_address`).
+  - When a public site sends the clean browser to a private IP address, Jarviz sees it and stops the job (`is_private_address`). Chrome has already sent that one request: see "Not proven" below.
   - After a note is born or taken back, the live links are the same as after a full rebuild (`build.relink`).
   - A teardown tag from the brain runs only for a sentence that asks for a teardown, not one that only mentions a site.
   - A teardown that fails takes back the Jarviz and REA notes it made (`Galaxy.unbirth`).
@@ -176,6 +177,17 @@ Review:
   - An address with a `?` part is refused. Jarviz opens a host and a path only.
   - three.js stays at 0.186.0. The library inside 3d-force-graph is the same release (r186).
   - The sample note "Wholesale Price List" is a sample.
+- [x] CodeRabbit reviewed the pull request again after the sign-in brains: 42 findings (24 in threads, 18 small ones). All 42 were real. All 42 are fixed. The ones that matter most:
+  - A lock proof of a sign-in brain is now STRONG or WEAK. Strong means: the trap saw a real attempt, and the lock refused it. Both brains give a strong proof on this computer.
+  - Antigravity must say at the start of every run that it took the lock. If it does not, its answer is thrown away.
+  - A sign-in tool is never started through a batch file (`.cmd`, `.bat`), because Windows starts a shell for those.
+  - A key is taken out of an error text before the text is cut. The Claude package no longer follows a redirect.
+  - A brain test fails when the answer is not a real answer (an empty reply with no envelope).
+  - "Cancel" with an empty job id stops nothing. Two refused teardown starts at the same moment leave the chat memory as it was.
+  - A teardown keeps its picture and its notes in one notes folder. A note of another notes folder is never taken back.
+  - Jarviz reads the REA version again when the installed files change.
+  - The page: a sentence that refuses a teardown starts none. Two saves at the same moment no longer hide a note.
+  - The drill fails when it did not see the end of its own job, and when the server does not confirm the clean-up.
 
 The page lock (it was the known gap, it is closed now):
 

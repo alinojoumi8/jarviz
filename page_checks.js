@@ -6,19 +6,22 @@
    page did. Nothing goes to the network, and no file is read except the two that are named.
 
    preflight runs it:   node page_checks.js viewer/core.js viewer/app.js
-   It prints ONE line on stdout, JSON: {"pass": 89, "fail": 0, "failures": []}. The exit code is 0 when it
+   It prints ONE line on stdout, JSON: {"pass": 108, "fail": 0, "failures": []}. The exit code is 0 when it
    ran to its end, also when a rule failed. Any other exit code means it could not run (a file is
    missing, or the page code threw while it loaded); the reason is on stderr.
    For people:          node page_checks.js viewer/core.js viewer/app.js --list   (the name of every check)
 
    To add a case: add a story(...) below, with a short plain name for each check it makes (the name
    says the rule), and call t.check(key, ok, detail) once for each key. A check that is never reached
-   fails. Node's standard library only. */
+   fails. A story that throws or never ends fails as a whole, also after all its checks passed. A promise
+   that the page lets fall (no handler) is a failure of the story that runs then; a story that drops one on
+   purpose calls t.expectRejection(/its message/) first. Node's standard library only. */
 'use strict';
 const fs = require('fs');
 const vm = require('vm');
 
 const STORY_MS = 3000;                  // a story that has not ended by then failed (an await never settled)
+let loaded = null;                      // the two page files (main reads them): the harness story runs stories of its own
 
 // ------------------------------------------------------------------ the fake page
 
@@ -933,20 +936,270 @@ story('switching the brain by voice', {
     && p.$('answer').textContent === 'chat', `${JSON.stringify(names)}, ${count(p.fetchLog, '/chat')} chats`);
 });
 
+story('a sentence that refuses a teardown', {
+  refused: 'a refusal with a teardown word anywhere in the sentence starts no teardown ("How does example.com work? Do not tear it down.")',
+  asks: 'the question without the refusal still starts one, and "don\'t wait" or "don\'t forget" is no refusal',
+  brain: 'the refused sentence goes to the brain as a question',
+}, async (t, open) => {
+  const p = await open({ handlers: {
+    '/chat': () => chatReply('A question', 5),
+    '/teardown/start': () => ({ ok: true, answer: 'Started', nodes: [], graph: meta(5), action: { type: 'teardown', job: job('j1', 'running') } }),
+  } });
+  const site = sentence => { const hit = p.J().Core.matchTeardown(sentence); return hit ? hit.site : null; };
+  const wrong = cases => cases.filter(([sentence, wanted]) => site(sentence) !== wanted)
+    .map(([sentence, wanted]) => `"${sentence}" gave ${site(sentence)}, not ${wanted}`).join('; ');
+  const refused = wrong([
+    ['How does example.com work? Do not tear it down.', null], ['What is example.com built with? Never reverse engineer it.', null],
+    ["How does example.com work? I can't have you taking it apart.", null], ['How does example.com work? No teardown, please.', null],
+  ]);
+  t.check('refused', !refused, refused);
+  const asks = wrong([
+    ['How does example.com work?', 'example.com'], ["Tear down stripe.com, don't wait for me", 'stripe.com'],
+    ["Tear down stripe.com and don't forget the pricing page", 'stripe.com'],
+  ]);
+  t.check('asks', !asks, asks);
+  await p.J().handleInput('How does example.com work? Do not tear it down.');
+  await p.tick(0);
+  t.check('brain', count(p.fetchLog, '/teardown/start') === 0 && count(p.fetchLog, '/chat') === 1 && p.$('answer').textContent === 'A question',
+    `${count(p.fetchLog, '/teardown/start')} starts, ${count(p.fetchLog, '/chat')} chats`);
+});
+
+story('two replies that wait on one read of the galaxy', {
+  both: 'two capture replies that wait on one read of the galaxy both reach it (a numbers step that is not installed reads the file)',
+  numbers: 'after them the numbers say what is on screen: the next reply at their rev lights its note with no new read',
+  forget: 'a forget and a capture that wait on one read leave the galaxy as the file says, not the forgotten note',
+}, async (t, open) => {
+  const read = deferred();
+  let file = () => read.promise;
+  let saves = 0;
+  const p = await open({ handlers: {
+    '/remember': () => (++saves === 1 ? rememberReply(6, 3, 'T1') : rememberReply(7, 4, 'T2')),
+    'graph-data.js': () => file(),
+    '/chat': () => chatReply('About T2', 7, [4]),
+  } });
+  const reload = p.J().reloadGraph();                 // a read in the air: both replies wait for it
+  const a = p.J().handleInput('remember that T1');
+  await p.tick(0);
+  const b = p.J().handleInput('remember that T2');
+  await p.tick(0);
+  file = () => graphFile(galaxy(7, ['A', 'B', 'C', 'T1', 'T2']));
+  read.resolve(graphFile(galaxy(5, ['A', 'B', 'C'])));
+  await reload; await a; await b;
+  await p.tick(1000);
+  t.check('both', labels(p) === 'A,B,C,T1,T2', labels(p));
+  const reads = count(p.fetchLog, 'graph-data.js');
+  await p.J().handleInput('tell me about T2');
+  await p.tick(0);
+  t.check('numbers', count(p.fetchLog, 'graph-data.js') === reads && p.J().Focus.current().primary === 4
+    && p.$('panel-title').textContent === 'T2', `primary ${p.J().Focus.current().primary}, ${count(p.fetchLog, 'graph-data.js') - reads} more reads`);
+
+  const read2 = deferred();
+  let file2 = () => graphFile(galaxy(6, ['A', 'B', 'C', 'T']));
+  let saves2 = 0;
+  const q = await open({ handlers: {
+    '/remember': () => (++saves2 === 1 ? rememberReply(6, 3, 'T') : rememberReply(8, 3, 'U')),
+    '/forget': () => ({ ok: true, answer: 'Forgotten', nodes: [], graph: meta(7), action: { type: 'forget', index: 3, title: 'T' } }),
+    'graph-data.js': () => file2(),
+  } });
+  await q.J().handleInput('remember that T');
+  await q.tick(1000);
+  file2 = () => read2.promise;
+  const reload2 = q.J().reloadGraph();
+  const f = q.J().handleInput('forget that');
+  await q.tick(0);
+  const u = q.J().handleInput('remember that U');
+  await q.tick(0);
+  file2 = () => graphFile(galaxy(8, ['A', 'B', 'C', 'U']));
+  read2.resolve(graphFile(galaxy(6, ['A', 'B', 'C', 'T'])));
+  await reload2; await f; await u;
+  await q.tick(1000);
+  t.check('forget', labels(q) === 'A,B,C,U', labels(q));
+});
+
+story('a teardown that ends after another tab saved a note', {
+  both: 'the end of a teardown after another tab saved a note shows the teardown\'s notes and the other note',
+  focus: 'the teardown\'s own note is found in the file that was read, and focused',
+}, async (t, open) => {
+  const births = [receipt(3, 'Jarviz'), receipt(4, 'REA'), receipt(5, 'Teardown x')];
+  const result = { births, spoken: 'Done', seconds: 40, label: 'Teardown · x', host: 'x', name: 'n', stack: [], totals: '', snapshot: '' };
+  let status = () => ({ ok: true, job: job('j1', 'running'), graph: meta(6) });
+  let file = () => graphFile(galaxy(6, ['A', 'B', 'C', 'Jarviz']));
+  const p = await open({ handlers: {
+    '/teardown/status': () => status(),
+    'graph-data.js': () => file(),
+    '/chat': () => chatReply('chat', 6),
+  } });
+  p.J().Teardown.follow(job('j1', 'running'));
+  await p.tick(800);
+  await p.J().handleInput('what now');                // other numbers: the page reads the file at rev 6, Jarviz in it
+  await p.tick(0);
+  // REA (rev 7) and the teardown note (rev 8) are born, then another tab saves Y (rev 9). 6 + 3 births is 9 too.
+  file = () => graphFile(galaxy(9, ['A', 'B', 'C', 'Jarviz', 'REA', 'Teardown x', 'Y']));
+  status = () => ({ ok: true, job: job('j1', 'done', { result }), graph: meta(9) });
+  await p.tick(2000);
+  t.check('both', labels(p) === 'A,B,C,Jarviz,REA,Teardown x,Y', labels(p));
+  t.check('focus', p.J().Focus.current().primary === 5 && p.$('answer').textContent === 'Done',
+    `primary ${p.J().Focus.current().primary} / ${p.$('answer').textContent}`);
+});
+
+story('a late start-up answer about a running teardown', {
+  newer: 'a start-up status answer that comes after a newer follow() does not take the watch',
+  end: 'the newer job is still followed to its end',
+}, async (t, open) => {
+  const first = deferred();
+  let calls = 0;
+  let status = () => ({ ok: true, job: job('B', 'running', { label: 'Teardown · B' }), graph: meta(5) });
+  const p = await open({ handlers: { '/teardown/status': () => (++calls === 1 ? first.promise : status()) } });
+  const T = p.J().Teardown;
+  T.follow(job('B', 'running', { label: 'Teardown · B' }));      // a new job, while the start-up answer is on its way
+  first.resolve({ ok: true, job: job('A', 'running'), graph: meta(5) });
+  await p.tick(0);
+  t.check('newer', T.current().following === 'B', String(T.current().following));
+  const result = { births: [], spoken: 'B done', seconds: 40, label: 'Teardown · B', host: 'b', name: 'nb', stack: [], totals: '', snapshot: '' };
+  status = () => ({ ok: true, job: job('B', 'done', { result }), graph: meta(5) });
+  await p.tick(2000);
+  t.check('end', p.$('answer').textContent === 'B done' && p.$('td-title').textContent === 'Teardown · B',
+    `${p.$('answer').textContent} / ${p.$('td-title').textContent}`);
+});
+
+story('a capture whose galaxy is built again before its focus', {
+  still: 'the focus timer of a capture opens no note when the galaxy was built again meanwhile',
+}, async (t, open) => {
+  let now = meta(5);
+  const p = await open({ handlers: {
+    '/status': () => ({ ok: true, active: { label: 'Claude', model: 'm', has_key: true }, lines: {}, say: 'Brain line', graph: now }),
+    '/remember': () => rememberReply(6, 3, 'T'),
+    'graph-data.js': () => graphFile(galaxy(0, ['P', 'Q', 'R', 'S'], 'b2')),
+  } });
+  await p.J().handleInput('remember that T');
+  await p.tick(0);                                    // T is born; its focus waits a moment
+  now = meta(0, 'b2');
+  await p.J().handleInput('which brain answers');     // the status names another build: the file is read again
+  await p.tick(1000);
+  const focus = p.J().Focus.current();
+  t.check('still', labels(p) === 'P,Q,R,S' && focus.primary === null && p.$('panel').hidden === true,
+    `${labels(p)} / primary ${focus.primary} / panel ${p.$('panel-title').textContent}`);
+});
+
+story('a cancel answer names its job', {
+  lateQuiet: 'a cancel answer about job A that comes after A ended does not silence the end of a later job B',
+  sameQuiet: 'a cancel answer that names the followed job keeps that job\'s end quiet',
+  lateFail: 'a "failed" cancel answer about job D does not silence the failure of the followed job E',
+}, async (t, open) => {
+  const cancel = deferred();
+  let cancelAnswer = () => cancel.promise;
+  let end = job('A', 'cancelled', { say: 'A was cancelled' });
+  const p = await open({ handlers: {
+    '/teardown/cancel': () => cancelAnswer(),
+    '/teardown/status': () => ({ ok: true, job: end, graph: meta(5) }),
+  } });
+  const T = p.J().Teardown;
+  T.follow(job('A', 'running'));
+  const c = T.cancel();                               // the server answers once the browser is closed
+  await p.tick(800);                                  // A's last poll comes first: its end is said
+  const saidA = p.$('answer').textContent;
+  cancel.resolve({ ok: true, answer: 'Cancelled line', nodes: [], graph: meta(5), action: { type: 'teardown_cancel' }, job_id: 'A' });
+  await c; await p.tick(0);
+  end = job('B', 'cancelled', { say: 'B was cancelled in another tab' });
+  T.follow(job('B', 'running'));
+  await p.tick(800);
+  t.check('lateQuiet', saidA === 'A was cancelled' && p.$('answer').textContent === 'B was cancelled in another tab',
+    `${saidA} / ${p.$('answer').textContent}`);
+
+  cancelAnswer = () => ({ ok: true, answer: 'Cancelled line', nodes: [], graph: meta(5), action: { type: 'teardown_cancel' }, job_id: 'C' });
+  end = job('C', 'running');
+  T.follow(job('C', 'running'));
+  await T.cancel();
+  await p.tick(0);
+  p.$('answer').textContent = 'sentinel';
+  end = job('C', 'cancelled', { say: 'C was cancelled' });
+  await p.tick(800);
+  t.check('sameQuiet', p.$('answer').textContent === 'sentinel', p.$('answer').textContent);
+
+  end = job('D', 'failed', { say: 'D failed' });
+  T.follow(job('D', 'running'));
+  await p.tick(800);                                  // D's end is said
+  end = job('E', 'failed', { say: 'E failed' });
+  T.follow(job('E', 'running'));
+  cancelAnswer = () => ({ ok: true, answer: 'D failed line', nodes: [], graph: meta(5), error: 'failed', job_id: 'D' });
+  await T.cancel();                                   // a late answer about D, while E is followed
+  await p.tick(800);
+  t.check('lateFail', p.$('answer').textContent === 'E failed', p.$('answer').textContent);
+});
+
+story('the harness reports trouble', {
+  thrown: 'a story that made all its checks and then threw is reported as a failure',
+  late: 'a story that made all its checks and then never ended is reported as a failure',
+  dropped: 'a promise that the page lets fall is a failure of its story',
+  handled: 'a rejection that gets its handler later is no failure',
+  expected: 'a rejection that the story expects (t.expectRejection) is no failure',
+}, async t => {
+  const inner = (body, ms) => runStory({ title: 'inner', checks: { one: 'one' }, run: body }, loaded, ms);
+  const failed = results => results.filter(result => !result.ok).map(result => result.name);
+  const broken = () => ({ build_id: 'b1', rev: 5, nodes: null, links: [] });       // boot() throws, and nothing catches it
+  let got = failed(await inner(async t2 => { t2.check('one', true); throw new Error('boom'); }));
+  t.check('thrown', got.length === 1 && /ran to its end/.test(got[0]), JSON.stringify(got));
+  got = failed(await inner(async t2 => { t2.check('one', true); await new Promise(() => {}); }, 30));
+  t.check('late', got.length === 1 && /ran to its end/.test(got[0]), JSON.stringify(got));
+  got = failed(await inner(async (t2, open2) => {
+    await open2({ graph: broken() }).catch(() => {});
+    t2.check('one', true);
+  }));
+  t.check('dropped', got.length === 1 && /no promise of the page failed/.test(got[0]), JSON.stringify(got));
+  got = failed(await inner(async t2 => {
+    const later = Promise.reject(new Error('caught later'));
+    await drain();
+    await later.catch(() => {});
+    t2.check('one', true);
+  }));
+  t.check('handled', got.length === 0, JSON.stringify(got));
+  got = failed(await inner(async (t2, open2) => {
+    t2.expectRejection(/reading 'map'/);
+    await open2({ graph: broken() }).catch(() => {});
+    t2.check('one', true);
+  }));
+  t.check('expected', got.length === 0, JSON.stringify(got));
+});
+
 // ------------------------------------------------------------------ the run
 
 const short = text => String(text).replace(/\s+/g, ' ').trim().slice(0, 160);
+const drain = async () => { for (let i = 0; i < 5; i++) await new Promise(done => setImmediate(done)); };
 
-async function runStory(entry, sources) {
+// A promise that fails with no handler at the end of its turn ("dropped") is a failure of the story that runs then.
+// One that gets its handler later (Node says 'rejectionHandled') is not. A story that drops one on purpose says so
+// first: t.expectRejection(/its message/). What is left at the end of the run is a failure too.
+const dropped = new Map();          // promise -> { story, text }
+let running = null;                 // the story that runs now (null: none)
+process.on('unhandledRejection', (error, promise) => {
+  dropped.set(promise, { story: running, text: short(error && error.message || error), stack: short(error && error.stack || error) });
+});
+process.on('rejectionHandled', promise => { dropped.delete(promise); });
+
+// The dropped promises of one story (or of none: `story` null takes them all), taken out of the list.
+function takeDropped(story) {
+  const taken = [];
+  for (const [promise, drop] of dropped) {
+    if (story === null || drop.story === story) { dropped.delete(promise); taken.push(drop); }
+  }
+  return taken;
+}
+
+async function runStory(entry, sources, limitMs = STORY_MS) {
   const done = new Set();
   const results = [];
+  const expected = [];
   const t = {
     check(key, ok, detail = '') {
       if (!(key in entry.checks)) throw new Error(`the story "${entry.title}" checks an unnamed rule: ${key}`);
       done.add(key);
       results.push({ name: entry.checks[key], ok: Boolean(ok), detail: ok ? '' : detail });
     },
+    expectRejection(pattern) { expected.push(pattern); },     // one dropped promise whose message matches is no failure
   };
+  const me = { title: entry.title };
+  const outer = running;
+  running = me;
   const open = async options => {                    // a fresh page that has booted
     const p = page(sources, options);
     await p.tick(0);
@@ -957,14 +1210,23 @@ async function runStory(entry, sources) {
   let limit = null;
   try {
     await Promise.race([entry.run(t, open),
-      new Promise((_, fail) => { limit = setTimeout(() => fail(new Error('it did not end: an await never settled')), STORY_MS); })]);
+      new Promise((_, fail) => { limit = setTimeout(() => fail(new Error('it did not end: an await never settled')), limitMs); })]);
   } catch (error) {
     trouble = error;
   } finally {
     clearTimeout(limit);
   }
+  await drain();                                      // a promise dropped in the story's last step is reported now
+  running = outer;
   for (const key of Object.keys(entry.checks)) {
     if (!done.has(key)) results.push({ name: entry.checks[key], ok: false, detail: trouble ? 'not reached: ' + (trouble.message || trouble) : 'not reached' });
+  }
+  // A story that threw or never ended failed, also when every check it made passed.
+  if (trouble) results.push({ name: `the story "${entry.title}" ran to its end`, ok: false, detail: short(trouble.message || trouble) });
+  for (const drop of takeDropped(me)) {
+    const wanted = expected.findIndex(pattern => pattern.test(drop.text));
+    if (wanted >= 0) { expected.splice(wanted, 1); continue; }
+    results.push({ name: `in the story "${entry.title}" no promise of the page failed unseen`, ok: false, detail: drop.text, stack: drop.stack });
   }
   return results;
 }
@@ -977,25 +1239,30 @@ async function main() {
   }
   const [coreFile, appFile] = args;
   if (!coreFile || !appFile) throw new Error('usage: node page_checks.js <core.js> <app.js> [--list]');
-  const sources = { core: fs.readFileSync(coreFile, 'utf8'), app: fs.readFileSync(appFile, 'utf8') };
+  const sources = loaded = { core: fs.readFileSync(coreFile, 'utf8'), app: fs.readFileSync(appFile, 'utf8') };
 
   const probe = page(sources);                       // the page must load and boot, or nothing can be checked
   await probe.tick(0);
-  if (!probe.J()) throw new Error('the page did not boot: ' + (probe.consoleLines.concat(rejections).join(' | ') || 'no reason given'));
+  await drain();
+  if (!probe.J()) {
+    const reasons = probe.consoleLines.concat(takeDropped(null).map(drop => drop.text));
+    throw new Error('the page did not boot: ' + (reasons.join(' | ') || 'no reason given'));
+  }
 
   const results = [];
   for (const entry of STORIES) results.push(...await runStory(entry, sources));
+  await drain();
+  for (const drop of takeDropped(null)) {             // dropped outside a story, or after its story had ended
+    const where = drop.story ? ` (after the story "${drop.story.title}" had ended)` : '';
+    results.push({ name: 'no promise of the page failed unseen' + where, ok: false, detail: drop.text, stack: drop.stack });
+  }
+  for (const result of results) {                     // for people: where a dropped promise came from
+    if (!result.ok && result.stack) process.stderr.write('page_checks: a promise of the page failed: ' + result.stack + '\n');
+  }
   const failures = results.filter(result => !result.ok).map(result => short(result.name + (result.detail ? ' -- ' + result.detail : '')));
   process.stdout.write(JSON.stringify({ pass: results.length - failures.length, fail: failures.length, failures }) + '\n');
   return 0;
 }
-
-// A promise that the page lets fall must not end the run. It is noted on stderr.
-const rejections = [];
-process.on('unhandledRejection', error => {
-  rejections.push(short(error && error.message || error));
-  process.stderr.write('page_checks: a promise of the page failed: ' + short(error && error.stack || error) + '\n');
-});
 
 main().then(code => { process.exitCode = code; }, error => {
   process.stderr.write('page_checks: could not run: ' + short(error && error.message || error) + '\n');

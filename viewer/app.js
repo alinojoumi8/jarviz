@@ -479,7 +479,14 @@
     }
     if (options.quiet) return node;
     pulse(node);
-    setTimeout(() => Focus.focusNode(node.id), REDUCED_MOTION ? 0 : BIRTH_SETTLE_MS);
+    // Node numbers belong to one state of the galaxy: when the galaxy on screen changed before the timer
+    // (a read, a rebuild), the number may name another note now. Then the camera stays.
+    const snapshot = graphState;
+    setTimeout(() => {
+      if (graphState.build_id === snapshot.build_id && graphState.rev === snapshot.rev && data.nodes[node.id] === node) {
+        Focus.focusNode(node.id);
+      }
+    }, REDUCED_MOTION ? 0 : BIRTH_SETTLE_MS);
     return node;
   }
 
@@ -514,14 +521,16 @@
   }
 
   // `births` = how many notes this reply added or took away (the server counts one step for each).
+  // `fits` (optional): one more test, made after a read in the air has landed, that the change can be replayed.
   // It says what it found:
-  //   'base'      the page was right before the reply: the reply's change is applied here
+  //   'base'      the page was right before the reply: the reply's change is applied here. The caller MUST
+  //               install that change, or doubt the graph (doubtGraph): the numbers are already the reply's
   //   'reloaded'  the file was read again: it already holds the truth, nothing is replayed on top
   //   'failed'    the read failed: change nothing, and keep the old numbers so the next reply reads again
-  async function syncGraph(meta, births = 0) {
+  async function syncGraph(meta, births = 0, fits = () => true) {
     if (!meta) return 'base';
     while (reading) await reading.catch(() => {});     // a read in the air first: its numbers decide
-    if (meta.build_id === graphState.build_id && meta.rev === graphState.rev + births) {
+    if (meta.build_id === graphState.build_id && meta.rev === graphState.rev + births && fits()) {
       graphState = { build_id: meta.build_id, rev: meta.rev };
       return 'base';
     }
@@ -551,7 +560,11 @@
       return;
     }
     if (found === 'base') {
-      receipts.forEach((receipt, index) => addNote(receipt, { quiet: quiet || index < receipts.length - 1 }));
+      // The numbers on screen are already the reply's: each note must be born at the next place. One that
+      // cannot be (another reply moved the galaxy meanwhile) means the numbers say what is not on screen.
+      const born = receipts.every((receipt, index) => receipt.index === data.nodes.length
+        && addNote(receipt, { quiet: quiet || index < receipts.length - 1 }));
+      if (!born) doubtGraph();
       return;
     }
     const newest = receipts[receipts.length - 1];
@@ -770,18 +783,23 @@
     // A newer sentence started while this one waited: it owns the answer. This reply only mends the galaxy.
     const owner = mine === sends;
     if (owner) say(reply.answer || '', reply.ok === false);   // also after a failed read: the save did happen
-    if (owner && reply.error === 'failed') Teardown.failureTold();   // the cancel reply said why the job failed
+    // The job a /teardown/cancel answer is about (`job_id`). An older server names none.
+    const about = typeof reply.job_id === 'string' && reply.job_id ? reply.job_id : null;
+    if (owner && reply.error === 'failed') Teardown.failureTold(about);   // the cancel reply said why that job failed
     if (reply.brain && reply.ok !== false) showBrain(reply.brain);
     if (type === 'remember') {
       lastCapture = action.receipt;                   // its `build` names the galaxy it was saved in (the server's lock)
       if (numbered) placeBirths([action.receipt], found, !owner);
+      // 'base' already took the reply's numbers, and another reply moved them on: this note is not on screen,
+      // so the numbers must not stay. The file decides.
+      else if (found === 'base') doubtGraph();
     } else if (type === 'forget') {
       if (found === 'base' && numbered) removeNote(action.index);  // after a new read the file already holds the truth
       lastCapture = null;
     } else if (type === 'teardown') {
       Teardown.follow(action.job, { track: !owner });  // a teardown started: the card shows its steps (late: at its end)
     } else if (type === 'teardown_cancel') {
-      Teardown.cancelled();                           // noted: the job's end stays quiet, the card is not touched
+      Teardown.cancelled(about);                      // noted: that job's end stays quiet, the card is not touched
     } else if (!owner) {
       return;                     // a late answer moves no camera and changes no card; a teardown above is only tracked
     } else if (numbered) {                            // not after a failed read, not on another snapshot
@@ -837,8 +855,11 @@
     let timer = null;
     let misses = 0;
     let card = null;            // the finished teardown on the card
-    let quietEnd = false;       // the user cancelled: Jarviz already said so
-    let failTold = false;       // the cancel reply already said why the followed job failed
+    // A /teardown/cancel answer names its job (`job_id`). An older server names none: then today's rule holds
+    // (ANY: the next end of a cancelled job; for a failure, the job followed at that moment).
+    const ANY = {};
+    let quietEnd = null;        // the job this tab cancelled: Jarviz already said so
+    let failTold = null;        // the job whose failure a cancel reply already said
     let round = 0;              // goes up at each follow(): a status answer from an older round is dropped
     let tracked = false;        // the job is only tracked (a late reply): the card shows it at its end, not before
     let opening = 0;            // the newest request to open the reader: closeReader drops it
@@ -925,12 +946,13 @@
     async function finish(job, meta) {
       following = null;
       tracked = false;                                // the end is shown, also for a job that was only tracked
-      const told = (quietEnd && job.state === 'cancelled') || (failTold && job.state === 'failed');
-      failTold = false;
+      const told = (job.state === 'cancelled' && (quietEnd === job.id || quietEnd === ANY))
+        || (job.state === 'failed' && failTold === job.id);
+      failTold = null;
       if (job.state !== 'done') {
         paintJob(job, job.state === 'cancelled' ? 'Cancelled.' : 'It stopped at this step.');
         if (!told) say(job.say || '', true);
-        quietEnd = false;
+        quietEnd = null;
         // A note the server could not take back is still in the file. When the numbers moved, read the
         // galaxy again. The receipts of a job that failed are never replayed as births.
         await syncGraph(meta);
@@ -940,7 +962,13 @@
       if (!born.has(job.id)) {
         born.add(job.id);
         // The same door as a capture: REA first if it is new, then the teardown, and the camera flies to it.
-        placeBirths(result.births, await syncGraph(meta, result.births.length));
+        // The status numbers are the server's numbers NOW, not those of the moment the notes were born. They
+        // are replayed without a read only when they can mean nothing else: the page holds exactly the notes
+        // before the first birth (it saw none of them; only the newest note can ever be taken away), and the
+        // steps since are exactly these births (every change is at least one step). Else the file decides.
+        const births = result.births;
+        const exact = () => births.every((receipt, index) => receipt.index === data.nodes.length + index);
+        placeBirths(births, await syncGraph(meta, births.length, exact));
       }
       paintCard(result, `Taken apart in ${result.seconds} s`);
       say(result.spoken);
@@ -977,7 +1005,7 @@
     function follow(job, options = {}) {
       if (!job || !job.id) return;
       round += 1;
-      failTold = false;
+      failTold = null;
       following = job.id;
       misses = 0;
       tracked = Boolean(options.track);
@@ -987,9 +1015,10 @@
     }
 
     async function resume() {                         // the page was reloaded while a teardown was running
+      const mine = round;                             // a follow() meanwhile (a newer job) wins over this answer
       try {
         const status = await fetchJson('/teardown/status');
-        if (status.job && status.job.state === 'running') follow(status.job);
+        if (mine === round && status.job && status.job.state === 'running') follow(status.job);
       } catch (error) { /* the card stays away */ }
     }
 
@@ -1064,7 +1093,7 @@
     }
 
     return { start, cancel, follow, resume, showLast, openReader, closeReader, close, fit,
-             cancelled: () => { quietEnd = true; }, failureTold: () => { if (following) failTold = true; },
+             cancelled: job => { quietEnd = job || ANY; }, failureTold: job => { failTold = job || following; },
              current: () => ({ following, card }) };
   })();
 

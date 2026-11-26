@@ -44,10 +44,16 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
   and keeps every other character; it reads the new text back before it replaces the file. `load_config` never
   writes. A new brain is one entry in `PROVIDERS` (`brains.py`) plus its key line and model line in
   `config.json`. Model ids change often: read the provider's documents, do not guess.
+- `save_brain_choice` puts the new text in place in one step, so a crash never leaves half a config. For that moment
+  the text is in a staging file beside it (`config.json.<pid>.tmp`: made new, never over a file, git ignores it).
+  That is the ONE other file that may hold a key. `sweep_config_staging` (from `main()`) removes one that a crash
+  left, and never reads it.
 - Preflight proves a brain with one very small real question on the same path as `ask()` (route `"probe"` in
-  `EFFORT` and `TIMEOUT_S`). A model list does not prove that a key may ask the model. An error text from a
-  provider goes through `scrub_key` before it travels on.
-- A provider call never follows a redirect (the key would go with it).
+  `EFFORT` and `TIMEOUT_S`). A model list does not prove that a key may ask the model. The answer must have the
+  shape of a completion: an empty text is fine for the tiny budget, a missing envelope is a fail. An error text
+  from a provider loses the key BEFORE it is cut (`_without_key`); `scrub_key` is the second net.
+- A provider call never follows a redirect (the key would go with it). That holds for the `anthropic` package too:
+  `get_client` gives it an HTTP client that follows none.
 - A sign-in brain (kind `"cli"` in `PROVIDERS`) is TALK-ONLY. Its tool is a coding agent, and Jarviz gives it text
   from strangers (notes, inspected websites). The lock is in ONE place for each tool: `CODEX_LOCK` (read-only
   sandbox, every tool family off, the user's own Codex settings left out), and `AGY_LOCK` with `AGY_SETTINGS` and
@@ -55,16 +61,25 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
   to make something work. `CLI_FRAME` is only words. It is not the lock.
 - Jarviz never reads, copies or prints a sign-in. It does not open `~/.codex` or `~/.gemini`. It starts the tool,
   and the tool signs in.
-- A sign-in brain is started with no shell. Every argument is a constant of `brains.py`, except a model id that
-  passed `MODEL_ID_RE`. The prompt goes in on stdin. The working folder is a new empty room (`cwd=`), removed after
-  the call. No text from a note, a website or the user ever goes on a command line.
+- A sign-in brain is started with no shell. Never a `.cmd` or `.bat`: Windows starts cmd.exe for those. `find_tool`
+  gives None for a tool that is there only as a batch file. Every argument is a constant of `brains.py`, except a
+  model id that passed `MODEL_ID_RE`. The prompt goes in on stdin. The working folder is a new empty room (`cwd=`),
+  removed after the call. No text from a note, a website or the user ever goes on a command line.
 - A sign-in brain answers only after a real trap proved its lock for THIS version of the tool and THIS recipe
   (`ensure_locked`, `prove_lock`, `lock_recipe`). A new version or a changed flag proves again by itself. A trap
   that could not look (`None`) is never a pass and writes no record. The trap uses `TRAP_FRAME`, never `CLI_FRAME`:
   it must test the lock, not the manners of the model.
+- A lock proof is STRONG or WEAK (`lock_seen`). Strong: the trap saw a real attempt that the lock refused (Codex:
+  the sandbox refused a write, `CODEX_REFUSED_RE`; agy: a permission refusal of a tool step, `AGY_REFUSED_RE`).
+  Weak: no word came back, no file was made and no tool ran, but no refused attempt was seen. Both let the brain
+  answer. Preflight says PASS for strong and WARN for weak. Never call a weak proof strong.
+- agy must say at the start of EVERY run that it took the lock (`AGY_INIT`: permission mode `strict`, agent
+  `jarviz-brain`). A run that started without those words is `cli_not_locked`, and its answer is thrown away.
 - A tool that ran throws the answer away (`cli_tool_ran`). Codex: any item that is not talk (`CODEX_TALK_ITEMS`).
-  agy: a tool step that did not end in a permission refusal. The one exception is `HARMLESS_LISTING` (tools that
-  only list). Never add a tool to it that can read, write, run a command or reach the web.
+  agy: a tool step that ends in ERROR is one of three kinds: refused by the lock (a permission message), never
+  sent (`AGY_NOT_SENT_RE`: agy threw an invalid call out), or anything else, which may have run. Only the first
+  two keep the answer. The one more exception is `HARMLESS_LISTING` (tools that only list). Never add a tool to it
+  that can read, write, run a command or reach the web.
 - What a tool says (its events, its error text, its version) is data from a stranger. Types are checked, and a text
   goes through `_cli_detail` (no home folder, no e-mail address) before it travels on.
 - Do not write that a sign-in brain "cannot" use tools. Write that the trap found none. The limits are in `TODO.md`
@@ -104,7 +119,8 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
   A sentence that only mentions a website does not ask for a teardown. A sentence about a teardown that is there
   ("what did my teardown of stripe.com say") does not ask for a new one, and "do not tear down stripe.com"
   does not ask for one (`asks_for_teardown`). The page's own voice route follows the same idea: a question starts
-  a teardown only when its subject IS the site (`matchTeardown` in `viewer/core.js`).
+  a teardown only when its subject IS the site (`matchTeardown` in `viewer/core.js`), and never when the sentence
+  refuses one ("How does example.com work? Do not tear it down.": `refusesTeardown`).
 - Note text is never HTML. The viewer uses `textContent` only. Labels given to the 3D library go
   through `Core.escapeHtml`.
 - The two outside libraries are pinned in three places that must agree: `GRAPH_LIB_URL` and
@@ -153,9 +169,17 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
   system could not be asked. `None` is never a pass. In preflight, a probe that got no answer is not a refusal
   (`try_probe`): the check fails and names it.
 - `/teardown/cancel` with `{"job": id}` stops only that job. A test always sends an id: the drill its own job,
-  preflight a made-up one. Without an id it stops the job that runs now (the voice command).
-- A teardown receipt goes on the turn that started the job (`Session.record` returns the turn). A start that is
-  refused leaves no turn behind.
+  preflight a made-up one. Only a MISSING `job` field stops the job that runs now (the voice command). A `job` that
+  is null, empty or not a text stops nothing. An answer about a job carries `job_id`, and the page ties its
+  "say nothing at the end" flags to that id.
+- A teardown receipt goes on the turn that started the job. `Session.draft` makes the turn, and `publish` puts it
+  into the history only after the job was accepted. A receipt for a draft is kept. A start that is refused
+  publishes nothing, so it leaves no turn behind.
+- A teardown binds ONE notes folder (`Galaxy.current_folder`). Its picture and every one of its notes go there.
+  `birth_note` refuses when the galaxy shows another folder by then (`NotesMoved`), and the job takes back what it
+  made.
+- The REA version is read again when the installed files change (`rea_reading`), so a new install is seen without
+  a restart. A profile path is compared as it is on a Mac or Linux. Only Windows folds case.
 - `run_rea` runs only the pinned REA version. On a Mac or Linux a process is "our Chrome" only when the system
   says that its program is the browser that `find_chrome()` gives, the `chrome` file beside it, one of its Mac
   helpers, or Chrome's crash helper (`ps -o comm=`, joined by pid in `posix_table`; `is_chrome_program`), and it
@@ -167,11 +191,19 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
   step (`chat_route`, `search_route`). Every capture receipt carries `"build"` and `"born"` (that fingerprint),
   written under the lock. `/forget` needs both, taken from the receipt: it moves a note only when it is the same
   creation, in the same galaxy. Two captures with exactly the same bytes count as the same note.
+- Every receipt also carries `"vault"`: a fingerprint of the notes folder (`vault_of`), never its path. `unbirth`
+  takes a note back only in the same vault and with the same `born`. A note of another folder is never touched.
 - Node numbers belong to one state of the galaxy. The page uses the node numbers of a reply only when the galaxy
   on screen is exactly the reply's snapshot (the same `build_id` and the same `rev`), a receipt only when its
   `build` is the build on screen, and never on a galaxy that it could not read again.
+- The page publishes a revision only when the change it describes is installed. A receipt that cannot be applied
+  makes the page doubt the galaxy and read it again. The numbers in the last status of a teardown only say if a
+  fresh read is needed. A timer that focuses a note checks the snapshot and the note again when it fires.
 - The drill counts only an end that is confirmed (`follow_job`). Only a good status answer counts (`job_of`: it
   has the key `job`, and a job has an `id`), and a job ends only on `done`, `failed` or `cancelled`. An end that is not confirmed is a FAIL.
+  When another job or no job answers, the end of our job was not seen: that is "not confirmed", with the last view
+  that was ours. `put_back` trusts only a good `/status` answer with whole graph numbers (`served_graph`).
+- In `page_checks.js` a story that throws, runs out of time or leaves a promise rejection behind is a failure.
 - `main()` takes the port first and loads the galaxy after it. A second start that finds the port busy changes
   nothing. `Galaxy.refresh_if_rebuilt` follows the `notes_dir` that `config.json` names now.
 - Library fingerprints live in ONE table (`FINGERPRINTS`). A "presence" pattern must be a string that only that
