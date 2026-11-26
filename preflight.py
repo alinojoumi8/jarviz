@@ -289,17 +289,23 @@ def check_chat(report: Report, ctx: dict) -> None:
             report.add(WARN, name, f"It answered but named no source note. Asked: {question!r}. Said: {short(body['answer'])}")
         else:
             report.add(PASS, name, f"nodes {body['nodes']}: {short(body['answer'])}")
-    elif status == 503 and shaped and body.get("error") == "api_key_missing" and not ctx["key_set"]:
-        report.add(WARN, name, "The brain is not connected yet. /chat gave a clean \"no key\" reply, not a crash.")
+    elif (status == 503 and shaped and not ctx["key_set"]
+          and body.get("error") == ("cli_missing" if ctx["brain"].get("sign_in") else "api_key_missing")):
+        report.add(WARN, name, "The brain is not connected yet. /chat gave a clean " +
+                   ("\"not installed\"" if ctx["brain"].get("sign_in") else "\"no key\"") + " reply, not a crash.")
     else:
         report.add(FAIL, name, f"HTTP {status}, error {body.get('error')!r}: {short(body.get('detail') or body.get('answer') or 'no JSON body')}")
 
 
 def check_key_and_model(report: Report, ctx: dict) -> None:
-    """The active brain: one real call for the key, one for the model."""
+    """The active brain: one real call for the key (a sign-in brain: its sign-in), one for the model."""
     brain = ctx["brain"]
-    key_name = f"The {brain['label']} key in config.json is valid (one real call)"
-    model_name = f"The {brain['label']} model in config.json is one the key can reach"
+    if brain.get("sign_in"):
+        key_name = f"The {brain['label']} sign-in works (one real call)"
+        model_name = f"The {brain['label']} model is one the sign-in can reach"
+    else:
+        key_name = f"The {brain['label']} key in config.json is valid (one real call)"
+        model_name = f"The {brain['label']} model in config.json is one the key can reach"
     ctx["brain_ok"] = False
     if ctx["config"].get("_error"):
         report.add(FAIL, key_name, f"config.json cannot be read. {ctx['config']['_error']}")
@@ -310,16 +316,19 @@ def check_key_and_model(report: Report, ctx: dict) -> None:
     model_ok, model_detail = result["model"]
     report.add(PASS if key_ok else FAIL, key_name, short(key_detail, 240))
     if model_ok is None:
-        report.add(WARN, model_name, f"Not checked: it needs a valid key first. The model id is {brain['model']!r}.")
+        report.add(WARN, model_name, f"Not checked: it needs a {'working sign-in' if brain.get('sign_in') else 'valid key'} "
+                                     f"first. The model id is {brain['model']!r}.")
     else:
         report.add(PASS if model_ok else FAIL, model_name, short(model_detail, 400))
     ctx["brain_ok"] = bool(key_ok and model_ok)
 
 
 def check_other_brains(report: Report, ctx: dict) -> None:
-    """Every other brain that has a key must answer too, so a switch never lands on a dead brain."""
+    """Every other brain that has a key (a sign-in brain: whose tool is installed) must answer too, so a switch never
+    lands on a dead brain."""
     others = [b for b in brains.describe_all(ctx["config"]) if b["name"] != ctx["brain"]["name"]]
-    keyless = [b["label"] for b in others if not b["has_key"]]
+    keyless = [b["label"] for b in others if not b["has_key"] and not b.get("sign_in")]
+    missing = [b["label"] for b in others if not b["has_key"] and b.get("sign_in")]
     for brain in (b for b in others if b["has_key"]):
         result = brains.probe(ctx["config"], brain["name"])
         (key_ok, key_detail), (model_ok, model_detail) = result["key"], result["model"]
@@ -328,6 +337,42 @@ def check_other_brains(report: Report, ctx: dict) -> None:
                    brain["model"] if works else short(model_detail or key_detail, 400))
     if keyless:
         print(f"   note  No key yet for: {', '.join(keyless)}. Add one in config.json to use that brain.", flush=True)
+    if missing:
+        print(f"   note  Not installed: {', '.join(missing)}. Install the tool and sign in to it to use that brain.",
+              flush=True)
+
+
+def check_brain_locks(report: Report, ctx: dict) -> None:
+    """Each installed sign-in brain: a REAL trap proves that this version of its tool, with these flags, cannot read a
+    file, write a file or run a command. It runs before any question goes through the server. "Could not look" is
+    never a pass."""
+    installed = [b for b in brains.describe_all(ctx["config"]) if b.get("sign_in") and b["has_key"]]
+    if not installed:
+        print("   note  No sign-in brain (Codex, Antigravity) is installed: there is no lock to prove.", flush=True)
+        return
+    for brain in installed:
+        name = f"The {brain['label']} brain is locked: no file read, no file write, no command (a real trap)"
+        try:
+            held, detail = brains.prove_lock(ctx["config"], brain["name"])
+        except Exception as error:      # noqa: BLE001 - a check that stops says so, it never crashes preflight
+            held, detail = None, f"could not look: the check stopped ({type(error).__name__})"
+        if held is True:
+            report.add(PASS, name, short(detail, 300))
+        elif held is False:
+            report.add(FAIL, name, short(detail, 300) + ". Jarviz refuses this brain until the lock holds.")
+        else:
+            report.add(FAIL, name, "NOT VERIFIED: " + short(detail, 300))
+
+
+def check_brains_offline(report: Report) -> None:
+    name = "The brain offline checks pass (sign-in parsers, command lines, the room, the lock proof)"
+    try:
+        results = brains.offline_checks()
+    except Exception as error:          # noqa: BLE001 - a check that stops says so, it never crashes preflight
+        report.add(FAIL, name, f"the checks stopped: {type(error).__name__}: {short(str(error), 200)}")
+        return
+    failed = [f"{label} ({detail})" for label, passed, detail in results if not passed]
+    report.add(FAIL if failed else PASS, name, short("; ".join(failed), 400) if failed else f"{len(results)} checks")
 
 
 def check_remember(report: Report, ctx: dict) -> None:
@@ -1253,7 +1298,7 @@ def check_config_hidden(report: Report, ctx: dict) -> None:
     name = "config.json is NOT reachable from the browser"
     config = ctx["config"]
     keys = [str(config[spec["key"]]).encode("utf-8") for name, spec in brains.PROVIDERS.items()
-            if brains.describe(config, name)["has_key"]]
+            if "key" in spec and brains.describe(config, name)["has_key"]]     # a sign-in brain has no key
     leaks, silent, unsent, refused = [], [], [], 0
     for probe in CONFIG_PROBES + TEARDOWN_PROBES:
         kind, got = try_probe(lambda probe=probe: call("GET", probe, timeout=10))
@@ -1809,6 +1854,8 @@ def main() -> int:
           f"  brain: {brain['label']} / {brain['model']}\n")
     if check_server(report):
         check_graph(report, ctx)
+        check_brains_offline(report)
+        check_brain_locks(report, ctx)          # before the first question goes through the server
         check_chat(report, ctx)
         check_key_and_model(report, ctx)
         check_other_brains(report, ctx)

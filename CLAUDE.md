@@ -17,8 +17,10 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
 
 - `build.py` indexer, standard library only. Writes `viewer/graph-data.js`.
 - `server.py` server, persona, routes. Port 4700, bound to 127.0.0.1.
-- `brains.py` the five brains (Claude, OpenAI, DeepSeek, Venice, OpenRouter) behind one `ask()`.
-  Claude uses the `anthropic` package. The others use plain HTTPS from the standard library.
+- `brains.py` the seven brains behind one `ask()`. Five use a key (Claude, OpenAI, DeepSeek, Venice, OpenRouter):
+  Claude uses the `anthropic` package, the others plain HTTPS from the standard library. Two use a sign-in
+  (Codex, Antigravity): Jarviz starts the user's own tool (`codex`, `agy`), and the tool uses its own sign-in.
+  `python brains.py` runs the offline checks of the sign-in brains.
 - `preflight.py` live end-to-end checks.
 - `teardown.py` the teardown bay (Part Two), standard library only. The server soft-imports it and starts without it.
 - `drill.py` the live teardown drill. `record()` and `put_back()` make a test leave no trace.
@@ -26,6 +28,9 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
 - `page_checks.js` the rules of the page, proved in Node with a fake page (no browser). Preflight runs it.
   A change in `viewer/app.js` gets a story there. It is in the project root: the server serves only `viewer/`.
 - `config.json` the active brain, a key and a model for each brain, the notes folder. Git ignores it.
+  A sign-in brain has a model line only (empty: the tool's own default model).
+- `~/.jarvis-tools/brain-locks.json` the lock proofs of the sign-in brains: the tool version and the lock recipe
+  that a real trap proved. It is outside the project. Jarviz writes it.
 - `~/.jarvis-tools/page-key` the page key (the lock). It is outside the project. The server makes it at the first start.
 
 ## Laws
@@ -43,6 +48,27 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
   `EFFORT` and `TIMEOUT_S`). A model list does not prove that a key may ask the model. An error text from a
   provider goes through `scrub_key` before it travels on.
 - A provider call never follows a redirect (the key would go with it).
+- A sign-in brain (kind `"cli"` in `PROVIDERS`) is TALK-ONLY. Its tool is a coding agent, and Jarviz gives it text
+  from strangers (notes, inspected websites). The lock is in ONE place for each tool: `CODEX_LOCK` (read-only
+  sandbox, every tool family off, the user's own Codex settings left out), and `AGY_LOCK` with `AGY_SETTINGS` and
+  `AGY_AGENT_HEAD` (an agent file with an empty tool list, strict permissions, deny rules). Do not take a flag out
+  to make something work. `CLI_FRAME` is only words. It is not the lock.
+- Jarviz never reads, copies or prints a sign-in. It does not open `~/.codex` or `~/.gemini`. It starts the tool,
+  and the tool signs in.
+- A sign-in brain is started with no shell. Every argument is a constant of `brains.py`, except a model id that
+  passed `MODEL_ID_RE`. The prompt goes in on stdin. The working folder is a new empty room (`cwd=`), removed after
+  the call. No text from a note, a website or the user ever goes on a command line.
+- A sign-in brain answers only after a real trap proved its lock for THIS version of the tool and THIS recipe
+  (`ensure_locked`, `prove_lock`, `lock_recipe`). A new version or a changed flag proves again by itself. A trap
+  that could not look (`None`) is never a pass and writes no record. The trap uses `TRAP_FRAME`, never `CLI_FRAME`:
+  it must test the lock, not the manners of the model.
+- A tool that ran throws the answer away (`cli_tool_ran`). Codex: any item that is not talk (`CODEX_TALK_ITEMS`).
+  agy: a tool step that did not end in a permission refusal. The one exception is `HARMLESS_LISTING` (tools that
+  only list). Never add a tool to it that can read, write, run a command or reach the web.
+- What a tool says (its events, its error text, its version) is data from a stranger. Types are checked, and a text
+  goes through `_cli_detail` (no home folder, no e-mail address) before it travels on.
+- Do not write that a sign-in brain "cannot" use tools. Write that the trap found none. The limits are in `TODO.md`
+  under "Not proven".
 - The server binds 127.0.0.1 and serves only `viewer/`.
 - The page lock: every request needs the page key. A browser brings it as the cookie `jarviz_key`. A tool signs
   the request with it (header `X-Jarviz-Sign`, made by `server.sign_request`) and never sends the key. ONE

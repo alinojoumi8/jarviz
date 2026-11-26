@@ -7,6 +7,7 @@ Rule: a job is done only when `python preflight.py` passes.
 
 - [x] **Anthropic API key.** It is in `config.json` and it works.
 - [ ] **Keys for the other brains (optional).** See "Brains" below.
+- [x] **Codex and Antigravity (no key).** Both tools are on this computer and you are signed in to both. See "Brains" below.
 - [ ] **Your own notes (optional).** Set `notes_dir` in `config.json` to the full path of your notes folder. Then run `python build.py`. Now Jarviz uses 30 sample notes about a coffee business in `notes/`.
 - [x] **A yes for REA (Part Two).** REA 6.7.0 is installed in `%USERPROFILE%\.jarvis-tools\rea`, outside the project.
 - [ ] **A newer Node.js (optional).** You have Node.js 24.15.0. The newest REA (6.10.1) needs 24.22.1 or later. So Jarviz is pinned to REA 6.7.0, the newest one that runs on your Node.js. See "Upgrade REA" below.
@@ -25,7 +26,7 @@ Rule: a job is done only when `python preflight.py` passes.
 
 ## Brains
 
-Jarviz has five brains. One is active. The screen shows it at the top (`brain: ...`).
+Jarviz has seven brains. One is active. The screen shows it at the top (`brain: ...`). Five use a key. Two use a sign-in and need no key.
 
 | Brain | Key line in `config.json` | Model line | Model now |
 | --- | --- | --- | --- |
@@ -45,6 +46,25 @@ Jarviz has five brains. One is active. The screen shows it at the top (`brain: .
 - [x] DeepSeek, Venice, OpenRouter: tested with real keys. Each one answered one real question in preflight.
 - [ ] OpenAI: the key is accepted, but the account has no credit, so OpenAI cannot answer ("You have no credits remaining"). Add credit at OpenAI, then run `python preflight.py`. An older test only read the model's page and said "ready". The test now asks one real, very small question, so it tells the truth.
 - Venice refused its key in one earlier run ("Authentication failed"). In the last runs it answered. If it refuses again, make a new key at Venice and type it into `venice_api_key`.
+
+### The two sign-in brains (no key)
+
+| Brain | Its tool | Sign in once | Model line in `config.json` |
+| --- | --- | --- | --- |
+| Codex (`codex`) | `codex` (OpenAI Codex CLI) | `codex login` in a terminal | `codex_model` (empty: the tool's own model) |
+| Antigravity (`antigravity`) | `agy` (Google Antigravity CLI) | start `agy` once and sign in | `antigravity_model` (empty: the tool's own model) |
+
+- **Switch:** say or type "switch to Codex" or "switch to Antigravity". To go back: "switch to Claude".
+- **How it works:** Jarviz starts the tool on your computer for each question. The tool uses its own sign-in. Jarviz never reads or copies the sign-in.
+- **The lock:** these tools are coding agents. They can run commands and read files. Jarviz starts them locked, so they can only talk. A real trap test proves the lock: Jarviz asks the brain to read a trap file, to run a command and to write a file. All three must fail. Jarviz does this test by itself for each new version of a tool, before the first question. The proof is kept in `%USERPROFILE%\.jarvis-tools\brain-locks.json`.
+- **If a brain reaches for a tool,** Jarviz throws that answer away and tells you.
+- [x] Codex (`codex-cli 0.171.0`): the lock held in a real trap, and it answered real questions about the notes on the page.
+- [x] Antigravity (`agy 1.5.18`): the lock held in a real trap, and it answered real questions about the notes on the page.
+- **Slower than a key brain.** Codex needs about 6 to 10 seconds for an answer. Antigravity needs about 15 to 30 seconds.
+- **Each question uses your plan.** The tool sends its own long instructions with every question: about 23,000 tokens for Codex and about 31,000 for Antigravity. This counts against the allowance of your ChatGPT plan or Google plan.
+- **History:** Codex keeps nothing (`--ephemeral`). Antigravity keeps each question as one conversation in its own history (`agy`, then `/resume` shows them). Jarviz cannot turn that off and does not delete it.
+- **The first question after a tool update** takes about half a minute longer: Jarviz proves the lock again first. `python preflight.py` does the same proof.
+- **A model of your choice:** put its id on the model line. For Antigravity, `agy models` in a terminal shows the ids.
 
 ## Part One: the foundation
 
@@ -80,7 +100,8 @@ Still to prove:
 
 Proven with the real brain and a real public site (igloo.inc):
 
-- [x] Last run: `PREFLIGHT: 30 pass, 1 fail, 0 warn` and `DRILL: 91 pass, 0 fail`. The one fail is the OpenAI account: it has no credit (see "Brains"). Preflight has 31 checks now.
+- [x] Last run: `PREFLIGHT: 35 pass, 1 fail, 0 warn`. The one fail is the OpenAI account: it has no credit (see "Brains"). Preflight has 36 checks now: 5 are new for the sign-in brains (the offline checks, one lock trap for each tool, one "ready to switch to" for each tool).
+- [x] Last drill: `DRILL: 91 pass, 0 fail`. The drill was not run again for the sign-in brains, because the teardown code did not change.
 - [x] The drill passed with a hidden browser, and also with the Chrome window on screen (`python drill.py --visible`). The snapshot from the visible window is a real picture.
 - [x] A full teardown in about one minute: 96 files, 14.7 MB, Three.js r165, GSAP 3.12.5, postprocessing 6.35.5.
 - [x] The card shows the 8 steps live, then the snapshot, the stack and the totals. The reader shows the whole note.
@@ -181,6 +202,13 @@ Not proven:
 - [ ] "This site" on a Mac (it reads the front Chrome tab). This computer has Windows, so Jarviz asks for the name.
 - [ ] The rule for "which process is our Chrome" on a Mac or Linux. It is tested with made-up process lists only. Run `python drill.py` on such a computer before you trust it there.
 - [ ] A teardown written by a brain other than Claude.
+- [ ] The lock of a sign-in brain is proven by a trap, not by a law of nature. The limits:
+  - The trap shows what the model can do when it is asked to try. It reads a file, runs a command and writes a file. A tool that the trap does not ask for is not proven absent.
+  - Codex keeps one inner tool (`exec`, a small JavaScript box). In real tests it had no file access, no network and no command. But the event stream of Codex does not show its calls, so Jarviz cannot see them. The read-only sandbox and the trap are the proof there.
+  - Antigravity lists about 60 tools at its start. With Jarviz's agent file (an empty tool list) the model could call none of them in the tests. One tool stayed that only lists (`list_resources`): it showed the names of your own MCP servers to the model. Jarviz lets that pass. `read_resource` (it reads from your MCP servers) could not be tested, because your MCP server has nothing to read. If it runs, Jarviz throws the answer away.
+  - Codex and `agy` update themselves. Jarviz proves the lock again for each new version. Between an update and that proof no question is answered. But a new version can add a tool that the trap does not know.
+  - A teardown with a sign-in brain gives the text of a strange website to a coding agent. The lock is what stands between them. If you want the smallest risk, write teardowns with a key brain.
+- [ ] The sign-in brains on a Mac or Linux. The code has the paths for it, but it ran only on this Windows computer.
 - [ ] The clean Chrome and your private network. Jarviz checks the address of the PAGE. It does not see the connections that Chrome makes. There are two cases:
   - The page itself moves to a private address. Jarviz sees that and stops the job. But Chrome has already sent the request that went there. Jarviz reads nothing from that page.
   - The page stays on its public address and asks for things on your home network (a picture, a script, a data call). Jarviz does not see these requests at all, and the job goes on. The same is true when a public name points at a private address only for Chrome.

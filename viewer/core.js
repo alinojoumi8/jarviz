@@ -174,12 +174,15 @@
     return null;
   }
 
-  // "Switch brain to DeepSeek", "use the OpenAI brain", "switch to Claude" -> the name that was said.
+  // "Switch brain to DeepSeek", "use the OpenAI brain", "switch to Claude", "switch to Codex" -> the name that was said.
+  // With the word "brain" any name is taken. The short form without it ("switch to agy") takes only the
+  // names in the last pattern: Claude, OpenAI, DeepSeek, Venice, OpenRouter, Codex (CLI) and Antigravity (CLI).
+  // The server resolves the name.
   const BRAIN_SWITCH = [
     /^(?:switch|change|swap)\s+(?:the\s+|your\s+)?brains?\s+to\s+(?:the\s+)?(.+)$/i,
     /^(?:switch|change|swap)\s+to\s+(?:the\s+)?(.+?)\s+brain$/i,
     /^use\s+(?:the\s+)?(.+?)\s+brain$/i,
-    /^(?:switch|change|swap)\s+to\s+(?:the\s+)?(claude|anthropic|open\s?ai|chat\s?gpt|gpt|deep\s?seek|venice|open\s?router)$/i,
+    /^(?:switch|change|swap)\s+to\s+(?:the\s+)?(claude|anthropic|open\s?ai\s+codex|open\s?ai|chat\s?gpt|gpt|deep\s?seek|venice|open\s?router|codex(?:\s+cli)?|anti\s?gravity(?:\s+cli)?|agy)$/i,
   ];
 
   function matchBrainSwitch(sentence) {

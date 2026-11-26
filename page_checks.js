@@ -6,7 +6,7 @@
    page did. Nothing goes to the network, and no file is read except the two that are named.
 
    preflight runs it:   node page_checks.js viewer/core.js viewer/app.js
-   It prints ONE line on stdout, JSON: {"pass": 84, "fail": 0, "failures": []}. The exit code is 0 when it
+   It prints ONE line on stdout, JSON: {"pass": 89, "fail": 0, "failures": []}. The exit code is 0 when it
    ran to its end, also when a rule failed. Any other exit code means it could not run (a file is
    missing, or the page code threw while it loaded); the reason is on stderr.
    For people:          node page_checks.js viewer/core.js viewer/app.js --list   (the name of every check)
@@ -885,6 +885,52 @@ story('the poll round', {
   await q.tick(2100);
   const loops = count(q.fetchLog, '/teardown/status') - start;
   t.check('errorDropped', loops === 3, `${loops} polls in 2100 ms`);
+});
+
+story('switching the brain by voice', {
+  short: 'a short "switch to ..." with a new brain name (Codex, Antigravity, agy) gives the name as it was said',
+  old: 'the names that worked before give the same name as before ("switch to open ai" stays "open ai")',
+  brainWord: 'with the word "brain" any name is taken ("switch brain to codex", "use the antigravity brain")',
+  noSwitch: 'a sentence that only mentions a brain name is no switch ("switch to codex mode on my editor", "what is codex")',
+  sent: 'the page sends the said name to /brain, and a sentence that is no switch goes to the brain (/chat)',
+}, async (t, open) => {
+  const p = await open({ handlers: {
+    '/brain': () => ({ ok: true, answer: 'Switched', nodes: [], graph: meta(5) }),
+    '/chat': () => chatReply('chat', 5),
+  } });
+  const match = p.J().Core.matchBrainSwitch;
+  const wrong = cases => cases.filter(([sentence, name]) => match(sentence) !== name)       // '' when every case holds
+    .map(([sentence, name]) => `"${sentence}" gave ${JSON.stringify(match(sentence))}, not ${JSON.stringify(name)}`).join('; ');
+  const short = wrong([
+    ['switch to codex', 'codex'], ['switch to the codex cli', 'codex cli'], ['change to antigravity', 'antigravity'],
+    ['swap to anti gravity', 'anti gravity'], ['switch to agy', 'agy'], ['switch to antigravity cli', 'antigravity cli'],
+    ['switch to openai codex', 'openai codex'], ['Jarvis, switch to Codex.', 'Codex'],
+  ]);
+  t.check('short', !short, short);
+  const old = wrong([
+    ['switch to claude', 'claude'], ['switch to anthropic', 'anthropic'], ['switch to open ai', 'open ai'],
+    ['switch to openai', 'openai'], ['change to chat gpt', 'chat gpt'], ['swap to gpt', 'gpt'], ['switch to deep seek', 'deep seek'],
+    ['switch to the venice', 'venice'], ['switch to open router', 'open router'], ['Switch brain to Deep Seek.', 'Deep Seek'],
+    ['Jarvis, use the OpenAI brain', 'OpenAI'], ['switch to decaf', null], ['How does a brain switch work?', null],
+  ]);
+  t.check('old', !old, old);
+  const brainWord = wrong([
+    ['switch brain to codex', 'codex'], ['use the antigravity brain', 'antigravity'], ['switch to the codex cli brain', 'codex cli'],
+  ]);
+  t.check('brainWord', !brainWord, brainWord);
+  const noSwitch = wrong([
+    ['switch to codex mode on my editor', null], ['what is codex', null], ['switch to agy now and then', null],
+  ]);
+  t.check('noSwitch', !noSwitch, noSwitch);
+  await p.J().handleInput('switch to the codex cli');
+  await p.tick(0);
+  await p.J().handleInput('switch to codex mode on my editor');
+  await p.tick(0);
+  await p.J().handleInput('what is codex');
+  await p.tick(0);
+  const names = p.fetchLog.filter(entry => entry.key === '/brain').map(entry => entry.body.name);
+  t.check('sent', names.length === 1 && names[0] === 'codex cli' && count(p.fetchLog, '/chat') === 2
+    && p.$('answer').textContent === 'chat', `${JSON.stringify(names)}, ${count(p.fetchLog, '/chat')} chats`);
 });
 
 // ------------------------------------------------------------------ the run

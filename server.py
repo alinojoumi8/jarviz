@@ -93,13 +93,20 @@ LINES = {
     "no_sdk": "My brain is missing a part, sir. Run: pip install anthropic.",
     "bad_config": "I cannot read config.json, sir. {reason}",
     "bad_key": "The {brain} key in config.json was refused, sir. Please check it.",
-    "no_model": "The model named in config.json, {model}, is not one the {brain} key can reach, sir.",
+    "no_model": "The model named in config.json, {model}, is not one my {brain} brain can reach, sir.",
     "no_credit": "The {brain} account has no credit left, sir.",
+    "no_cli": "My {brain} brain is not on this computer, sir. Install it, sign in, and ask me again.",
+    "signed_out": "My {brain} brain is not signed in, sir. Sign in to it once, and ask me again.",
+    "tool_ran": "My {brain} brain reached for a tool it may not touch, sir, so I threw its answer away.",
+    "not_locked": "I could not prove that my {brain} brain is locked, sir, so I shall not use it. Run preflight.",
+    "limit": "My {brain} account has reached its usage limit for now, sir.",
     "which_brain": "I am thinking with {brain}, sir. The model is {model}.",
     "switched": "Now thinking with {brain}, sir. The model is {model}.",
     "already": "I am already thinking with {brain}, sir.",
-    "no_such_brain": "I know no brain by that name, sir. I have Claude, OpenAI, DeepSeek, Venice and OpenRouter.",
+    "no_such_brain": "I know no brain by that name, sir. I have Claude, OpenAI, DeepSeek, Venice, OpenRouter, "
+                     "Codex and Antigravity.",
     "brain_no_key": "The {brain} brain has no key yet, sir. Put it in config.json first.",
+    "brain_no_cli": "The {brain} brain is not on this computer, sir. Install it and sign in first.",
     "switch_failed": "I could not switch brains, sir. {reason}",
     "busy": "The line to my brain is busy, sir. Give it a moment and ask again.",
     "offline": "I cannot reach my brain, sir. The internet connection may be down.",
@@ -182,7 +189,8 @@ PORT = 4700
 VIEWER_ROOT = build.VIEWER_DIR.resolve()
 CONFIG_PATH = build.CONFIG_PATH
 KEY_PLACEHOLDER = brains.KEY_PLACEHOLDER
-# config.json: the active brain, a key and a model for every brain (see brains.py), the notes folder.
+# config.json: the active brain, a key and a model for every brain (see brains.py; a sign-in brain has a model line
+# only, empty for the tool's own default), the notes folder.
 DEFAULT_CONFIG = {**brains.default_config(), "notes_dir": build.DEFAULT_NOTES_DIR}
 CONFIG_LOCK = threading.Lock()
 # Which spoken line goes with which brain problem (the codes come from brains.BrainError).
@@ -191,6 +199,9 @@ BRAIN_LINES = {
     "api_permission": "bad_key", "model_not_found": "no_model", "no_credit": "no_credit",
     "rate_limited": "busy", "api_error": "busy", "api_unreachable": "offline",
     "refused": "declined", "empty_reply": "empty",
+    # the sign-in brains (Codex, Antigravity). cli_failed falls to brain_error.
+    "cli_missing": "no_cli", "cli_signed_out": "signed_out", "cli_tool_ran": "tool_ran",
+    "cli_not_locked": "not_locked", "cli_limit": "limit", "cli_timeout": "busy",
 }
 
 RETRIEVE_TOP = 6                # notes handed to the brain with each question
@@ -1133,6 +1144,8 @@ def brain_route(payload: dict) -> tuple[int, dict]:
     if config.get("_error"):
         return 500, reply(LINES["bad_config"].format(reason=config["_error"]), ok=False, error="bad_config")
     target = brains.describe(config, wanted)
+    if not target["has_key"] and target.get("sign_in"):     # a sign-in brain needs its tool, not a key
+        return 409, reply(LINES["brain_no_cli"].format(brain=target["label"]), ok=False, error="brain_no_cli")
     if not target["has_key"]:
         return 409, reply(LINES["brain_no_key"].format(brain=target["label"]), ok=False, error="brain_no_key")
     if wanted == brains.active_name(config):
@@ -1866,10 +1879,11 @@ def main(argv: list[str]) -> int:
     url = f"http://{HOST}:{PORT}"
     active = brains.describe(config)
     state = {"ready": "connected", "no_key": "NOT connected (type its key into config.json)",
+             "no_cli": "NOT connected (its tool is not on this computer: install it and sign in)",
              "sdk_missing": "NOT connected (run: pip install anthropic)",
              "bad_config": "NOT connected (config.json cannot be read)"}[brain_state(config)]
-    others = ", ".join(f"{b['label']}{'' if b['has_key'] else ' (no key)'}" for b in brains.describe_all(config)
-                       if b["name"] != active["name"])
+    others = ", ".join(f"{b['label']}{'' if b['has_key'] else ' (not installed)' if b.get('sign_in') else ' (no key)'}"
+                       for b in brains.describe_all(config) if b["name"] != active["name"])
     kit = "missing (teardown.py)" if teardown is None else (
         "ready" if not (problems := teardown.diag()["problems"]) else f"NOT ready ({problems[0]})")
     print(f"Jarviz is up: {url}\n  notes: {len(GALAXY.notes)} from {notes_dir}\n"
