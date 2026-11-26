@@ -10,6 +10,7 @@ The page is locked: a caller without the page key gets nothing (see "lock" below
 """
 from __future__ import annotations
 
+import hashlib
 import hmac
 import http.client
 import json
@@ -968,9 +969,11 @@ def tag_teardown(argument: str, question: str, session: Session, payload: dict) 
 #   - The key lives in ONE file in the user's home folder. Other accounts cannot read that folder.
 #   - A browser gets it once, in the address (/?key=...). The server turns it into a cookie that page
 #     scripts cannot read, and sends the browser on to the clean address.
-#   - preflight.py and drill.py read the same file and send the key in a header.
-#   - Before a tool sends the key, it asks the server to PROVE that it holds the key (/lock/proof).
-#     So another program that sits on port 4700 while Jarviz is stopped is never handed the key.
+#   - preflight.py and drill.py read the same file. They never SEND the key: they sign each request
+#     with it (X-Jarviz-Sign). A signature is good for one request, for two minutes. So another
+#     program that sits on port 4700 while Jarviz is stopped gets nothing that it can use.
+#   - `python server.py --link` shows the link only after the server PROVED that it holds the key
+#     (/lock/proof), because the browser that the link is pasted into does send the key.
 # The key is never in viewer/, never in a response body and never in the console.
 # What the lock cannot stop:
 #   - A program that runs AS the user. It can read the key file, and config.json too.
@@ -982,7 +985,9 @@ def tag_teardown(argument: str, question: str, session: Session, payload: dict) 
 KEY_FILE = Path.home() / ".jarvis-tools" / "page-key"
 KEY_RE = re.compile(r"[A-Za-z0-9_-]{40,100}")
 KEY_COOKIE = "jarviz_key"
-KEY_HEADER = "X-Jarviz-Key"
+SIGN_HEADER = "X-Jarviz-Sign"       # time.nonce.body-hash.signature, made by sign_request()
+SIGN_WINDOW_S = 120                 # a signature older or newer than this is refused
+EMPTY_BODY_HASH = hashlib.sha256(b"").hexdigest()
 KEY_PARAM = "key"                   # /?key=... : the first visit of a browser
 AGAIN_PARAM = "again"               # /?again=1 : the one automatic second try of the locked page
 KEY_COOKIE_AGE_S = 365 * 24 * 3600
@@ -1042,6 +1047,35 @@ def key_matches(given: str | None) -> bool:
     return hmac.compare_digest(given.encode("utf-8", "replace"), PAGE_KEY.encode("ascii"))
 
 
+def _signature(key: str, method: str, path: str, stamp: str, nonce: str, body_hash: str) -> str:
+    # The first line keeps this text apart from the text of key_proof(): one can never stand in for the other.
+    text = "\n".join(("jarviz-request", method, path, stamp, nonce, body_hash))
+    return hmac.new(key.encode("ascii"), text.encode("utf-8", "replace"), "sha256").hexdigest()
+
+
+def sign_request(key: str, method: str, path: str, body: bytes = b"", now: float | None = None) -> str:
+    """What a tool sends in place of the key: a signature for THIS method, path and body, at this time."""
+    stamp, nonce = str(int(time.time() if now is None else now)), secrets.token_urlsafe(12)
+    body_hash = hashlib.sha256(body).hexdigest()
+    return ".".join((stamp, nonce, body_hash, _signature(key, method, path, stamp, nonce, body_hash)))
+
+
+def signed_body_hash(value: str, method: str, path: str) -> str | None:
+    """Check a signed request. Returns the hash of the body that the signature covers, or None when
+    the signature does not hold (wrong key, another method or path, too old, bad shape)."""
+    parts = value.split(".")
+    if not PAGE_KEY or len(parts) != 4:
+        return None
+    stamp, nonce, body_hash, given = parts
+    if not (re.fullmatch(r"[0-9]{1,12}", stamp) and re.fullmatch(r"[A-Za-z0-9_-]{8,40}", nonce)
+            and re.fullmatch(r"[0-9a-f]{64}", body_hash)):
+        return None
+    if abs(time.time() - int(stamp)) > SIGN_WINDOW_S:
+        return None
+    wanted = _signature(PAGE_KEY, method, path, stamp, nonce, body_hash)
+    return body_hash if hmac.compare_digest(given.encode("utf-8", "replace"), wanted.encode("ascii")) else None
+
+
 def key_proof(key: str, nonce: str) -> str:
     """A text that only a holder of the key can work out for this nonce. It does not give the key away,
     and the lock never accepts it in place of the key."""
@@ -1049,7 +1083,7 @@ def key_proof(key: str, nonce: str) -> str:
 
 
 def listener_holds(key: str, timeout: float = 5.0) -> bool | None:
-    """Ask the program on port 4700 to prove that it holds the page key, BEFORE the key is sent to it.
+    """Ask the program on port 4700 to prove that it holds the page key. Only a nonce is sent, never the key.
     True: it is this user's Jarviz. False: a program answers there and it is not. None: nothing answers."""
     nonce = secrets.token_urlsafe(24)
     connection = http.client.HTTPConnection(HOST, PORT, timeout=timeout)
@@ -1098,6 +1132,7 @@ def resolve_static(url_path: str) -> Path | None:
 
 
 class Handler(BaseHTTPRequestHandler):
+    _signed_body: str | None = None     # set by _unlocked for a signed request: the hash its body must have
     server_version = "Jarviz"
     sys_version = ""
 
@@ -1175,10 +1210,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def _unlocked(self) -> bool:
         """The page lock. This is the ONE place that decides whether a caller holds the page key."""
-        given = self.headers.get(KEY_HEADER)
-        if given is not None:
-            return key_matches(given)
-        # Every cookie with our name is tried. Cookies ignore the port, so another local server can
+        self._signed_body = None
+        signed = self.headers.get(SIGN_HEADER)
+        if signed is not None:          # a tool: it signs the request and never sends the key
+            covered = signed_body_hash(signed, self.command, self.path)
+            if covered is None or (self.command != "POST" and covered != EMPTY_BODY_HASH):
+                return False
+            self._signed_body = covered     # _read_json checks the body against it
+            return True
+        # A browser: the cookie. Every cookie with our name is tried. Cookies ignore the port, so another local server can
         # plant a wrong one beside the right one. That must not lock the owner out.
         for part in ";".join(self.headers.get_all("Cookie") or []).split(";"):
             name, _, value = part.strip().partition("=")
@@ -1238,8 +1278,15 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(413 if length > MAX_BODY_BYTES else 400, {"ok": False, "error": "bad_length"})
             return None
         try:
-            payload = json.loads(self.rfile.read(length).decode("utf-8"))
-        except (ValueError, OSError):
+            raw = self.rfile.read(length)
+        except OSError:
+            raw = b""
+        if self._signed_body is not None and not hmac.compare_digest(hashlib.sha256(raw).hexdigest(), self._signed_body):
+            self._send_json(403, LOCKED_BODY)       # the signature was made for another body
+            return None
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except ValueError:
             payload = None
         if not isinstance(payload, dict):
             self._send_json(400, {"ok": False, "error": "bad_json"})

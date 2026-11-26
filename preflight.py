@@ -7,6 +7,7 @@ Real calls against the running system. No mocks. The exit code is 0 only when no
 """
 from __future__ import annotations
 
+import email.message
 import hashlib
 import http.client
 import json
@@ -140,28 +141,32 @@ class Report:
 _PAGE_KEY: list[str] = []
 
 
+# A text that is never a website address (the offline checks prove it). A test that must NOT start a
+# teardown sends this. An empty site is not safe: on a Mac it means "the page in the front Chrome tab".
+INERT_SITE = "make it pop"
+
+
 def page_key() -> str:
-    """The page key from its file, read once. It is "" when there is no key yet, and also when the
-    program on the port cannot prove that it is this user's Jarviz: a stranger there is never sent the key."""
+    """The page key from its file, read once ("" when the server has not made one yet). It never
+    leaves this process: every call is SIGNED with it. So a stranger on the port learns nothing."""
     if not _PAGE_KEY:
-        key = server.read_page_key() or ""
-        _PAGE_KEY.append(key if key and server.listener_holds(key) is True else "")
+        _PAGE_KEY.append(server.read_page_key() or "")
     return _PAGE_KEY[0]
 
 
 def call_full(method: str, path: str, body: dict | None = None, timeout: float = 150,
               extra_headers: dict | None = None, key: bool = True) -> tuple[int, dict, bytes]:
     """One raw HTTP call to the running server. The path is sent exactly as given, and a redirect is
-    not followed. The call carries the page key, as the user's own browser does, unless `key` is False.
-    Returns the status, the response headers (lower-case names) and the body."""
+    not followed. The call is signed with the page key (the key itself is not sent), unless `key` is
+    False. Returns the status, the response headers (lower-case names) and the body."""
     connection = http.client.HTTPConnection(server.HOST, server.PORT, timeout=timeout)
     try:
         headers, data = dict(extra_headers or {}), None
-        if key and page_key():
-            headers.setdefault(server.KEY_HEADER, page_key())
         if body is not None:
             data = json.dumps(body).encode("utf-8")
             headers["Content-Type"] = "application/json"
+        if key and page_key():
+            headers.setdefault(server.SIGN_HEADER, server.sign_request(page_key(), method, path, data or b""))
         connection.request(method, path, body=data, headers=headers)
         response = connection.getresponse()
         return response.status, {name.lower(): value for name, value in response.getheaders()}, response.read()
@@ -197,10 +202,10 @@ def check_server(report: Report) -> bool:
     except OSError as error:
         return report.add(FAIL, "Server is up and serving the viewer",
                           f"No answer on http://{server.HOST}:{server.PORT} ({error.strerror or error}). Start it: python server.py")
-    if not page_key():
+    if status == 403 and b"<title>Jarviz is locked</title>" in page:
         return report.add(FAIL, "Server is up and serving the viewer",
-                          f"The program on port {server.PORT} did not prove that it is your Jarviz, so the page key was "
-                          "not sent to it. Stop that program and start Jarviz again: python server.py")
+                          "The server did not take a request signed with the page key. Its key is not the key on disk. "
+                          "Stop the server and start it again: python server.py")
     ok = status == 200 and b'id="graph"' in page and b"<title>Jarviz</title>" in page
     return report.add(PASS if ok else FAIL, "Server is up and serving the viewer",
                       "" if ok else f"GET / gave {status}, and it is not the Jarviz page. Is another program on port {server.PORT}?")
@@ -407,8 +412,8 @@ def check_other_sites(report: Report) -> None:
         "a request under another host name": call("GET", "/status", extra_headers={"Host": f"evil.example:{server.PORT}"}),
         "a script tag on another website": call("GET", "/graph-data.js", extra_headers={"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Dest": "script"}),
         "a form post (not JSON)": call("POST", "/chat", extra_headers={"Content-Type": "text/plain", "Content-Length": "0"}),
-        # An empty site can never start a job, so this is safe to send even if the guard were broken.
-        "a teardown started by another website": call("POST", "/teardown/start", {"site": ""}, extra_headers={"Origin": evil}),
+        # INERT_SITE is not an address, so this can never start a job, even if the guard were broken.
+        "a teardown started by another website": call("POST", "/teardown/start", {"site": INERT_SITE}, extra_headers={"Origin": evil}),
         "a teardown cancelled by another website": call("POST", "/teardown/cancel", {}, extra_headers={"Sec-Fetch-Site": "cross-site"}),
         "a teardown note read by another website": call("GET", "/teardown/last", extra_headers={"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Dest": "empty"}),
     }
@@ -418,17 +423,25 @@ def check_other_sites(report: Report) -> None:
 
 
 def check_lock(report: Report) -> None:
-    """Another program or another account on this computer must get nothing without the page key."""
+    """Another program or another account on this computer must get nothing without the page key.
+    This check never sends the key itself anywhere: it signs, and it runs the cookie rule in this process."""
     name = "Without your page key, a caller gets nothing"
     key = page_key()
     if not key:
         report.add(FAIL, name, f"No page key on disk ({server.KEY_FILE}). Stop the server and start it again.")
         return
+    if teardown.parse_site(INERT_SITE) is not None:
+        report.add(FAIL, name, f"The test text {INERT_SITE!r} is read as a website. The check was not run.")
+        return
     secret, wrong = key.encode("ascii"), "x" * len(key)
     nothing = {"message": "", "session": "preflight-outsider"}      # empty: it can never reach the brain
+    empty_note = {"text": ""}                                        # empty: it can never be saved
 
     def outsider(method: str, path: str, body: dict | None = None, headers: dict | None = None):
         return call_full(method, path, body, timeout=10, extra_headers=headers, key=False)
+
+    def signed(value: str) -> dict:
+        return {server.SIGN_HEADER: value}
 
     def refused(status: int, body: bytes) -> bool:
         """Only the locked answer counts: the locked page, or the one locked line of JSON. No key in it."""
@@ -441,7 +454,7 @@ def check_lock(report: Report) -> None:
         except ValueError:
             return False
 
-    # Empty sites, empty texts and empty names: none of these could do anything if the lock were broken.
+    # Empty texts, empty names and a site that is no site: none of these could do anything if the lock were broken.
     attempts = {
         "the page": outsider("GET", "/"),
         "the page by its file name": outsider("GET", "/index.html"),
@@ -450,36 +463,60 @@ def check_lock(report: Report) -> None:
         "the status": outsider("GET", "/status"),
         "a search in the notes": outsider("GET", "/search?q=coffee"),
         "a question to the brain": outsider("POST", "/chat", nothing),
-        "a new note": outsider("POST", "/remember", {"text": ""}),
+        "a new note": outsider("POST", "/remember", empty_note),
         "a change of brain": outsider("POST", "/brain", {"brain": ""}),
-        "a teardown": outsider("POST", "/teardown/start", {"site": ""}),
+        "a teardown": outsider("POST", "/teardown/start", {"site": INERT_SITE}),
         "the last teardown": outsider("GET", "/teardown/last"),
-        "a wrong key in the header": outsider("GET", "/status", headers={server.KEY_HEADER: wrong}),
+        "a second try without a key": outsider("GET", f"/?{server.AGAIN_PARAM}=1"),
         "a wrong key in the cookie": outsider("GET", "/status", headers={"Cookie": f"{server.KEY_COOKIE}={wrong}"}),
         "a wrong key in the address": outsider("GET", f"/?{server.KEY_PARAM}={wrong}"),
-        "a key that is one letter short": outsider("GET", "/status", headers={server.KEY_HEADER: key[:-1]}),
-        "a second try without a key": outsider("GET", f"/?{server.AGAIN_PARAM}=1"),
-        "a wrong cookie beside nothing else": outsider("GET", "/status", headers={
-            "Cookie": f"other=1; {server.KEY_COOKIE}={wrong}; {server.KEY_COOKIE}="}),
+        "a wrong key in the old header": outsider("GET", "/status", headers={"X-Jarviz-Key": wrong}),
+        "a signature made with a wrong key": outsider("GET", "/status", headers=signed(server.sign_request(wrong, "GET", "/status"))),
+        "a signature made for another address": outsider("GET", "/status", headers=signed(server.sign_request(key, "GET", "/search?q=x"))),
+        "a signature made for another method": outsider("GET", "/status", headers=signed(server.sign_request(key, "POST", "/status"))),
+        "a signature that is one hour old": outsider("GET", "/status", headers=signed(
+            server.sign_request(key, "GET", "/status", now=time.time() - 3600))),
+        "a signature made for another body": outsider("POST", "/remember", empty_note, headers=signed(
+            server.sign_request(key, "POST", "/remember", b"{}"))),
+        "a signature with no parts": outsider("GET", "/status", headers=signed("")),
     }
     trouble = ["LET IN: " + what for what, (status, _, body) in attempts.items() if not refused(status, body)]
 
-    # The right key, the way a browser brings it: once in the address, then as a cookie.
-    # (No address is printed below: a wrong redirect could still have the key in it.)
-    status, headers, _ = outsider("GET", f"/?{server.KEY_PARAM}={key}&mute=1")
+    # With the key (a signed call): the door sets the cookie the right way and goes on to the clean address.
+    # (No address is printed below: a wrong redirect could have a key in it.)
+    status, headers, _ = call_full("GET", f"/?{server.KEY_PARAM}={wrong}&mute=1", timeout=10)
     cookie = headers.get("set-cookie", "")
     if status != 303 or headers.get("location") != "/?mute=1":
-        trouble.append(f"the right key in the address gave {status} and did not go on to the clean address")
+        trouble.append(f"the door gave {status} and did not go on to the clean address")
     if not cookie.startswith(f"{server.KEY_COOKIE}={key};") or "HttpOnly" not in cookie or "SameSite=Strict" not in cookie:
         trouble.append("the cookie is not set as HttpOnly and SameSite=Strict")
-    status, _, page = outsider("GET", "/", headers={"Cookie": f"{server.KEY_COOKIE}={key}"})
-    if status != 200 or b"<title>Jarviz</title>" not in page:
-        trouble.append(f"the right cookie did not open the page (HTTP {status})")
-    # Another local server can plant a wrong cookie with our name beside the right one. The owner still gets in.
-    status, _, _ = outsider("GET", "/status", headers={"Cookie": f"{server.KEY_COOKIE}={wrong}; {server.KEY_COOKIE}={key}"})
-    if status != 200:
-        trouble.append(f"a planted wrong cookie locks the owner out (HTTP {status})")
-    # The proof that a tool asks for before it sends the key: right for the key, wrong for any other, and no key in it.
+
+    # The cookie rule, run in THIS process with a made-up key, so the real key is not sent as a cookie.
+    # Another local server can plant a wrong cookie with our name beside the right one: the owner still gets in.
+    class Caller:
+        command, path = "GET", "/status"
+
+        def __init__(self, cookie: str):
+            self.headers = email.message.Message()
+            if cookie:
+                self.headers["Cookie"] = cookie
+
+    made_up, real = "k" * len(key), server.PAGE_KEY
+    server.PAGE_KEY = made_up
+    try:
+        name_ = server.KEY_COOKIE
+        cookie_rule = (server.Handler._unlocked(Caller(f"other=1; {name_}={made_up}"))
+                       and server.Handler._unlocked(Caller(f"{name_}={wrong}; {name_}={made_up}"))
+                       and not server.Handler._unlocked(Caller(f"{name_}={wrong}; {name_}="))
+                       and not server.Handler._unlocked(Caller(f"{name_}x={made_up}"))
+                       and not server.Handler._unlocked(Caller("")))
+    finally:
+        server.PAGE_KEY = real
+    if not cookie_rule:
+        trouble.append("the cookie rule is wrong (the right cookie must open, also beside a planted wrong one)")
+
+    # The proof that `python server.py --link` asks for before it shows the link: right for the key,
+    # wrong for any other key, and no key in it. Only a nonce is sent.
     status, _, proof = outsider("GET", f"{server.PROOF_ROUTE}?nonce={'n' * 32}")
     if status != 200 or secret in proof or server.listener_holds(key) is not True or server.listener_holds(wrong) is not False:
         trouble.append("the server's proof that it holds the key does not work")

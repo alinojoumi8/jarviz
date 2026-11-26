@@ -37,16 +37,19 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
   and model line in `config.json`. Model ids change often: read the provider's documents, do not guess.
 - A provider call never follows a redirect (the key would go with it).
 - The server binds 127.0.0.1 and serves only `viewer/`.
-- The page lock: every request needs the page key, as the cookie `jarviz_key` or the header `X-Jarviz-Key`. ONE
+- The page lock: every request needs the page key. A browser brings it as the cookie `jarviz_key`. A tool signs
+  the request with it (header `X-Jarviz-Sign`, made by `server.sign_request`) and never sends the key. ONE
   place decides: `Handler._unlocked` in `server.py`. A new route is locked without more work. Do not add a route
   that answers before that check. The one exception is `/lock/proof`: it proves that the server holds the key and
   shows nothing about it.
-- The key is never sent to a program that has not proven it is this user's Jarviz: `server.listener_holds` runs
-  first, in `preflight.page_key` and in `python server.py --link`. Only the running server makes the key file, after
-  the port is its own.
+- No tool and no test sends the key itself, in a header, a cookie or an address. `python server.py --link` shows
+  the link only after `server.listener_holds` proved that the server holds the key. Only the running server makes
+  the key file, after the port is its own.
+- A test that must NOT start a teardown sends `preflight.INERT_SITE`, never an empty site. An empty site means
+  "the front Chrome tab" on a Mac.
 - The page key lives only in `~/.jarvis-tools/page-key`. Never in `viewer/`, never in a response body, never in the
   console, never in a test's output. `python server.py --link` is the one command that shows it, to the user.
-- Tests call the server through `preflight.call` (it sends the key). A call with `key=False` is an outsider.
+- Tests call the server through `preflight.call` (it signs the call). A call with `key=False` is an outsider.
 - One function speaks: `createSpeaker().speak` in `viewer/core.js`. `?mute=1` makes a tab silent. Open
   test tabs with `?mute=1`.
 - One owner for focus: only `Focus` in `viewer/app.js` moves the camera or changes which stars are lit.
