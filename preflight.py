@@ -154,6 +154,19 @@ def page_key() -> str:
     return _PAGE_KEY[0]
 
 
+_INSTANCE: list[str] = []
+
+
+def server_instance() -> str:
+    """The name of this start of the server, asked once, and taken only from a server that PROVED it
+    holds the page key ("" when none did: then nothing is signed). A signature names it, so a signature
+    that a stranger on the port catches is worth nothing after Jarviz starts again."""
+    if not _INSTANCE:
+        holds, instance = server.ask_listener(page_key()) if page_key() else (None, "")
+        _INSTANCE.append(instance if holds is True else "")
+    return _INSTANCE[0]
+
+
 def call_full(method: str, path: str, body: dict | None = None, timeout: float = 150,
               extra_headers: dict | None = None, key: bool = True) -> tuple[int, dict, bytes]:
     """One raw HTTP call to the running server. The path is sent exactly as given, and a redirect is
@@ -165,8 +178,9 @@ def call_full(method: str, path: str, body: dict | None = None, timeout: float =
         if body is not None:
             data = json.dumps(body).encode("utf-8")
             headers["Content-Type"] = "application/json"
-        if key and page_key():
-            headers.setdefault(server.SIGN_HEADER, server.sign_request(page_key(), method, path, data or b""))
+        if key and page_key() and server_instance():
+            headers.setdefault(server.SIGN_HEADER,
+                               server.sign_request(page_key(), server_instance(), method, path, data or b""))
         connection.request(method, path, body=data, headers=headers)
         response = connection.getresponse()
         return response.status, {name.lower(): value for name, value in response.getheaders()}, response.read()
@@ -204,8 +218,11 @@ def check_server(report: Report) -> bool:
                           f"No answer on http://{server.HOST}:{server.PORT} ({error.strerror or error}). Start it: python server.py")
     if status == 403 and b"<title>Jarviz is locked</title>" in page:
         return report.add(FAIL, "Server is up and serving the viewer",
-                          "The server did not take a request signed with the page key. Its key is not the key on disk. "
-                          "Stop the server and start it again: python server.py")
+                          "The server did not take a request signed with the page key. " + (
+                              "Its key is not the key on disk, or it was started again a moment ago. "
+                              if server_instance() else
+                              f"The program on port {server.PORT} did not prove that it holds your key, so nothing "
+                              "signed was sent to it. ") + "Stop it and start Jarviz again: python server.py")
     ok = status == 200 and b'id="graph"' in page and b"<title>Jarviz</title>" in page
     return report.add(PASS if ok else FAIL, "Server is up and serving the viewer",
                       "" if ok else f"GET / gave {status}, and it is not the Jarviz page. Is another program on port {server.PORT}?")
@@ -424,11 +441,13 @@ def check_other_sites(report: Report) -> None:
 
 def check_lock(report: Report) -> None:
     """Another program or another account on this computer must get nothing without the page key.
-    This check never sends the key itself anywhere: it signs, and it runs the cookie rule in this process."""
+    This check never sends the key itself anywhere: it signs, and it runs the door and the cookie rule
+    in this process with a made-up key."""
     name = "Without your page key, a caller gets nothing"
-    key = page_key()
-    if not key:
-        report.add(FAIL, name, f"No page key on disk ({server.KEY_FILE}). Stop the server and start it again.")
+    key, instance = page_key(), server_instance()
+    if not key or not instance:
+        report.add(FAIL, name, f"No page key on disk ({server.KEY_FILE}), or the server did not prove that it holds it. "
+                               "Stop the server and start it again.")
         return
     if teardown.parse_site(INERT_SITE) is not None:
         report.add(FAIL, name, f"The test text {INERT_SITE!r} is read as a website. The check was not run.")
@@ -443,9 +462,12 @@ def check_lock(report: Report) -> None:
     def signed(value: str) -> dict:
         return {server.SIGN_HEADER: value}
 
-    def refused(status: int, body: bytes) -> bool:
-        """Only the locked answer counts: the locked page, or the one locked line of JSON. No key in it."""
-        if status != 403 or secret in body:
+    def sign(method: str, path: str, body: bytes = b"", *, with_key: str = key, start: str = instance, now=None) -> dict:
+        return signed(server.sign_request(with_key, start, method, path, body, now))
+
+    def refused(status: int, headers: dict, body: bytes) -> bool:
+        """Only the locked answer counts: the locked page, or the one locked line of JSON. No key and no cookie in it."""
+        if status != 403 or secret in body or "set-cookie" in headers:
             return False
         if b"<title>Jarviz is locked</title>" in body:
             return b"<title>Jarviz</title>" not in body and b'id="graph"' not in body
@@ -471,52 +493,70 @@ def check_lock(report: Report) -> None:
         "a wrong key in the cookie": outsider("GET", "/status", headers={"Cookie": f"{server.KEY_COOKIE}={wrong}"}),
         "a wrong key in the address": outsider("GET", f"/?{server.KEY_PARAM}={wrong}"),
         "a wrong key in the old header": outsider("GET", "/status", headers={"X-Jarviz-Key": wrong}),
-        "a signature made with a wrong key": outsider("GET", "/status", headers=signed(server.sign_request(wrong, "GET", "/status"))),
-        "a signature made for another address": outsider("GET", "/status", headers=signed(server.sign_request(key, "GET", "/search?q=x"))),
-        "a signature made for another method": outsider("GET", "/status", headers=signed(server.sign_request(key, "POST", "/status"))),
-        "a signature that is one hour old": outsider("GET", "/status", headers=signed(
-            server.sign_request(key, "GET", "/status", now=time.time() - 3600))),
-        "a signature made for another body": outsider("POST", "/remember", empty_note, headers=signed(
-            server.sign_request(key, "POST", "/remember", b"{}"))),
+        "a signature made with a wrong key": outsider("GET", "/status", headers=sign("GET", "/status", with_key=wrong)),
+        "a signature made for another address": outsider("GET", "/status", headers=sign("GET", "/search?q=x")),
+        "a signature made for another method": outsider("GET", "/status", headers=sign("POST", "/status")),
+        "a signature that is one hour old": outsider("GET", "/status", headers=sign("GET", "/status", now=time.time() - 3600)),
+        "a signature made for another body": outsider("POST", "/remember", empty_note, headers=sign("POST", "/remember", b"{}")),
+        "a signature made for another start of the server": outsider("GET", "/status", headers=sign("GET", "/status", start="s" * 16)),
         "a signature with no parts": outsider("GET", "/status", headers=signed("")),
+        # A good signature opens the routes, but it is never traded for the cookie (the cookie IS the key).
+        "a good signature at the door, to get the cookie": outsider(
+            "GET", f"/?{server.KEY_PARAM}={wrong}&mute=1", headers=sign("GET", f"/?{server.KEY_PARAM}={wrong}&mute=1")),
+        "a good signature at the second try, to get the cookie": outsider(
+            "GET", f"/?{server.AGAIN_PARAM}=1", headers=sign("GET", f"/?{server.AGAIN_PARAM}=1")),
     }
-    trouble = ["LET IN: " + what for what, (status, _, body) in attempts.items() if not refused(status, body)]
+    trouble = ["LET IN: " + what for what, (status, headers, body) in attempts.items() if not refused(status, headers, body)]
+    if call("GET", "/status", timeout=10)[0] != 200:
+        trouble.append("a call with a good signature is not let in")
 
-    # With the key (a signed call): the door sets the cookie the right way and goes on to the clean address.
-    # (No address is printed below: a wrong redirect could have a key in it.)
-    status, headers, _ = call_full("GET", f"/?{server.KEY_PARAM}={wrong}&mute=1", timeout=10)
-    cookie = headers.get("set-cookie", "")
-    if status != 303 or headers.get("location") != "/?mute=1":
-        trouble.append(f"the door gave {status} and did not go on to the clean address")
-    if not cookie.startswith(f"{server.KEY_COOKIE}={key};") or "HttpOnly" not in cookie or "SameSite=Strict" not in cookie:
-        trouble.append("the cookie is not set as HttpOnly and SameSite=Strict")
-
-    # The cookie rule, run in THIS process with a made-up key, so the real key is not sent as a cookie.
-    # Another local server can plant a wrong cookie with our name beside the right one: the owner still gets in.
+    # The door and the cookie rule, run in THIS process with a made-up key. So the real key is never sent
+    # in an address or as a cookie by this check. (The real browser proves the live path every day.)
     class Caller:
-        command, path = "GET", "/status"
+        command, path = "GET", "/"
+        _unlocked, _cookie_ok = server.Handler._unlocked, server.Handler._cookie_ok
+        _door, _refuse_locked, _send_json = server.Handler._door, server.Handler._refuse_locked, server.Handler._send_json
 
-        def __init__(self, cookie: str):
-            self.headers = email.message.Message()
+        def __init__(self, cookie: str = ""):
+            self.headers, self.sent = email.message.Message(), []
             if cookie:
                 self.headers["Cookie"] = cookie
 
-    made_up, real = "k" * len(key), server.PAGE_KEY
+        def _send(self, status: int, data: bytes, content_type: str, extra: tuple = ()) -> None:
+            self.sent.append((status, dict(extra)))
+
+    def door(pairs: list, cookie: str = "") -> tuple[int, dict]:
+        caller = Caller(cookie)
+        caller._door(pairs)
+        return caller.sent[-1]
+
+    made_up, real, jar = "k" * len(key), server.PAGE_KEY, server.KEY_COOKIE
     server.PAGE_KEY = made_up
     try:
-        name_ = server.KEY_COOKIE
-        cookie_rule = (server.Handler._unlocked(Caller(f"other=1; {name_}={made_up}"))
-                       and server.Handler._unlocked(Caller(f"{name_}={wrong}; {name_}={made_up}"))
-                       and not server.Handler._unlocked(Caller(f"{name_}={wrong}; {name_}="))
-                       and not server.Handler._unlocked(Caller(f"{name_}x={made_up}"))
-                       and not server.Handler._unlocked(Caller("")))
+        cookie_rule = (Caller(f"other=1; {jar}={made_up}")._unlocked()
+                       and Caller(f"{jar}={wrong}; {jar}={made_up}")._unlocked()       # a planted wrong cookie beside the right one
+                       and not Caller(f"{jar}={wrong}; {jar}=")._unlocked()
+                       and not Caller(f"{jar}x={made_up}")._unlocked()
+                       and not Caller()._unlocked())
+        status, sent = door([(server.KEY_PARAM, made_up), ("mute", "1")])
+        cookie = sent.get("Set-Cookie", "")
+        right_key = (status == 303 and sent.get("Location") == "/?mute=1" and cookie.startswith(f"{jar}={made_up};")
+                     and "HttpOnly" in cookie and "SameSite=Strict" in cookie)
+        again = door([(server.AGAIN_PARAM, "1")], cookie=f"{jar}={made_up}")
+        wrong_key = door([(server.KEY_PARAM, wrong)])
     finally:
         server.PAGE_KEY = real
     if not cookie_rule:
         trouble.append("the cookie rule is wrong (the right cookie must open, also beside a planted wrong one)")
+    if not right_key:
+        trouble.append("the door does not turn the right key into an HttpOnly, SameSite=Strict cookie and a clean address")
+    if again[0] != 303 or again[1].get("Location") != "/":
+        trouble.append("the second try of a browser that has the cookie does not go on to the page")
+    if wrong_key[0] != 403 or "Set-Cookie" in wrong_key[1]:
+        trouble.append("the door gives a cookie for a wrong key")
 
-    # The proof that `python server.py --link` asks for before it shows the link: right for the key,
-    # wrong for any other key, and no key in it. Only a nonce is sent.
+    # The proof that a tool asks for before it signs, and that `python server.py --link` asks for before it
+    # shows the link: right for the key, wrong for any other key, and no key in it. Only a nonce is sent.
     status, _, proof = outsider("GET", f"{server.PROOF_ROUTE}?nonce={'n' * 32}")
     if status != 200 or secret in proof or server.listener_holds(key) is not True or server.listener_holds(wrong) is not False:
         trouble.append("the server's proof that it holds the key does not work")

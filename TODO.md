@@ -92,14 +92,14 @@ Review:
 - [x] Two reviewers checked the Part Two code (Python and security). Their findings are fixed and the tests ran again.
 - [x] The whole PDF was checked against the code, prompt by prompt. Five gaps were found and fixed (see "The PDF check" below).
 - [x] CodeRabbit ran on the first commit: 44 files, 0 findings.
-- [x] CodeRabbit ran two times on the new work (the lock, the drill, the page lines): 4 small findings, then 2 more in the lock tests. All 6 are fixed.
+- [x] CodeRabbit ran three times on the new work (the lock, the drill, the page lines): 4 small findings, then 2 in the lock tests, then 1 in the lock. All 7 are fixed.
 - [x] One more security review read the page lock. Nothing had to be fixed. Three of its ideas made the lock stronger.
 - CodeRabbit used its free review each time, because the project is not on GitHub. Its full review needs the project on GitHub and CodeRabbit installed for it. That is your decision.
 - [x] The code is committed on the branch `first-build`. Nothing is pushed anywhere.
 
 The page lock (it was the known gap, it is closed now):
 
-- [x] Port 4700 answers every program and every account on this computer. Now a caller without your page key gets nothing: not the page, not the notes, not the brain, not a teardown. Preflight tries 21 ways without the key.
+- [x] Port 4700 answers every program and every account on this computer. Now a caller without your page key gets nothing: not the page, not the notes, not the brain, not a teardown. Preflight tries 24 ways without the key.
 - [x] The test tools never send the key. They sign each request with it. `python server.py --link` shows the link only after the server proved that it holds the key. So a program that sits on port 4700 in place of Jarviz gets nothing.
 - [x] The key is in `%USERPROFILE%\.jarvis-tools\page-key`, outside the project. Other accounts on this computer cannot read your home folder.
 - [ ] What no lock can stop: a program that runs as you. It can read the key file. It can read `config.json` too.

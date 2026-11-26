@@ -42,6 +42,8 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
   place decides: `Handler._unlocked` in `server.py`. A new route is locked without more work. Do not add a route
   that answers before that check. The one exception is `/lock/proof`: it proves that the server holds the key and
   shows nothing about it.
+- A signature is never traded for the cookie: `Handler._door` gives the cookie only to a caller that brought the
+  key itself. A signature names the start of the server (`INSTANCE`), so it is worth nothing after a restart.
 - No tool and no test sends the key itself, in a header, a cookie or an address. `python server.py --link` shows
   the link only after `server.listener_holds` proved that the server holds the key. Only the running server makes
   the key file, after the port is its own.
