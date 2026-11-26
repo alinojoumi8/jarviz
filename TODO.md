@@ -80,7 +80,7 @@ Still to prove:
 
 Proven with the real brain and a real public site (igloo.inc):
 
-- [x] Last run: `PREFLIGHT: 30 pass, 1 fail, 0 warn` and `DRILL: 85 pass, 0 fail`. The one fail is the OpenAI account: it has no credit (see "Brains"). Preflight has 31 checks now.
+- [x] Last run: `PREFLIGHT: 30 pass, 1 fail, 0 warn` and `DRILL: 91 pass, 0 fail`. The one fail is the OpenAI account: it has no credit (see "Brains"). Preflight has 31 checks now.
 - [x] The drill passed with a hidden browser, and also with the Chrome window on screen (`python drill.py --visible`). The snapshot from the visible window is a real picture.
 - [x] A full teardown in about one minute: 96 files, 14.7 MB, Three.js r165, GSAP 3.12.5, postprocessing 6.35.5.
 - [x] The card shows the 8 steps live, then the snapshot, the stack and the totals. The reader shows the whole note.
@@ -139,6 +139,7 @@ Review:
   - In "tell me about stripe.com, then tear down example.com", only example.com can be torn down. "I like igloo.inc. Take it apart." still works.
   - A note is known by its notes folder and its path.
 - [x] A fourth set of 5 replies: 1 closed its thread, 4 had a small point, all 4 fixed. The time of a signature is read inside the lock. On a Mac or Linux only the exact Chrome that Jarviz starts counts, and a process that nobody can name stops nothing. The drill takes only the end states it knows. The page uses a node number only for the galaxy it belongs to. `page_checks.js` has 79 rules now.
+- [x] A fifth set of 4 replies: 2 tiny points fixed (the drill wants a job with an id; the page lights a note only on the exact state of the galaxy that the answer was made from). 1 point is not changed, on purpose: on a Mac or Linux, Jarviz knows "its" Chrome by the program's name and by the test profile in its command line, not by the full file path of the program. A program with Chrome's exact name that runs on Jarviz's own test profile is treated as that Chrome. This part runs only on a Mac or Linux, and this computer has Windows, so more changes there cannot be tested here.
 - The other 5 replies say one thing: preflight must be all green. Its one fail is the OpenAI account with no credit. Add credit, or take the OpenAI key out of `config.json` (then that brain is not tested), and run `python preflight.py`.
 - 12 findings are not changed, on purpose:
   - The drill deletes its own test note also when a program changed it. A test note is not your work.
@@ -177,6 +178,7 @@ The PDF check (what was different from the PDF):
 Not proven:
 
 - [ ] "This site" on a Mac (it reads the front Chrome tab). This computer has Windows, so Jarviz asks for the name.
+- [ ] The rule for "which process is our Chrome" on a Mac or Linux. It is tested with made-up process lists only. Run `python drill.py` on such a computer before you trust it there.
 - [ ] A teardown written by a brain other than Claude.
 - [ ] The clean Chrome and your private network. Jarviz checks the address of the PAGE. It does not see the connections that Chrome makes. There are two cases:
   - The page itself moves to a private address. Jarviz sees that and stops the job. But Chrome has already sent the request that went there. Jarviz reads nothing from that page.

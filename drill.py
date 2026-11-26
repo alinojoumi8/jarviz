@@ -66,10 +66,14 @@ def job_of(status: int, raw: bytes) -> dict:
         body = json.loads(raw.decode("utf-8"))
     except (ValueError, UnicodeDecodeError):
         body = None
-    if (status != 200 or not isinstance(body, dict) or body.get("ok") is False or "job" not in body
-            or not (body["job"] is None or isinstance(body["job"], dict))):
+    if status != 200 or not isinstance(body, dict) or body.get("ok") is False or "job" not in body:
         raise BadAnswer(f"HTTP {status}")
-    return body["job"] or {}
+    job = body["job"]
+    if job is None:
+        return {}                       # no job: "not ours"
+    if not isinstance(job, dict) or not isinstance(job.get("id"), str) or not job["id"]:
+        raise BadAnswer("a job without an id")      # a job must say whose it is
+    return job
 
 
 def job_now() -> dict:
@@ -172,7 +176,8 @@ def follow_checks() -> list[tuple[str, bool, str]]:
     stateless, weird = good({"id": "job1"}), good({"id": "job1", "state": "weird"})
     for what, bad in (("an HTTP 500", error_500), ("an HTML error page", html), ('{"ok": false}', refused),
                       ("{} with HTTP 200", no_job_key), ("a job with no state", stateless),
-                      ('a job with the state "weird"', weird)):
+                      ('a job with the state "weird"', weird), ('{"job": {}}', good({})),
+                      ('a job with no id', good({"state": "running"})), ("a job with an empty id", good({"id": ""}))):
         cases.append((f"{what} once, then done, is a confirmed end", [bad, good(done)], 60, (ENDED, done, 0)))
         cases.append((f"{what} until the retry limit is not a confirmed end", [good(running), bad], 60,
                       (NOT_CONFIRMED, running, 0)))

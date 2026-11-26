@@ -763,8 +763,10 @@
     const action = reply.ok === false ? null : reply.action || null;
     const type = action ? action.type : null;
     const found = await syncGraph(reply.graph, type === 'remember' || type === 'forget' ? 1 : 0);
-    // Node numbers belong to one build: they count only when the galaxy on screen is the reply's own build.
-    const numbered = found !== 'failed' && Boolean(reply.graph) && reply.graph.build_id === graphState.build_id;
+    // Node numbers belong to one snapshot: they count only when the galaxy on screen is exactly the one the
+    // reply was made from (same build, same rev). Within one build an index can be used again.
+    const numbered = found !== 'failed' && Boolean(reply.graph) && reply.graph.build_id === graphState.build_id
+      && reply.graph.rev === graphState.rev;
     // A newer sentence started while this one waited: it owns the answer. This reply only mends the galaxy.
     const owner = mine === sends;
     if (owner) say(reply.answer || '', reply.ok === false);   // also after a failed read: the save did happen
@@ -782,7 +784,7 @@
       Teardown.cancelled();                           // noted: the job's end stays quiet, the card is not touched
     } else if (!owner) {
       return;                     // a late answer moves no camera and changes no card; a teardown above is only tracked
-    } else if (numbered) {                            // not after a failed read, not on another build
+    } else if (numbered) {                            // not after a failed read, not on another snapshot
       Focus.apply(Core.planFocus(reply.nodes));
     }
   }

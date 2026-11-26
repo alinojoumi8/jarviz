@@ -6,7 +6,7 @@
    page did. Nothing goes to the network, and no file is read except the two that are named.
 
    preflight runs it:   node page_checks.js viewer/core.js viewer/app.js
-   It prints ONE line on stdout, JSON: {"pass": 79, "fail": 0, "failures": []}. The exit code is 0 when it
+   It prints ONE line on stdout, JSON: {"pass": 82, "fail": 0, "failures": []}. The exit code is 0 when it
    ran to its end, also when a rule failed. Any other exit code means it could not run (a file is
    missing, or the page code threw while it loaded); the reason is on stderr.
    For people:          node page_checks.js viewer/core.js viewer/app.js --list   (the name of every check)
@@ -253,19 +253,25 @@ story('a capture one step ahead (base)', {
 
 story('a capture after a read of the galaxy (reloaded)', {
   once: 'after a read of the galaxy a capture is not added a second time, and ids equal indexes',
-  focus: 'after a read the saved note is found by its index and its name, and focused',
+  focus: 'after a read that lands on the reply\'s own rev the saved note is found by its index and name, and focused',
   numbers: 'after a read the numbers of the file are kept, so the next reply needs no read',
 }, async (t, open) => {
-  const p = await open({ handlers: {
+  let p = await open({ handlers: {
+    '/remember': () => rememberReply(7, 3, 'T'),                               // the server counted two steps
+    'graph-data.js': () => graphFile(galaxy(7, ['A', 'B', 'C', 'T'])),          // the file is the reply's snapshot
+  } });
+  await p.J().handleInput('remember that T');
+  await p.tick(1000);
+  const nodes = p.J().data().nodes;
+  t.check('once', nodes.length === 4 && nodes.every((node, index) => node.id === index), labels(p));
+  t.check('focus', p.J().Focus.current().primary === 3 && p.$('answer').textContent === 'Saved T');
+  p = await open({ handlers: {
     '/remember': () => rememberReply(7, 3, 'T'),
     'graph-data.js': () => graphFile(galaxy(9, ['A', 'B', 'C', 'T', 'Other tab'])),     // newer than the reply
     '/chat': () => chatReply('chat', 9),
   } });
   await p.J().handleInput('remember that T');
   await p.tick(1000);
-  const nodes = p.J().data().nodes;
-  t.check('once', nodes.length === 5 && nodes.every((node, index) => node.id === index), labels(p));
-  t.check('focus', p.J().Focus.current().primary === 3 && p.$('answer').textContent === 'Saved T');
   await p.J().handleInput('what now');
   await p.tick(0);
   t.check('numbers', count(p.fetchLog, 'graph-data.js') === 1, `${count(p.fetchLog, 'graph-data.js')} reads`);
@@ -594,9 +600,42 @@ story('no node numbers on a galaxy that could not be read', {
     `${q.J().Focus.current().primary} / ${q.$('panel-title').textContent}`);
 });
 
+story('an index used again inside one build', {
+  reuse: 'a reply whose read finds the same build moved on (an index used again) shows its answer and lights no star',
+  inStep: 'the next reply after that is in step again and lights its stars',
+  capture: 'a capture whose read finds the galaxy moved on past its reply shows its answer and focuses nothing',
+}, async (t, open) => {
+  let chat = () => chatReply('About Note A', 6, [3]);
+  // On the page: rev 5 with "Note A" at 3. The reply was made at rev 6. Before the read, another tab forgot
+  // "Note A" and saved "Note B" at the same index: the file is at rev 8.
+  let p = await open({ graph: galaxy(5, ['A', 'B', 'C', 'Note A']), handlers: {
+    '/chat': () => chat(),
+    'graph-data.js': () => graphFile(galaxy(8, ['A', 'B', 'C', 'Note B'])),
+  } });
+  await p.J().handleInput('tell me about note A');
+  await p.tick(2500);
+  const focus = p.J().Focus.current();
+  t.check('reuse', focus.primary === null && focus.lit.length === 0 && p.$('panel').hidden === true
+    && p.$('answer').textContent === 'About Note A' && labels(p) === 'A,B,C,Note B', `primary ${focus.primary} / ${labels(p)}`);
+  chat = () => chatReply('About Note B', 8, [3]);
+  await p.J().handleInput('tell me about note B');
+  await p.tick(0);
+  t.check('inStep', p.J().Focus.current().primary === 3 && p.$('panel-title').textContent === 'Note B'
+    && count(p.fetchLog, 'graph-data.js') === 1, `primary ${p.J().Focus.current().primary}, ${count(p.fetchLog, 'graph-data.js')} reads`);
+
+  p = await open({ handlers: {
+    '/remember': () => rememberReply(7, 3, 'T'),
+    'graph-data.js': () => graphFile(galaxy(9, ['A', 'B', 'C', 'T', 'Other tab'])),     // moved on past the reply
+  } });
+  await p.J().handleInput('remember that T');
+  await p.tick(1000);
+  t.check('capture', p.J().Focus.current().primary === null && p.$('answer').textContent === 'Saved T' && labels(p) === 'A,B,C,T,Other tab',
+    `primary ${p.J().Focus.current().primary} / ${labels(p)}`);
+});
+
 story('node numbers belong to one build of the galaxy', {
   rebuilt: 'a reply about a galaxy that was built again before the read shows its answer and lights no star',
-  sameBuild: 'a reply from the same build with a newer rev still lights its stars',
+  sameBuild: 'a reply whose read lands on its own snapshot (same build, same rev) lights its stars',
   otherBase: 'a capture whose receipt names another build adds and focuses nothing, and shows its answer',
   inStep: 'after such a capture the page reads the file, so the next reply lights its stars again',
   sameLabel: 'a receipt from another build does not focus a note with the same index and name',
@@ -613,8 +652,8 @@ story('node numbers belong to one build of the galaxy', {
     && p.$('answer').textContent === 'About B' && labels(p) === 'P,Q,R', `primary ${focus.primary} / ${labels(p)}`);
 
   p = await open({ handlers: {
-    '/chat': () => chatReply('About B', 7, [1]),
-    'graph-data.js': () => graphFile(galaxy(7, ['A', 'B', 'C', 'D'])),
+    '/chat': () => chatReply('About B', 7, [1]),                                  // the page is at rev 5: it reads
+    'graph-data.js': () => graphFile(galaxy(7, ['A', 'B', 'C', 'D'])),          // ...and finds rev 7, the reply's own
   } });
   await p.J().handleInput('tell me about B');
   await p.tick(0);

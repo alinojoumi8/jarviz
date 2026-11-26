@@ -140,10 +140,11 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
   its graph numbers come from one locked step (`chat_route`, `search_route`). Every capture receipt carries
   `"build"`, written under the lock. `/forget` needs it: a capture from a galaxy that was built again is not
   forgotten. The page sends the build of the receipt, not the build of the reply.
-- Node numbers belong to one build of the galaxy. The page uses the node numbers of a reply or a receipt only
-  when their `build` is the build on screen, and never on a galaxy that it could not read again.
+- Node numbers belong to one state of the galaxy. The page uses the node numbers of a reply only when the galaxy
+  on screen is exactly the reply's snapshot (the same `build_id` and the same `rev`), a receipt only when its
+  `build` is the build on screen, and never on a galaxy that it could not read again.
 - The drill counts only an end that is confirmed (`follow_job`). Only a good status answer counts (`job_of`: it
-  has the key `job`), and a job ends only on `done`, `failed` or `cancelled`. An end that is not confirmed is a FAIL.
+  has the key `job`, and a job has an `id`), and a job ends only on `done`, `failed` or `cancelled`. An end that is not confirmed is a FAIL.
 - `main()` takes the port first and loads the galaxy after it. A second start that finds the port busy changes
   nothing. `Galaxy.refresh_if_rebuilt` follows the `notes_dir` that `config.json` names now.
 - Library fingerprints live in ONE table (`FINGERPRINTS`). A "presence" pattern must be a string that only that
