@@ -134,8 +134,8 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
   says that its program is the browser that `find_chrome()` gives, the `chrome` file beside it, one of its Mac
   helpers, or Chrome's crash helper (`ps -o comm=`, joined by pid in `posix_table`; `is_chrome_program`), and it
   names the profile in `--user-data-dir=` (the crash helper in `--database=`). Another program is never stopped.
-  A process on the profile whose program is not known, or a process list that cannot be read, is "could not
-  look": nothing is stopped on a guess, and no check says "clean".
+  A process on the profile whose program is not known, a process list that cannot be read, or no browser found
+  is "could not look": nothing is stopped on a guess, and no check says "clean".
 - The identity of a note is its notes folder and its path (`note_id`), not its title. The sources of a reply and
   its graph numbers come from one locked step (`chat_route`, `search_route`). Every capture receipt carries
   `"build"`, written under the lock. `/forget` needs it: a capture from a galaxy that was built again is not

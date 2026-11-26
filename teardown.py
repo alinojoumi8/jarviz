@@ -398,8 +398,11 @@ def pids_on_profile(table, folder, names, windows: bool | None = None) -> list[i
     """The pids in a process table (pid, command line, program) that run on `folder`. Pure. On a Mac or Linux a
     process that names the profile but whose program is not known (it was not in the second `ps` list) could be
     ours or not: nobody knows. Then the answer is None ("could not look"), so nothing is killed on a guess and no
-    check says "clean"."""
+    check says "clean". With no browser names (find_chrome found none) no program can be compared: None too.
+    Windows does not use the names."""
     windows = os.name == "nt" if windows is None else windows
+    if not windows and not names:
+        return None
     needle = str(folder).replace("\\", "/").rstrip("/").casefold()
     pids = []
     for pid, command, program in table:
@@ -2624,13 +2627,18 @@ def _offline_bay_checks(reply: str, evidence: dict) -> list[tuple[str, bool, str
     unknown = groups[0][1] + [(111, f"/opt/google/chrome/chrome --user-data-dir={root}/job1", "", False)]
     if pids_on_profile(table_of(unknown), root, linux_chrome, windows=False) is not None:
         wrong.append("a process on the profile with no known program did not give 'could not look'")
-    if pids_on_profile(table_of(groups[0][1]), root, frozenset(), windows=False) != []:
-        wrong.append("with no browser found, a process was ours")
+    # With no browser found there is nothing to compare a program with: on a Mac or Linux that is "could not look".
+    if pids_on_profile(table_of(groups[0][1]), root, frozenset(), windows=False) is not None:
+        wrong.append("with no browser found, the answer was not 'could not look'")
     windows = [(r'"C:\Program Files\Google\Chrome\Application\chrome.exe" --type=gpu-process '
                 r'--user-data-dir=C:\Users\u\.jarvis-tools\rea\profiles\job1', True),
                (r'"C:\Program Files\Google\Chrome\Application\chrome.exe" "--user-data-dir=C:\Users\u\.jarvis-tools\rea\profiles\job1"', True),
                (r'"C:\Program Files\Google\Chrome\Application\chrome.exe" --user-data-dir=C:\Users\u\AppData\Local\Google\Chrome', False)]
     wrong += [line for line, ours in windows if names_profile(line, r"C:\Users\u\.jarvis-tools\rea\profiles", windows=True) != ours]
+    # Windows does not use the names: with none, the same rows still give the same pids.
+    windows_table = [(number, line, "chrome.exe") for number, (line, _) in enumerate(windows, start=401)]
+    if pids_on_profile(windows_table, r"C:\Users\u\.jarvis-tools\rea\profiles", frozenset(), windows=True) != [401, 402]:
+        wrong.append("on Windows, no browser names changed the answer")
     one_job = names_profile(groups[0][1][0][1], root + "/job1", windows=False, program="chrome", names=linux_chrome)
     results.append(("a process is ours only when Jarviz's own Chrome runs on a job profile; a look-alike or a script "
                     "is not, and an unknown program on the profile is 'could not look'",
