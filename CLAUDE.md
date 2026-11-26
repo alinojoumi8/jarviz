@@ -5,10 +5,13 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
 
 ## Run
 
-- Start: `python server.py` then open http://127.0.0.1:4700 (or double-click `start-jarviz.bat`).
+- Start: double-click `start-jarviz.bat` (it runs `python server.py --open`). The page is locked: a browser
+  needs the page key once. `--open` gives it to the default browser. For another browser, run
+  `python server.py --link` and paste the link.
 - Re-index the notes: `python build.py`. The running server picks the new index up by itself.
 - Verify: `python preflight.py` while the server runs.
 - Verify the teardown kit: `python drill.py` while the server runs. It runs one hidden test teardown and removes its own note.
+  `python drill.py --visible` is the same drill with the Chrome window on screen.
 
 ## Files
 
@@ -21,6 +24,7 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
 - `drill.py` the live teardown drill. `record()` and `put_back()` make a test leave no trace.
 - `viewer/index.html`, `viewer/core.js`, `viewer/app.js` the page. No npm, no build step.
 - `config.json` the active brain, a key and a model for each brain, the notes folder. Git ignores it.
+- `~/.jarvis-tools/page-key` the page key (the lock). It is outside the project. The server makes it at the first start.
 
 ## Laws
 
@@ -33,12 +37,24 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
   and model line in `config.json`. Model ids change often: read the provider's documents, do not guess.
 - A provider call never follows a redirect (the key would go with it).
 - The server binds 127.0.0.1 and serves only `viewer/`.
+- The page lock: every request needs the page key, as the cookie `jarviz_key` or the header `X-Jarviz-Key`. ONE
+  place decides: `Handler._unlocked` in `server.py`. A new route is locked without more work. Do not add a route
+  that answers before that check. The one exception is `/lock/proof`: it proves that the server holds the key and
+  shows nothing about it.
+- The key is never sent to a program that has not proven it is this user's Jarviz: `server.listener_holds` runs
+  first, in `preflight.page_key` and in `python server.py --link`. Only the running server makes the key file, after
+  the port is its own.
+- The page key lives only in `~/.jarvis-tools/page-key`. Never in `viewer/`, never in a response body, never in the
+  console, never in a test's output. `python server.py --link` is the one command that shows it, to the user.
+- Tests call the server through `preflight.call` (it sends the key). A call with `key=False` is an outsider.
 - One function speaks: `createSpeaker().speak` in `viewer/core.js`. `?mute=1` makes a tab silent. Open
   test tabs with `?mute=1`.
 - One owner for focus: only `Focus` in `viewer/app.js` moves the camera or changes which stars are lit.
 - One door for new notes: `Galaxy.birth_note` in `server.py` and `addNote` in `viewer/app.js`.
 - Every node id equals its index in `GRAPH.nodes`.
 - The persona, the control tags and the spoken lines live in the persona block at the top of `server.py`.
+  The lines that the page says by itself are `PAGE_LINES` in that block. The page gets them with `/status`.
+  `viewer/` holds no butler words: `lines` in `viewer/app.js` has plain words for the time before the first answer.
 - Voice routes are checked before the brain. Add a command with `router.add`, do not edit the core.
 - A control tag runs only when the user's own sentence asks for that action. Every tag in
   `TAG_HANDLERS` needs an entry in `TAG_INTENT` (`server.py`). Text inside a note can never order an action.
@@ -65,6 +81,8 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
   `resolves_to_private`). The `[TEARDOWN:site|question]` tag runs only for a site whose own name is a word in the
   user's sentence (`named_by_user`), and "this" only when the user said "this site".
 - A note never shows the brain a ready-made control tag: `note_block` turns `[WORD:` into `(WORD:`.
+- The REA note links to the Jarviz note. When the notes have no note called Jarviz or Jarvis, the first teardown
+  makes `captures/Jarviz.md` first (`owner_note` in `teardown.py`). The births go in this order: Jarviz, REA, the teardown.
 - Every evidence line in the digest starts with who captured it (`EVIDENCE_TAGS`). The brain writes the note text.
   Code writes the Evidence section and the facts block on top.
 - Everything that comes out of the inspected website is data from a stranger: REA's output, the page reads (they
@@ -78,4 +96,7 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
 - `/teardown/note` and `/teardown/image` serve only files inside the teardowns folder (`valid_name`). The card and
   the reader show no file paths.
 - A test that runs a teardown uses a hidden browser (`"headless": true`, or a `?headless=1` tab) and
-  `drill.record()` / `drill.put_back()`. A test never starts a real teardown without them.
+  `drill.record()` / `drill.put_back()`. A test never starts a real teardown without them. The one test with a
+  window is `python drill.py --visible`. It still records and puts back.
+- The drill compares the galaxy by its shape (`drill.shape`: note names and link pairs), not by node numbers. A
+  galaxy that is built again can number the same notes in another order.

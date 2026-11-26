@@ -1,26 +1,32 @@
 """Jarviz server: serves the viewer and runs the brain.
 
     python server.py           start on http://127.0.0.1:4700
-    python server.py --open    start and open the page
+    python server.py --open    start and open the page (it unlocks this browser)
+    python server.py --link    print the link that unlocks one more browser, then stop
 
 It serves ONLY the viewer/ folder. config.json stays in the project root, out of the
 browser's reach. The key is read from that file when the brain is called. It is never logged.
+The page is locked: a caller without the page key gets nothing (see "lock" below).
 """
 from __future__ import annotations
 
+import hmac
+import http.client
 import json
 import os
 import random
 import re
+import secrets
 import sys
 import threading
 import time
 import webbrowser
 from collections import deque
 from datetime import datetime
+from html import escape as html_escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, quote, unquote
+from urllib.parse import parse_qs, parse_qsl, quote, unquote, urlencode
 
 import brains
 import build
@@ -123,6 +129,22 @@ LINES = {
     "teardown_none_saved": "I have no teardown on file yet, sir.",
     "teardown_last": "The last one on file, sir: {label}.",
     "server_error": "Something went wrong on my side, sir. The server window has the details.",
+    "locked": "This page has lost its key, sir. Close it and start me again with start-jarviz.bat.",
+}
+
+# Lines the PAGE says by itself: the greeting, and what to say when the server does not answer. The
+# page gets them with /status. Until then it has plain words of its own, with no character in them.
+# A new line needs the same name here and in `lines` in viewer/app.js (preflight checks both).
+PAGE_LINES = {
+    "hello": "Hello, sir.",
+    "unreachable": "I cannot reach the server, sir. Is server.py still running?",
+    "remember_unreachable": "That note did not save, sir. I could not reach the server.",
+    "nothing_to_forget": "There is no new note of yours for me to forget, sir.",
+    "forget_unreachable": "I could not remove that note, sir. I could not reach the server.",
+    "brain_unreachable": "I could not switch brains, sir. I could not reach the server.",
+    "teardown_unreachable": "I could not start the teardown, sir. I could not reach the server.",
+    "cancel_unreachable": "I could not cancel it, sir. I could not reach the server.",
+    "teardown_missing": "I cannot find that teardown on file, sir.",
 }
 # ============================ END OF PERSONA BLOCK ============================
 
@@ -731,7 +753,7 @@ def status_route(query: dict) -> tuple[int, dict]:
     return 200, {"ok": True, "name": "Jarviz", "brain": brain_state(config), "active": active,
                  "brains": brains.describe_all(config), "model": active["model"],
                  "say": LINES["which_brain"].format(brain=active["label"], model=active["model"]),
-                 "graph": GALAXY.meta()}
+                 "lines": PAGE_LINES, "graph": GALAXY.meta()}
 
 
 def brain_route(payload: dict) -> tuple[int, dict]:
@@ -940,6 +962,116 @@ def tag_teardown(argument: str, question: str, session: Session, payload: dict) 
                           headless=payload.get("headless") is True)
 
 
+# ---------------------------------------------------------------------- lock
+# Port 4700 answers every program and every user account on this computer. The page key keeps the
+# others out: a caller without it gets nothing, not the page, not the notes, not the brain.
+#   - The key lives in ONE file in the user's home folder. Other accounts cannot read that folder.
+#   - A browser gets it once, in the address (/?key=...). The server turns it into a cookie that page
+#     scripts cannot read, and sends the browser on to the clean address.
+#   - preflight.py and drill.py read the same file and send the key in a header.
+#   - Before a tool sends the key, it asks the server to PROVE that it holds the key (/lock/proof).
+#     So another program that sits on port 4700 while Jarviz is stopped is never handed the key.
+# The key is never in viewer/, never in a response body and never in the console.
+# What the lock cannot stop:
+#   - A program that runs AS the user. It can read the key file, and config.json too.
+#   - Cookies ignore the port number: another server on 127.0.0.1 that this browser visits can see
+#     the cookie. And the first link (/?key=...) can stay in the history of the user's own browser.
+#   - On Windows the key file is private because the home folder is private (its access list). The
+#     0o600 below does the same work on a Mac or on Linux.
+
+KEY_FILE = Path.home() / ".jarvis-tools" / "page-key"
+KEY_RE = re.compile(r"[A-Za-z0-9_-]{40,100}")
+KEY_COOKIE = "jarviz_key"
+KEY_HEADER = "X-Jarviz-Key"
+KEY_PARAM = "key"                   # /?key=... : the first visit of a browser
+AGAIN_PARAM = "again"               # /?again=1 : the one automatic second try of the locked page
+KEY_COOKIE_AGE_S = 365 * 24 * 3600
+PROOF_ROUTE = "/lock/proof"         # the ONE route that answers before the lock. It shows nothing.
+NONCE_RE = re.compile(r"[A-Za-z0-9_-]{16,64}")
+PAGE_KEY = ""                       # set by main(). Empty means: nobody gets in.
+LOCKED_BODY = {"ok": False, "error": "locked", "answer": LINES["locked"], "nodes": []}
+LOCKED_PAGE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Jarviz is locked</title>{again}
+<style>body{{margin:0;min-height:100vh;display:grid;place-items:center;background:#05070d;color:#c9d6ea;
+font:16px/1.6 system-ui,sans-serif}}main{{max-width:34rem;padding:2rem}}h1{{font-weight:500;color:#fff}}
+code{{background:#111826;padding:.15rem .4rem;border-radius:4px}}</style></head>
+<body><main><h1>Jarviz is locked.</h1>
+<p>This page opens only for you, with your key.</p>
+<p>To open it, double-click <code>start-jarviz.bat</code>.</p>
+<p>Is Jarviz already running? Open a terminal in the Jarviz folder and run
+<code>python server.py --link</code>. Paste the link that it prints into this browser.</p>
+</main></body></html>
+"""
+
+
+def read_page_key() -> str | None:
+    """The key on disk, or None when there is none yet. Reads only: tests use this."""
+    try:
+        text = KEY_FILE.read_text(encoding="ascii").strip()
+    except (OSError, ValueError):
+        return None
+    return text if KEY_RE.fullmatch(text) else None
+
+
+def page_key() -> str:
+    """The key on disk. The first call makes it. Raises OSError when the file cannot be written."""
+    key = read_page_key()
+    if key is not None:
+        return key
+    KEY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    key = secrets.token_urlsafe(32)
+    try:
+        handle = os.open(KEY_FILE, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        # Another start made the file in this same moment: its key wins, so both hold the same one.
+        time.sleep(0.3)
+        stored = read_page_key()
+        if stored is not None:
+            return stored
+        handle = os.open(KEY_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)     # the file held no key
+    with os.fdopen(handle, "w", encoding="ascii") as file:
+        file.write(key + "\n")
+    return key
+
+
+def key_matches(given: str | None) -> bool:
+    """True only for the page key. The compare takes the same time for a near miss as for a far one."""
+    if not PAGE_KEY or not given:
+        return False
+    return hmac.compare_digest(given.encode("utf-8", "replace"), PAGE_KEY.encode("ascii"))
+
+
+def key_proof(key: str, nonce: str) -> str:
+    """A text that only a holder of the key can work out for this nonce. It does not give the key away,
+    and the lock never accepts it in place of the key."""
+    return hmac.new(key.encode("ascii"), b"jarviz-proof:" + nonce.encode("ascii"), "sha256").hexdigest()
+
+
+def listener_holds(key: str, timeout: float = 5.0) -> bool | None:
+    """Ask the program on port 4700 to prove that it holds the page key, BEFORE the key is sent to it.
+    True: it is this user's Jarviz. False: a program answers there and it is not. None: nothing answers."""
+    nonce = secrets.token_urlsafe(24)
+    connection = http.client.HTTPConnection(HOST, PORT, timeout=timeout)
+    try:
+        connection.request("GET", f"{PROOF_ROUTE}?nonce={nonce}")
+        body = connection.getresponse().read(4096)
+    except (OSError, http.client.HTTPException):
+        return None
+    finally:
+        connection.close()
+    try:
+        proof = json.loads(body.decode("utf-8")).get("proof")
+    except (ValueError, AttributeError):
+        return False
+    return isinstance(proof, str) and hmac.compare_digest(proof.encode("utf-8", "replace"),
+                                                         key_proof(key, nonce).encode("ascii"))
+
+
+def unlock_link() -> str:
+    return f"http://{HOST}:{PORT}/?{KEY_PARAM}={PAGE_KEY}"
+
+
 TAG_HANDLERS = {"REMEMBER": tag_remember, "TEARDOWN": tag_teardown}    # every tag needs an entry in TAG_INTENT too
 GET_ROUTES = {"/status": status_route, "/search": search_route, "/teardown/diag": teardown_diag_route,
               "/teardown/status": teardown_status_route, "/teardown/last": teardown_last_route,
@@ -973,6 +1105,13 @@ class Handler(BaseHTTPRequestHandler):
         if not self._host_ok() or not self._own_page():
             return
         path, _, query = self.path.partition("?")
+        pairs = parse_qsl(query, keep_blank_values=True)
+        if path == PROOF_ROUTE:
+            return self._prove(pairs)
+        if path == "/" and any(name in (KEY_PARAM, AGAIN_PARAM) for name, _ in pairs):
+            return self._door(pairs)
+        if not self._unlocked():
+            return self._refuse_locked(path, pairs)
         route = GET_ROUTES.get(path)
         if route:
             return self._run(route, parse_qs(query))
@@ -988,6 +1127,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         if not self._host_ok() or not self._same_origin():
             return
+        if not self._unlocked():
+            return self._send_json(403, LOCKED_BODY)
         route = POST_ROUTES.get(self.path.partition("?")[0])
         if route is None:
             return self._send_json(404, {"ok": False, "error": "not_found"})
@@ -1032,6 +1173,50 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(403, {"ok": False, "error": "forbidden_origin"})
         return False
 
+    def _unlocked(self) -> bool:
+        """The page lock. This is the ONE place that decides whether a caller holds the page key."""
+        given = self.headers.get(KEY_HEADER)
+        if given is not None:
+            return key_matches(given)
+        # Every cookie with our name is tried. Cookies ignore the port, so another local server can
+        # plant a wrong one beside the right one. That must not lock the owner out.
+        for part in ";".join(self.headers.get_all("Cookie") or []).split(";"):
+            name, _, value = part.strip().partition("=")
+            if name == KEY_COOKIE and key_matches(value):
+                return True
+        return False
+
+    def _prove(self, pairs: list[tuple[str, str]]) -> None:
+        """The one answer given before the lock: proof that THIS server holds the page key. A tool asks
+        for it before it sends the key. The answer shows nothing about the key and opens nothing."""
+        nonce = next((value for name, value in pairs if name == "nonce"), "")
+        if not PAGE_KEY or not NONCE_RE.fullmatch(nonce):
+            return self._send_json(400, {"ok": False, "error": "bad_nonce"})
+        self._send_json(200, {"ok": True, "proof": key_proof(PAGE_KEY, nonce)})
+
+    def _door(self, pairs: list[tuple[str, str]]) -> None:
+        """The start page with a key (or a second try) in its address. The right key becomes a cookie,
+        and the browser goes on to the clean address. So the key does not stay in the address bar."""
+        given = next((value for name, value in pairs if name == KEY_PARAM), None)
+        if not key_matches(given) and not self._unlocked():
+            return self._refuse_locked("/", pairs)
+        rest = urlencode([(name, value) for name, value in pairs if name not in (KEY_PARAM, AGAIN_PARAM)])
+        cookie = f"{KEY_COOKIE}={PAGE_KEY}; Path=/; Max-Age={KEY_COOKIE_AGE_S}; HttpOnly; SameSite=Strict"
+        self._send(303, b"", "text/plain; charset=utf-8",
+                   extra=(("Location", "/?" + rest if rest else "/"), ("Set-Cookie", cookie)))
+
+    def _refuse_locked(self, path: str, pairs: list[tuple[str, str]]) -> None:
+        """No key: a plain page that says what to do (for the start page), or one line of JSON."""
+        if path not in ("/", "/index.html"):
+            return self._send_json(403, LOCKED_BODY)
+        again = ""
+        if not any(name in (KEY_PARAM, AGAIN_PARAM) for name, _ in pairs):
+            # A link on another website does not carry the cookie (SameSite=Strict). One reload from
+            # this page does. So the owner gets in, and a stranger sees the locked page.
+            rest = urlencode([(AGAIN_PARAM, "1"), *pairs])
+            again = f'\n<meta http-equiv="refresh" content="0; url=/?{html_escape(rest)}">'
+        self._send(403, LOCKED_PAGE.format(again=again).encode("utf-8"), "text/html; charset=utf-8")
+
     def _same_origin(self) -> bool:
         """Refuse POSTs sent by other websites open in the same browser."""
         origin = self.headers.get("Origin")
@@ -1064,12 +1249,12 @@ class Handler(BaseHTTPRequestHandler):
     def _send_json(self, status: int, body: dict) -> None:
         self._send(status, json.dumps(body, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
 
-    def _send(self, status: int, data: bytes, content_type: str) -> None:
+    def _send(self, status: int, data: bytes, content_type: str, extra: tuple = ()) -> None:
         try:
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(data)))
-            for name, value in SECURITY_HEADERS:
+            for name, value in (*SECURITY_HEADERS, *extra):
                 self.send_header(name, value)
             self.end_headers()
             self.wfile.write(data)
@@ -1095,6 +1280,20 @@ class Server(ThreadingHTTPServer):
 
 
 def main(argv: list[str]) -> int:
+    global PAGE_KEY
+    if "--link" in argv:            # for a Jarviz that is already running: never makes a key, never starts a server
+        PAGE_KEY = read_page_key() or ""
+        running = listener_holds(PAGE_KEY) if PAGE_KEY else None
+        if running is True:
+            print(f"{unlock_link()}\n\nPaste this link into your browser. It opens your notes, so keep it to yourself.")
+            return 0
+        if running is False:
+            print(f"A program answers on port {PORT}, but it did not prove that it is your Jarviz. The link is not "
+                  "shown.\nStop that program. Then start Jarviz: start-jarviz.bat", file=sys.stderr)
+        else:
+            print("Jarviz is not running, or it has no key file yet. Start it first: start-jarviz.bat",
+                  file=sys.stderr)
+        return 1
     config = load_config()
     notes_dir = build.resolve_notes_dir(config["notes_dir"])
     if not notes_dir.is_dir():
@@ -1105,7 +1304,13 @@ def main(argv: list[str]) -> int:
     except OSError:
         print(f"Port {PORT} is busy. Jarviz may already be running. Close it, then start again.", file=sys.stderr)
         return 1
-    if teardown is not None:        # only now, as the one running Jarviz: clear what a crash may have left behind
+    lock = "on"                     # only now, as the one running Jarviz: read the key, or make the first one
+    try:
+        PAGE_KEY = page_key()
+    except OSError:                 # no place to keep it: a key for this run only, given to --open
+        PAGE_KEY = secrets.token_urlsafe(32)
+        lock = f"on, for this run only (cannot write {KEY_FILE}). Start with: python server.py --open"
+    if teardown is not None:        # ...and clear what a crash may have left behind
         teardown.sweep()
     url = f"http://{HOST}:{PORT}"
     active = brains.describe(config)
@@ -1119,9 +1324,13 @@ def main(argv: list[str]) -> int:
     print(f"Jarviz is up: {url}\n  notes: {len(GALAXY.notes)} from {notes_dir}\n"
           f"  brain: {active['label']} / {active['model']} - {state}\n  other brains: {others}\n"
           f"  teardown kit: {kit}\n"
-          f"  test tab: {url}/?mute=1\nPress Ctrl+C to stop.", flush=True)
+          f"  page lock: {lock}\n"
+          f"  test tab: {url}/?mute=1\n"
+          f"A browser that this page never opened in shows \"Jarviz is locked\". Unlock it once:\n"
+          f"  start-jarviz.bat (or: python server.py --open), or paste the link from: python server.py --link\n"
+          f"Press Ctrl+C to stop.", flush=True)
     if "--open" in argv:
-        threading.Timer(0.5, webbrowser.open, args=(url,)).start()
+        threading.Timer(0.5, webbrowser.open, args=(unlock_link(),)).start()
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

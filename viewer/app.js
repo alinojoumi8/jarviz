@@ -533,10 +533,30 @@
     $('brain').hidden = false;
   }
 
+  // What the page says by itself. The words belong to the persona block in server.py (PAGE_LINES)
+  // and come with /status. These plain ones have no character: they are used only until the server
+  // has answered once.
+  const lines = {
+    hello: 'Hello.',
+    unreachable: 'I cannot reach the server. Is server.py still running?',
+    remember_unreachable: 'That note did not save. I could not reach the server.',
+    nothing_to_forget: 'There is no new note of yours to forget.',
+    forget_unreachable: 'I could not remove that note. I could not reach the server.',
+    brain_unreachable: 'I could not switch brains. I could not reach the server.',
+    teardown_unreachable: 'I could not start the teardown. I could not reach the server.',
+    cancel_unreachable: 'I could not cancel it. I could not reach the server.',
+    teardown_missing: 'I cannot find that teardown on file.',
+  };
+
   async function readStatus() {
     const response = await fetch('/status', { cache: 'no-store' });
     const status = await response.json();
+    if (status.ok === false) return status;         // the page has lost its key: the caller shows status.answer
     showBrain(status.active);
+    const spoken = status.lines || {};
+    for (const name of Object.keys(lines)) {
+      if (typeof spoken[name] === 'string' && spoken[name]) lines[name] = spoken[name];
+    }
     return status;
   }
 
@@ -649,6 +669,7 @@
 
   let inFlight = null;
   let lastCapture = null;
+  let touched = false;          // the user has said or typed something: a late greeting must not cover the answer
 
   async function post(path, body) {
     if (inFlight) inFlight.abort();                   // a new sentence replaces the one still in the air
@@ -706,25 +727,25 @@
   const HIDDEN_BROWSER = /[?&]headless=1(?:&|$)/.test(window.location.search);
 
   const askBrain = text => send('/chat', { message: text, session: SESSION, headless: HIDDEN_BROWSER },
-    'I cannot reach the server, sir. Is server.py still running?');
+    lines.unreachable);
 
-  const remember = fact => send('/remember', { text: fact, session: SESSION },
-    'That note did not save, sir. I could not reach the server.');
+  const remember = fact => send('/remember', { text: fact, session: SESSION }, lines.remember_unreachable);
 
   function forgetLast() {
-    if (!lastCapture) return say('There is no new note of yours for me to forget, sir.');
+    if (!lastCapture) return say(lines.nothing_to_forget);
     return send('/forget', { index: lastCapture.index, label: lastCapture.title, session: SESSION },
-      'I could not remove that note, sir. I could not reach the server.');
+      lines.forget_unreachable);
   }
 
-  const switchBrain = name => send('/brain', { name },
-    'I could not switch brains, sir. I could not reach the server.');
+  const switchBrain = name => send('/brain', { name }, lines.brain_unreachable);
 
   async function whichBrain() {
     try {
-      say((await readStatus()).say);
+      const status = await readStatus();
+      if (status.ok === false) return say(status.answer || lines.unreachable, true);
+      say(status.say);
     } catch (error) {
-      say('I cannot reach the server, sir. Is server.py still running?', true);
+      say(lines.unreachable, true);
     }
   }
 
@@ -742,7 +763,6 @@
 
   const Teardown = (() => {
     const POLL_MS = 700;
-    const UNREACHABLE = 'I cannot reach the server, sir. Is server.py still running?';
     const born = new Set();     // jobs whose notes this tab already put in the galaxy
     let following = null;       // the id of the job this tab watches
     let timer = null;
@@ -860,10 +880,11 @@
         misses = 0;
       } catch (error) {
         misses += 1;
-        if (misses > 8) { following = null; return say(UNREACHABLE, true); }
+        if (misses > 8) { following = null; return say(lines.unreachable, true); }
         timer = setTimeout(poll, POLL_MS * 3);
         return;
       }
+      if (status.ok === false) { following = null; return say(status.answer || lines.unreachable, true); }
       const job = status.job;
       if (!job || job.id !== following) { following = null; return; }
       if (job.state === 'running') {
@@ -893,10 +914,9 @@
 
     const start = hit => send('/teardown/start',
       { site: hit.site, question: hit.question, session: SESSION, headless: HIDDEN_BROWSER },
-      'I could not start the teardown, sir. I could not reach the server.');
+      lines.teardown_unreachable);
 
-    const cancel = () => send('/teardown/cancel', { session: SESSION },
-      'I could not cancel it, sir. I could not reach the server.');
+    const cancel = () => send('/teardown/cancel', { session: SESSION }, lines.cancel_unreachable);
 
     async function loadLast() {
       const reply = await fetchJson('/teardown/last');
@@ -908,7 +928,7 @@
       try {
         say((await loadLast()).answer || '');
       } catch (error) {
-        say(UNREACHABLE, true);
+        say(lines.unreachable, true);
       }
     }
 
@@ -933,7 +953,7 @@
           if (!reply.card) return say(reply.answer || '');
         }
         const note = await fetchJson('/teardown/note?name=' + encodeURIComponent(card.name));
-        if (!note.ok) return say('I cannot find that teardown on file, sir.', true);
+        if (!note.ok) return say(note.answer || lines.teardown_missing, true);
         $('reader-title').textContent = note.label;
         const text = String(note.text).replace(/^#\s+.*\n+/, '');         // the title is already on top
         Markdown.render($('reader-body'), text, {
@@ -947,7 +967,7 @@
         $('reader-body').scrollTop = 0;
         fit();
       } catch (error) {
-        say(UNREACHABLE, true);
+        say(lines.unreachable, true);
       }
     }
 
@@ -977,6 +997,7 @@
   function handleInput(raw) {
     const text = String(raw || '').replace(/\s+/g, ' ').trim();
     if (!text) return null;
+    touched = true;
     showHeard(text);
     const route = router.match(text);
     return route ? route.handler(route.hit, text) : askBrain(text);
@@ -1037,8 +1058,12 @@
     const muted = Core.isMuted(window.location.search);
     $('muted').hidden = !muted;
     if (muted || !window.speechSynthesis) $('hint').hidden = true;
-    say('Hello, sir.');
-    readStatus().catch(error => console.warn('Could not read the server status', error));
+    try {
+      await readStatus();               // the greeting is one of the persona's lines: it comes with the status
+    } catch (error) {
+      console.warn('Could not read the server status', error);
+    }
+    if (!touched) say(lines.hello);     // the user was faster than the status: their answer stays
     Teardown.resume();
 
     // For tests.

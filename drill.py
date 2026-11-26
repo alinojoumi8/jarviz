@@ -4,10 +4,14 @@
     python drill.py --site igloo.inc   use another public page for the live part (default: example.com)
     python drill.py --offline          only the fast checks: no browser, no network, no server
     python drill.py --keep FOLDER      copy the test note and its snapshot to FOLDER before they are removed
+    python drill.py --visible          the same drill with the browser window on screen (a person starts this one)
 
-The live part runs ONE real teardown with a hidden browser. Before it, the drill records the galaxy
+The live part runs ONE real teardown with a hidden browser, then one that is cancelled and one of an
+address where nothing answers. Before it, the drill records the galaxy (every note and every link)
 and the teardowns folder. After it, the drill removes the files that its own test made (and only
 those) and builds the galaxy again from the notes. So your first real teardown is truly the first.
+Jarviz keeps no log of what was said on disk: the drill talks in a session of its own, and that
+session is gone when the server stops.
 """
 from __future__ import annotations
 
@@ -15,6 +19,7 @@ import http.client
 import re
 import secrets
 import shutil
+import socket
 import sys
 import time
 from pathlib import Path
@@ -30,6 +35,7 @@ LIVE_LIMIT_S = 240          # the whole live teardown must end inside this time
 GOOD_TIME_S = 150           # ...and a healthy one is faster than this
 call, call_json = preflight.call, preflight.call_json
 SERVER_GONE = (OSError, http.client.HTTPException)
+VISIBLE = False             # --visible: the one drill with a browser window on screen
 
 
 class Report(preflight.Report):
@@ -99,26 +105,50 @@ def nothing_left(report: Report, when: str) -> None:
                    f"{len(chromes)} Chrome processes, {len(profiles)} profile folders" if chromes or profiles else "")
 
 
+def shape(graph: dict) -> tuple[list[str], list[tuple[str, str]]]:
+    """The galaxy without its numbers: every note by folder and name, every link by its two notes.
+    A galaxy that is built again can number the same notes in another order. The shape stays."""
+    nodes = graph.get("nodes", [])
+    names = [f"{node.get('group')}/{node.get('label')}" for node in nodes]
+
+    def end(value) -> str:
+        return names[value] if isinstance(value, int) and 0 <= value < len(names) else "?"
+
+    links = sorted(tuple(sorted((end(link.get("source")), end(link.get("target"))))) for link in graph.get("links", []))
+    return sorted(names), links
+
+
 def record() -> dict:
-    """How things are before a test teardown: the notes in the galaxy and the teardowns folder."""
+    """How things are before a test teardown: the notes and links in the galaxy, and the teardowns folder."""
     notes_dir = build.resolve_notes_dir(server.load_config()["notes_dir"])
     folder = notes_dir / teardown.TEARDOWNS_DIR
     watched = (notes_dir / "captures", folder, folder / teardown.ASSETS_DIR)
-    return {"notes_dir": str(notes_dir), "labels": [node.get("label") for node in build.read_graph().get("nodes", [])],
-            "tree": tree(folder), "folders": {str(path): path.is_dir() for path in watched}}
+    graph = build.read_graph()
+    return {"notes_dir": str(notes_dir), "labels": [node.get("label") for node in graph.get("nodes", [])],
+            "shape": shape(graph), "tree": tree(folder), "folders": {str(path): path.is_dir() for path in watched}}
+
+
+def closed_port() -> int:
+    """A port on this computer where nothing answers."""
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
 
 
 def made_by(job: dict) -> list[str]:
-    """The files one finished test teardown made, as paths inside the notes folder. Nothing else is ever removed."""
+    """The files one test teardown made, as paths inside the notes folder. Nothing else is ever removed.
+    A job that failed half way can have made the Jarviz note or the REA note: the job lists every birth."""
     result = job.get("result") or {}
     name = result.get("name")
-    if job.get("state") != "done" or not teardown.valid_name(name):
-        return []
-    files = [f"{teardown.TEARDOWNS_DIR}/{name}.md"]
-    if result.get("snapshot"):
-        files.append(f"{teardown.TEARDOWNS_DIR}/{teardown.ASSETS_DIR}/{name}.png")
-    if any(birth.get("file") == teardown.CONCEPT_PATH for birth in result.get("births") or []):
-        files.append(teardown.CONCEPT_PATH)             # the REA note, only when THIS job made it
+    files = []
+    if job.get("state") == "done" and teardown.valid_name(name):
+        files.append(f"{teardown.TEARDOWNS_DIR}/{name}.md")
+        if result.get("snapshot"):
+            files.append(f"{teardown.TEARDOWNS_DIR}/{teardown.ASSETS_DIR}/{name}.png")
+    births = [birth for birth in (job.get("births") or result.get("births") or []) if isinstance(birth, dict)]
+    for concept in (teardown.CONCEPT_PATH, teardown.OWNER_PATH):
+        if any(birth.get("file") == concept for birth in births):
+            files.append(concept)                       # the REA note or the Jarviz note, only when THIS job made it
     return files
 
 
@@ -151,18 +181,22 @@ def put_back(state: dict, made: list[str]) -> tuple[bool, str]:
     except SERVER_GONE:
         count = None
         trouble.append("the server did not answer, so it still holds the old galaxy. Restart it")
-    labels = [node.get("label") for node in build.read_graph().get("nodes", [])]
-    if labels != state["labels"]:
-        trouble.append(f"the galaxy has {len(labels)} notes, it had {len(state['labels'])}")
+    graph = build.read_graph()
+    labels = [node.get("label") for node in graph.get("nodes", [])]
+    notes, links = shape(graph)
+    if notes != state["shape"][0]:
+        trouble.append(f"the galaxy does not hold the same notes ({len(labels)} now, {len(state['labels'])} before)")
+    elif links != state["shape"][1]:
+        trouble.append(f"the galaxy does not hold the same links ({len(links)} now, {len(state['shape'][1])} before)")
     elif count is not None and count != len(labels):
         trouble.append(f"the server holds {count} notes, the file has {len(labels)}")
     if tree(folder) != state["tree"]:
         trouble.append("the teardowns folder is not as it was")
-    return not trouble, "; ".join(trouble) or f"{len(labels)} notes"
+    return not trouble, "; ".join(trouble) or f"{len(labels)} notes and {len(links)} links, as before"
 
 
 def start(site: str, session: str, question: str = "") -> tuple[int, dict, str]:
-    body = {"site": site, "session": session, "headless": True}
+    body = {"site": site, "session": session, "headless": not VISIBLE}
     if question:
         body["question"] = question
     status, started = call_json("POST", "/teardown/start", body)
@@ -270,6 +304,22 @@ def live(report: Report, site: str, keep: Path | None) -> None:
             nothing_left(report, "after a cancelled run")
         else:
             report.add(FAIL, "A cancelled teardown stops and writes nothing", f"it did not start: HTTP {status}")
+
+        # -- a job that fails half way must close its browser too. Nothing answers at this address.
+        failing = "A teardown of an address where nothing answers fails with a reason and writes nothing"
+        status, started, fourth = start(f"localhost:{closed_port()}", session)
+        if status == 200 and fourth:
+            ours.append(fourth)
+            failed = wait_for_end(fourth, 90)
+            made += made_by(failed)
+            error = failed.get("error") or {}
+            report.add(PASS if failed.get("state") == "failed" and error.get("code") == "site_silent"
+                       and tree(folder) == tree_after_run else FAIL, failing,
+                       f"state {failed.get('state')}: {teardown._clean(error.get('detail'), 90)}")
+            time.sleep(1.0)
+            nothing_left(report, "after a failed run")
+        else:
+            report.add(FAIL, failing, f"it did not start: HTTP {status}")
     finally:
         # -- put everything back, whatever happened above. Only the files of this drill's own jobs go.
         try:
@@ -283,13 +333,15 @@ def live(report: Report, site: str, keep: Path | None) -> None:
 
 
 def main(argv: list[str]) -> int:
+    global VISIBLE
+    VISIBLE = "--visible" in argv
     report = Report()
     site = argv[argv.index("--site") + 1] if "--site" in argv[:-1] else "example.com"
     keep = Path(argv[argv.index("--keep") + 1]).resolve() if "--keep" in argv[:-1] else None
     print(f"Jarviz teardown drill  {time.strftime('%Y-%m-%d %H:%M:%S')}\n\nOffline checks")
     offline(report)
     if "--offline" not in argv:
-        print(f"\nLive drill: one hidden teardown of {site}")
+        print(f"\nLive drill: one {'visible' if VISIBLE else 'hidden'} teardown of {site}")
         if teardown.parse_site(site) is None:
             report.add(FAIL, "The drill site is a website address", site)
         elif not preflight.check_server(report):

@@ -137,20 +137,42 @@ class Report:
         return f"PREFLIGHT: {self.counts[PASS]} pass, {self.counts[FAIL]} fail, {self.counts[WARN]} warn"
 
 
-def call(method: str, path: str, body: dict | None = None, timeout: float = 150,
-         extra_headers: dict | None = None) -> tuple[int, bytes]:
-    """One raw HTTP call to the running server. The path is sent exactly as given."""
+_PAGE_KEY: list[str] = []
+
+
+def page_key() -> str:
+    """The page key from its file, read once. It is "" when there is no key yet, and also when the
+    program on the port cannot prove that it is this user's Jarviz: a stranger there is never sent the key."""
+    if not _PAGE_KEY:
+        key = server.read_page_key() or ""
+        _PAGE_KEY.append(key if key and server.listener_holds(key) is True else "")
+    return _PAGE_KEY[0]
+
+
+def call_full(method: str, path: str, body: dict | None = None, timeout: float = 150,
+              extra_headers: dict | None = None, key: bool = True) -> tuple[int, dict, bytes]:
+    """One raw HTTP call to the running server. The path is sent exactly as given, and a redirect is
+    not followed. The call carries the page key, as the user's own browser does, unless `key` is False.
+    Returns the status, the response headers (lower-case names) and the body."""
     connection = http.client.HTTPConnection(server.HOST, server.PORT, timeout=timeout)
     try:
         headers, data = dict(extra_headers or {}), None
+        if key and page_key():
+            headers.setdefault(server.KEY_HEADER, page_key())
         if body is not None:
             data = json.dumps(body).encode("utf-8")
             headers["Content-Type"] = "application/json"
         connection.request(method, path, body=data, headers=headers)
         response = connection.getresponse()
-        return response.status, response.read()
+        return response.status, {name.lower(): value for name, value in response.getheaders()}, response.read()
     finally:
         connection.close()
+
+
+def call(method: str, path: str, body: dict | None = None, timeout: float = 150,
+         extra_headers: dict | None = None, key: bool = True) -> tuple[int, bytes]:
+    status, _, raw = call_full(method, path, body, timeout, extra_headers, key)
+    return status, raw
 
 
 def call_json(method: str, path: str, body: dict | None = None) -> tuple[int, dict]:
@@ -175,6 +197,10 @@ def check_server(report: Report) -> bool:
     except OSError as error:
         return report.add(FAIL, "Server is up and serving the viewer",
                           f"No answer on http://{server.HOST}:{server.PORT} ({error.strerror or error}). Start it: python server.py")
+    if not page_key():
+        return report.add(FAIL, "Server is up and serving the viewer",
+                          f"The program on port {server.PORT} did not prove that it is your Jarviz, so the page key was "
+                          "not sent to it. Stop that program and start Jarviz again: python server.py")
     ok = status == 200 and b'id="graph"' in page and b"<title>Jarviz</title>" in page
     return report.add(PASS if ok else FAIL, "Server is up and serving the viewer",
                       "" if ok else f"GET / gave {status}, and it is not the Jarviz page. Is another program on port {server.PORT}?")
@@ -391,6 +417,109 @@ def check_other_sites(report: Report) -> None:
                "LET IN: " + "; ".join(let_in) if let_in else f"{len(attempts)} ways tried, all refused")
 
 
+def check_lock(report: Report) -> None:
+    """Another program or another account on this computer must get nothing without the page key."""
+    name = "Without your page key, a caller gets nothing"
+    key = page_key()
+    if not key:
+        report.add(FAIL, name, f"No page key on disk ({server.KEY_FILE}). Stop the server and start it again.")
+        return
+    secret, wrong = key.encode("ascii"), "x" * len(key)
+    nothing = {"message": "", "session": "preflight-outsider"}      # empty: it can never reach the brain
+
+    def outsider(method: str, path: str, body: dict | None = None, headers: dict | None = None):
+        return call_full(method, path, body, timeout=10, extra_headers=headers, key=False)
+
+    def refused(status: int, body: bytes) -> bool:
+        """Only the locked answer counts: the locked page, or the one locked line of JSON. No key in it."""
+        if status != 403 or secret in body:
+            return False
+        if b"<title>Jarviz is locked</title>" in body:
+            return b"<title>Jarviz</title>" not in body and b'id="graph"' not in body
+        try:
+            return json.loads(body.decode("utf-8")) == server.LOCKED_BODY
+        except ValueError:
+            return False
+
+    # Empty sites, empty texts and empty names: none of these could do anything if the lock were broken.
+    attempts = {
+        "the page": outsider("GET", "/"),
+        "the page by its file name": outsider("GET", "/index.html"),
+        "the page script": outsider("GET", "/app.js"),
+        "the index of the notes": outsider("GET", "/graph-data.js"),
+        "the status": outsider("GET", "/status"),
+        "a search in the notes": outsider("GET", "/search?q=coffee"),
+        "a question to the brain": outsider("POST", "/chat", nothing),
+        "a new note": outsider("POST", "/remember", {"text": ""}),
+        "a change of brain": outsider("POST", "/brain", {"brain": ""}),
+        "a teardown": outsider("POST", "/teardown/start", {"site": ""}),
+        "the last teardown": outsider("GET", "/teardown/last"),
+        "a wrong key in the header": outsider("GET", "/status", headers={server.KEY_HEADER: wrong}),
+        "a wrong key in the cookie": outsider("GET", "/status", headers={"Cookie": f"{server.KEY_COOKIE}={wrong}"}),
+        "a wrong key in the address": outsider("GET", f"/?{server.KEY_PARAM}={wrong}"),
+        "a key that is one letter short": outsider("GET", "/status", headers={server.KEY_HEADER: key[:-1]}),
+        "a second try without a key": outsider("GET", f"/?{server.AGAIN_PARAM}=1"),
+        "a wrong cookie beside nothing else": outsider("GET", "/status", headers={
+            "Cookie": f"other=1; {server.KEY_COOKIE}={wrong}; {server.KEY_COOKIE}="}),
+    }
+    trouble = ["LET IN: " + what for what, (status, _, body) in attempts.items() if not refused(status, body)]
+
+    # The right key, the way a browser brings it: once in the address, then as a cookie.
+    # (No address is printed below: a wrong redirect could still have the key in it.)
+    status, headers, _ = outsider("GET", f"/?{server.KEY_PARAM}={key}&mute=1")
+    cookie = headers.get("set-cookie", "")
+    if status != 303 or headers.get("location") != "/?mute=1":
+        trouble.append(f"the right key in the address gave {status} and did not go on to the clean address")
+    if not cookie.startswith(f"{server.KEY_COOKIE}={key};") or "HttpOnly" not in cookie or "SameSite=Strict" not in cookie:
+        trouble.append("the cookie is not set as HttpOnly and SameSite=Strict")
+    status, _, page = outsider("GET", "/", headers={"Cookie": f"{server.KEY_COOKIE}={key}"})
+    if status != 200 or b"<title>Jarviz</title>" not in page:
+        trouble.append(f"the right cookie did not open the page (HTTP {status})")
+    # Another local server can plant a wrong cookie with our name beside the right one. The owner still gets in.
+    status, _, _ = outsider("GET", "/status", headers={"Cookie": f"{server.KEY_COOKIE}={wrong}; {server.KEY_COOKIE}={key}"})
+    if status != 200:
+        trouble.append(f"a planted wrong cookie locks the owner out (HTTP {status})")
+    # The proof that a tool asks for before it sends the key: right for the key, wrong for any other, and no key in it.
+    status, _, proof = outsider("GET", f"{server.PROOF_ROUTE}?nonce={'n' * 32}")
+    if status != 200 or secret in proof or server.listener_holds(key) is not True or server.listener_holds(wrong) is not False:
+        trouble.append("the server's proof that it holds the key does not work")
+    if outsider("GET", server.PROOF_ROUTE)[0] != 400 or outsider("GET", f"{server.PROOF_ROUTE}?nonce=short")[0] != 400:
+        trouble.append("the proof route takes a bad nonce")
+
+    # The key itself is never inside anything the server sends, and never inside viewer/.
+    shown = [path for path in ("/", "/app.js", "/core.js", "/graph-data.js", "/status", "/teardown/diag")
+             if secret in call("GET", path, timeout=10)[1]]
+    shown += ["viewer/" + path.relative_to(server.VIEWER_ROOT).as_posix()
+              for path in sorted(server.VIEWER_ROOT.rglob("*")) if path.is_file() and secret in path.read_bytes()]
+    if shown:
+        trouble.append("THE KEY IS SHOWN in " + ", ".join(shown))
+    report.add(FAIL if trouble else PASS, name,
+               "; ".join(trouble) if trouble else f"{len(attempts)} ways tried without it, all refused. With it, the page opens.")
+
+
+def check_persona_home(report: Report) -> None:
+    """The character lives in the persona block of server.py. The page has no butler words of its own."""
+    name = "The butler's words live in server.py only: the page gets them with /status"
+    trouble = []
+    script = (server.VIEWER_ROOT / "app.js").read_text(encoding="utf-8")
+    table = re.search(r"const lines = \{(.*?)\n  \};", script, re.DOTALL)
+    named = set(re.findall(r"^\s*(\w+):", table.group(1), re.MULTILINE)) if table else set()
+    used = set(re.findall(r"\blines\.(\w+)", script))
+    if named != set(server.PAGE_LINES):
+        trouble.append("`lines` in viewer/app.js and PAGE_LINES in server.py do not name the same lines: "
+                       + ", ".join(sorted(named ^ set(server.PAGE_LINES))))
+    if used - named:
+        trouble.append("the page uses a line that has no words: " + ", ".join(sorted(used - named)))
+    for path in sorted(server.VIEWER_ROOT.glob("*")):
+        if path.suffix.lower() in (".js", ".html") and path.name != build.GRAPH_PATH.name:
+            if re.search(r"\bsir\b", path.read_text(encoding="utf-8", errors="replace"), re.IGNORECASE):
+                trouble.append(f"viewer/{path.name} has a butler line of its own (\"sir\")")
+    _, status = call_json("GET", "/status")
+    if status.get("lines") != server.PAGE_LINES:
+        trouble.append("/status does not give the page its lines. Start the server again")
+    report.add(FAIL if trouble else PASS, name, "; ".join(trouble) if trouble else f"{len(named)} lines")
+
+
 def check_pinned_libraries(report: Report) -> None:
     name = "The two outside libraries are pinned and match the security policy"
     _, page = call("GET", "/")
@@ -526,6 +655,8 @@ def main() -> int:
         check_served_files(report)
         check_config_hidden(report, ctx)
         check_other_sites(report)
+        check_lock(report)
+        check_persona_home(report)
         check_pinned_libraries(report)
         check_voice_rules(report, ctx)
         check_teardown_kit(report)

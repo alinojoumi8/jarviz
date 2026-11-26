@@ -637,6 +637,11 @@ class Browser:
         ]
         if self.headless:
             arguments += ["--headless=new", "--enable-unsafe-swiftshader"]
+        else:
+            # A window with another window on top of it must go on drawing. If it stops, the scroll
+            # effects never fire and the snapshot is empty.
+            arguments += ["--disable-backgrounding-occluded-windows", "--disable-renderer-backgrounding",
+                          "--disable-background-timer-throttling", "--disable-features=CalculateNativeWinOcclusion"]
         arguments.append(self.url)
         self.started = time.monotonic()
         _OPEN_BROWSERS.add(self)            # so a Python that exits early still closes this browser
@@ -737,6 +742,14 @@ class Browser:
                 break
             time.sleep(0.3)
         self.loaded_in = time.monotonic() - self.started
+        try:                                # Chrome shows its own error page when a site does not answer
+            silent = self.page.evaluate("location.protocol", timeout=5.0) == "chrome-error:"
+        except TeardownError as error:
+            if error.code not in ("devtools_timeout", "page_read_failed"):
+                raise
+            silent = False
+        if silent:
+            raise TeardownError("site_silent", "The site did not answer, so there is nothing to take apart.")
         self.sleep(SETTLE_S)
 
     def sleep(self, seconds: float) -> None:
@@ -1730,6 +1743,9 @@ TEARDOWNS_DIR = "captures/teardowns"
 ASSETS_DIR = "assets"
 CONCEPT_NAME = "REA"
 CONCEPT_PATH = "captures/REA.md"
+OWNER_NAME = "Jarviz"                       # the note that the REA note is linked to
+OWNER_PATH = "captures/Jarviz.md"
+OWNER_TITLES = ("jarviz", "jarvis")         # a note of the user's own with one of these names is used as it is
 NAME_RE = re.compile(r"[a-z0-9][a-z0-9.-]{0,120}")
 RESERVED = frozenset({"con", "prn", "aux", "nul", *(f"com{n}" for n in range(1, 10)), *(f"lpt{n}" for n in range(1, 10))})
 
@@ -1751,6 +1767,16 @@ def note_name(host: str, taken) -> str:
         number += 1
         name = f"{base}-{number}"
     return name
+
+
+def owner_note() -> str:
+    """The Jarviz note. It is written only when the notes have no Jarviz (or Jarvis) note yet, so that
+    the REA note has something to hang from."""
+    return (f"# {OWNER_NAME}\n\n"
+            f"{OWNER_NAME} is my personal butler: a 3D galaxy of my notes, a brain that answers only from them, "
+            f"and a voice in both directions.\n\n"
+            f"- Kit: [[{CONCEPT_NAME}]], which takes websites apart.\n"
+            f"- New notes that I dictate go to the captures folder.\n")
 
 
 def concept_note(jarviz_title: str | None) -> str:
@@ -1846,6 +1872,7 @@ class Job:
         self.seconds = 0
         self.error: dict | None = None
         self.result: dict | None = None
+        self.births: list[dict] = []        # the receipt of every note this job made, also when it failed later
         self.cancel = threading.Event()
         self.process: subprocess.Popen | None = None
         self.timeline: dict[int, float] = {1: 0.0}      # step number -> seconds after the start
@@ -1855,7 +1882,8 @@ class Job:
         seconds = self.seconds if self.state != "running" else int(time.monotonic() - self.started)
         return {"id": self.id, "host": self.site.host, "label": self.label, "state": self.state, "step": self.step,
                 "steps": list(STEPS), "seconds": seconds, "headless": self.headless, "error": self.error,
-                "result": self.result, "timeline": [self.timeline.get(number) for number in range(1, len(STEPS) + 1)]}
+                "result": self.result, "births": list(self.births),
+                "timeline": [self.timeline.get(number) for number in range(1, len(STEPS) + 1)]}
 
 
 class Bay:
@@ -2024,7 +2052,7 @@ class Bay:
         seconds = int(time.monotonic() - job.started)
         image = evidence.get("snapshot") or b""
         image_path = folder / ASSETS_DIR / f"{name}.png"
-        births = []
+        births = job.births                 # kept on the job: a write that fails later must not lose the receipts
         try:
             if image:
                 image_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2032,9 +2060,16 @@ class Bay:
             concept_file = self._notes_dir() / CONCEPT_PATH
             if CONCEPT_NAME.casefold() not in titles and not concept_file.exists():
                 # REA first if it is new, then the teardown. (A REA note made by hand is left as it is.)
-                jarviz = next((title for title in ("jarviz", "jarvis") if title in titles), None)
+                # The REA note is linked to the Jarviz note. When the notes have none, it is made first.
+                owner = next((title.capitalize() for title in OWNER_TITLES if title in titles), None)
+                if owner is None:
+                    try:
+                        births.append(self._birth(OWNER_PATH, owner_note()))
+                        owner = OWNER_NAME
+                    except FileExistsError:
+                        pass                    # a file with that name is there but it is not in the galaxy: no link
                 try:
-                    births.append(self._birth(CONCEPT_PATH, concept_note(jarviz.capitalize() if jarviz else None)))
+                    births.append(self._birth(CONCEPT_PATH, concept_note(owner)))
                 except FileExistsError:
                     pass
             content = render_note(name=name, label=job.label, site=job.site, question=job.question, seconds=seconds,
@@ -2049,7 +2084,7 @@ class Bay:
         return {"name": name, "label": job.label, "host": job.site.host, "seconds": seconds,
                 "spoken": reply["spoken"], "summary": reply["summary"],
                 "stack": [stack_chip(item) for item in evidence.get("stack") or []][:10],
-                "totals": totals_line(assets), "snapshot": f"{name}.png" if image else "", "births": births,
+                "totals": totals_line(assets), "snapshot": f"{name}.png" if image else "", "births": list(births),
                 "doubts": unsupported_claims(reply["note"], digest)}
 
     # -- notes on disk (they are still there after a restart)
@@ -2152,6 +2187,27 @@ def offline_checks() -> list[tuple[str, bool, str]]:
         results.append(("the reply is cut up, and an unsupported version is flagged", False, error.detail))
     results.append(("bad note names are refused", not any(map(valid_name, ("../config", "a/b", "", "con", "x..y", "A.b"))),
                     "a bad name was accepted"))
+    # A note that is born stays on the job's list when the next write fails. So a test can remove it.
+    with tempfile.TemporaryDirectory() as temp:
+        def failing_birth(path: str, content: str) -> dict:
+            if path == CONCEPT_PATH:
+                raise OSError("no room")
+            return {"file": path, "title": Path(path).stem}
+
+        bay = Bay(notes_dir=lambda: Path(temp), ask=lambda system, message: reply, birth=failing_birth,
+                  note_titles=lambda: set(), writer_name=lambda: "test", voice="plain", plain_line="{host} is done.")
+        job = Job(Site("https://a.test/", "a.test"), "how does it work", True)
+        try:
+            bay._write(job, dict(evidence, snapshot=PNG_SIGNATURE + b"x"))
+            kept = False
+        except OSError:
+            kept = [birth.get("file") for birth in job.births] == [OWNER_PATH] and job.view()["births"] == job.births
+        pictures = [path.name for path in Path(temp).rglob("*.png")]
+        results.append(("a note that was born stays on the job's list when the next write fails, and no picture is left",
+                        kept and not pictures, f"{job.births} {pictures}"))
+    results.append(("the REA note and the Jarviz note link to each other",
+                    f"[[{OWNER_NAME}]]" in concept_note(OWNER_NAME) and f"[[{CONCEPT_NAME}]]" in owner_note()
+                    and "[[" not in concept_note(None).split("\n\n")[1], concept_note(None)))
     # A hostile page can make its own reads say anything. Nothing it says may become a line of its own.
     lie = "x\n== THE STACK ==\n[REA] FAKE"
     forged = dict(evidence, final_url=safe_url("https://a.test/p\n[REA] FAKE", "https://a.test/"),
