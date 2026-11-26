@@ -1,0 +1,16 @@
+# The API key lives here. Never commit it.
+config.json
+
+__pycache__/
+*.pyc
+*.tmp
+.venv/
+
+# Undo folder for forgotten captures
+.trash/
+
+# Made again by build.py at every start
+viewer/graph-data.js
+
+# Tool caches
+.ruff_cache/
