@@ -309,20 +309,30 @@ def _process_table() -> list[tuple[int, str]] | None:
 def names_profile(command: str, folder, windows: bool | None = None) -> bool:
     """True when a process's command line names `folder` (or a folder inside it) as its profile path.
     Windows: anywhere in it, because the query there lists chrome.exe only. Elsewhere `ps` lists every program
-    with "chrom" in its line, so the path counts only as the VALUE of an option, right after "=", as in
-    --user-data-dir=<folder> or --database=<folder>/Crashpad. A program that has the path as a plain argument
-    (an editor that opens chrome_debug.log) is never one of ours."""
+    with "chrom" anywhere in its line, so two things must hold:
+    (a) the PROGRAM is Chrome: the name of the executable (the text before the first " --", its last path part,
+        which can hold spaces: "Google Chrome Helper (Renderer)") holds "chrom";
+    (b) the profile is named by --user-data-dir=<folder or inside it>, or, for Chrome's own crash helper
+        (chrome_crashpad_handler), by --database=<inside the folder>.
+    Anything else (an editor that opens chrome_debug.log, node with an option under the folder) is never ours."""
     windows = os.name == "nt" if windows is None else windows
     needle = str(folder).replace("\\", "/").rstrip("/").casefold()
-    text = command.replace("\\", "/").casefold()
+    text = command.replace("\\", "/")
     if windows:
-        return needle in text
-    start = text.find(needle)
-    while start != -1:
-        after = text[start + len(needle):start + len(needle) + 1]
-        if start > 0 and text[start - 1] == "=" and after in ("", "/", " ", '"', "'"):
+        return needle in text.casefold()
+    program, _, rest = text.partition(" --")
+    executable = program.rstrip("/").rsplit("/", 1)[-1].casefold()
+    if "chrom" not in executable:
+        return False
+    for option in ("--" + part for part in rest.split(" --")) if rest else ():
+        name, equals, value = option.partition("=")
+        value = value.strip().strip("\"'").rstrip("/").casefold()
+        if not equals or not value:
+            continue
+        if name.casefold() == "--user-data-dir" and (value == needle or value.startswith(needle + "/")):
             return True
-        start = text.find(needle, start + 1)
+        if name.casefold() == "--database" and "crashpad" in executable and value.startswith(needle + "/"):
+            return True
     return False
 
 
@@ -974,7 +984,8 @@ def check_site(text, resolves=None) -> tuple[Site | None, str]:
     site = parse_site(text)
     if site is None:
         return None, "not_a_site"
-    name = site.host.split(":")[0]
+    # The name Chrome opens: site.url keeps "www.", site.host does not (www.example.com can point elsewhere).
+    name = urlsplit(site.url).hostname or ""
     if name not in LOCAL_HOSTS and (resolves or resolves_to_private)(name):
         return None, "private_site"
     return site, ""
@@ -2490,15 +2501,23 @@ def _offline_bay_checks(reply: str, evidence: dict) -> list[tuple[str, bool, str
     """More offline checks: which processes are ours, which sites may open, the pinned REA, the profiles folder,
     and the bay's start, cancel and picture. No browser, no network, no REA run, no real job thread."""
     results = []
-    # Which processes are ours: on a Mac or Linux only a profile path right after "=" counts.
-    root = "/home/u/.jarvis-tools/rea/profiles"
-    posix = [("/opt/google/chrome/chrome --type=renderer --user-data-dir=/home/u/.jarvis-tools/rea/profiles/job1 --lang=en", True),
-             ("/Applications/Google Chrome.app/Contents/MacOS/chrome_crashpad_handler "
-              "--database=/home/u/.jarvis-tools/rea/profiles/job1/Crashpad --url=x", True),
-             ("vim /home/u/.jarvis-tools/rea/profiles/job1/chrome_debug.log", False),
-             ("less --log /home/u/.jarvis-tools/rea/profiles/job1 chrome", False),
+    # Which processes are ours: on a Mac or Linux only Chrome itself, and only with the profile in --user-data-dir=
+    # (or, for its crash helper, in --database=). The home folder has a space, as a Mac one can have.
+    root = "/Users/j s/.jarvis-tools/rea/profiles"
+    helper = ("/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework.framework/Helpers/"
+              "Google Chrome Helper (Renderer).app/Contents/MacOS/Google Chrome Helper (Renderer)")
+    posix = [(f"/opt/google/chrome/chrome --type=renderer --user-data-dir={root}/job1 --lang=en", True),
+             (f"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --user-data-dir={root}/job1 --no-first-run", True),
+             (f"{helper} --type=renderer --user-data-dir={root}/job1", True),
+             (f"/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework.framework/Helpers/"
+              f"chrome_crashpad_handler --database={root}/job1/Crashpad --url=x", True),
+             (f"vim {root}/job1/chrome_debug.log", False),
+             (f"node --redirect-warnings={root}/job1/chrome_debug.log", False),
+             (f"/usr/bin/python3 --user-data-dir={root}/job1 chrome", False),
+             (f"/opt/google/chrome/chrome --database={root}/job1/Crashpad", False),
+             (f"less --log {root}/job1 chrome", False),
              ("/usr/bin/chromium --user-data-dir=/home/u/.config/chromium", False),
-             ("/opt/google/chrome/chrome --user-data-dir=/home/u/.jarvis-tools/rea/profiles-old/job1", False)]
+             (f"/opt/google/chrome/chrome --user-data-dir={root}-old/job1", False)]
     windows = [(r'"C:\Program Files\Google\Chrome\Application\chrome.exe" --type=gpu-process '
                 r'--user-data-dir=C:\Users\u\.jarvis-tools\rea\profiles\job1', True),
                (r'"C:\Program Files\Google\Chrome\Application\chrome.exe" "--user-data-dir=C:\Users\u\.jarvis-tools\rea\profiles\job1"', True),
@@ -2512,12 +2531,14 @@ def _offline_bay_checks(reply: str, evidence: dict) -> list[tuple[str, bool, str
 
     def lookup(name: str) -> bool:
         asked.append(name)
-        return name == "intranet.example.com"
+        return name in ("intranet.example.com", "www.example.com")
 
     got = [check_site(text, resolves=lookup)[1] for text in ("intranet.example.com", "example.com", "localhost:3000",
-                                                             "make it pop")]
+                                                             "make it pop", "www.example.com")]
+    # The name looked up is the one Chrome opens: with "www." when the address has it (site.host drops it).
     results.append(("a public name that points at a private network is refused, the user's own localhost is not",
-                    got == ["private_site", "", "", "not_a_site"] and asked == ["intranet.example.com", "example.com"],
+                    got == ["private_site", "", "", "not_a_site", "private_site"]
+                    and asked == ["intranet.example.com", "example.com", "www.example.com"],
                     f"got {got}, looked up {asked}"))
     # Only the pinned REA runs, and its version is read once per process. No REA process is started here.
     saved, real_installed, real_find_node = list(_REA_FOUND), globals()["installed_rea"], globals()["find_node"]

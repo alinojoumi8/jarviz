@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from urllib.parse import quote
@@ -488,6 +489,9 @@ def check_take_back_safe(report: Report) -> None:
     try:
         with tempfile.TemporaryDirectory() as folder:
             _take_back_steps(Path(folder).resolve(), trouble)
+        # A "build" that is not a text is a bad request, like a bad index. It is refused before the galaxy is read.
+        if server.forget_route({"index": 0, "label": "x", "build": 5})[0] != 400:
+            trouble.append("a forget whose build id is not a text is not refused as a bad request")
     except Exception as error:                      # noqa: BLE001 - a check that stops says so, it never crashes preflight
         trouble.append(f"the check stopped: {type(error).__name__}: {error}")
     finally:
@@ -719,6 +723,22 @@ def _take_back_steps(notes_dir: Path, trouble: list[str]) -> None:
         trouble.append("(e) a note with no fingerprint did not stay")
     true_links("(e)")
 
+    # (i) A forget with the receipt of another galaxy (built again since: another notes folder, or build.py): the
+    # same number and title may be another note. Nothing moves. The receipt of THIS galaxy works.
+    galaxy.build_id = "this-galaxy"
+    capture = galaxy.remember("the till was short on Friday")
+    path, before, trashed = notes_dir / capture["file"], state(), sorted(trash.glob("*"))
+    error = expect("(i) a forget with the build id of another galaxy", ValueError,
+                   lambda: galaxy.forget_last(capture["index"], capture["title"], "another-galaxy"))
+    if state() != before or not path.is_file() or sorted(trash.glob("*")) != trashed:
+        trouble.append("(i) a forget with another galaxy's receipt moved something")
+    if error is not None and "built again" not in str(error):
+        trouble.append(f"(i) the reason does not say that the galaxy was built again: {error}")
+    gone = galaxy.forget_last(capture["index"], capture["title"], "this-galaxy")
+    if path.exists() or gone.get("title") != capture["title"]:
+        trouble.append("(i) a forget with this galaxy's receipt did not work")
+    true_links("(i)")
+
 
 def check_notes_dir_follows_config(report: Report) -> None:
     """After "set notes_dir, run build.py", the running server loads the folder that config.json names NOW, when
@@ -891,7 +911,7 @@ def check_teardown_receipt_turn(report: Report) -> None:
                                                       503, "teardown_not_started")):
             session = server.Session()      # (d) a refused start leaves the session as it was, even a full one
             for number in range(server.HISTORY_TURNS):
-                session.record(f"Question {number}", "An answer.", ["coffee"], [3], labels={3: "Coffee"})
+                session.record(f"Question {number}", "An answer.", ["coffee"], [3], paths={3: "notes/Coffee.md"})
             before = (receipts(session), [turn[0] for turn in session.turns], session.last_tokens, session.last_sources)
             status, body = start(session, _FakeBay(refuse=refusal))
             after = (receipts(session), [turn[0] for turn in session.turns], session.last_tokens, session.last_sources)
@@ -945,6 +965,126 @@ def check_teardown_cancel(report: Report) -> None:
         server.BAY = real_bay
     report.add(FAIL if trouble else PASS, name, "; ".join(trouble) or
                "another id, a bad id and an empty id stop nothing; the own id and no id cancel; failed and done are said")
+
+
+def check_sources_stay_true(report: Report) -> None:
+    """The sources of a reply are the notes the brain was SHOWN, by their identity (the path), also when a new index
+    comes in: (1) two notes with the same title in two folders that swap places are not taken for each other, in
+    the reply and in the session; (2) a reload that comes between the search and the render does not change what
+    the brain is sent; (3) the sources and the graph numbers of one reply come from one state; (4) so do the results
+    and the numbers of /search. Pure: a test Galaxy over a temporary folder (refresh off, a fake save), a fake brain,
+    and a thread that tries a reload at the worst moment. For the length of the check, build.write_graph is a
+    recorder: nothing may call it."""
+    name = "The sources of a reply are the notes the brain was shown, also across a new index"
+    trouble: list[str] = []
+    real_galaxy, real_ask, real_write, writes = server.GALAXY, server.ask_model, build.write_graph, []
+    session_id = "preflight-sources-" + secrets.token_hex(3)
+    build.write_graph = lambda *args, **kwargs: writes.append(args)
+    try:
+        with tempfile.TemporaryDirectory() as folder:
+            notes_dir = Path(folder).resolve()
+
+            def make(relative: str, text: str) -> build.Note:
+                path = notes_dir / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(f"# {path.stem}\n\n{text}\n", encoding="utf-8")
+                return build.make_note(path, notes_dir)
+
+            foo_a, foo_b = make("shop a/Foo.md", "Foo is the roaster."), make("shop b/Foo.md", "Foo is the grinder.")
+            tea = make("shop c/Tea.md", "Tea is sold by the pot.")
+            galaxy = server.Galaxy()
+            galaxy.notes_dir, galaxy.refresh_if_rebuilt, galaxy._save_graph = notes_dir, lambda: None, lambda: None
+            server.GALAXY = galaxy
+            sent: list[str] = []
+
+            def brain(during=None):
+                def ask(route, messages, system=server.SYSTEM_PROMPT):
+                    sent.append(messages[-1]["content"])
+                    if during:
+                        during()
+                    return "Foo is the roaster, sir.\nSOURCES: 0"
+                return ask
+
+            def reload_soon(notes: list, build_id: str) -> threading.Thread:
+                """Another request that loads a new index: it waits for the lock, as a real one does."""
+                def run() -> None:
+                    with galaxy.lock:
+                        galaxy.notes[:] = notes
+                        galaxy.build_id = build_id
+                worker = threading.Thread(target=run, daemon=True)
+                worker.start()
+                worker.join(0.3)        # it gets in at once unless the snapshot holds the lock
+                return worker
+
+            def ask_chat() -> dict:
+                return server.chat_route({"message": "What is Foo?", "session": session_id})[1]
+
+            # (1) Foo.md of shop a and of shop b swap places while the brain thinks: index 0 is another note now.
+            galaxy.notes[:], galaxy.build_id = [foo_a, foo_b], "one"
+            server.ask_model = brain(during=galaxy.notes.reverse)
+            body = ask_chat()
+            session = server.get_session(session_id)
+            if body.get("nodes") != [] or session.last_sources != []:
+                trouble.append(f"(1) a note with the same title in another folder was taken as the source: "
+                               f"{body.get('nodes')}, session {session.last_sources}")
+            session.record("What is Foo?", "The roaster.", ["foo"], [0], paths={0: foo_b.path})
+            galaxy.notes.reverse()                      # index 0 is shop a's Foo again
+            if session.snapshot()[2] != []:
+                trouble.append("(1) the session carried a source whose note is another Foo.md now")
+            # (2) A reload comes between the search and the render.
+            galaxy.notes[:], galaxy.build_id, workers = [foo_a], "two", []
+            real_search = galaxy.search
+
+            def search_then_reload(*args, **kwargs):
+                hits = real_search(*args, **kwargs)
+                workers.append(reload_soon([foo_b], "two-b"))
+                return hits
+
+            galaxy.search, sent[:] = search_then_reload, []
+            server.ask_model = brain()
+            ask_chat()
+            del galaxy.search
+            for worker in workers:
+                worker.join(2.0)
+            if not sent or "roaster" not in sent[-1] or "grinder" in sent[-1]:
+                trouble.append("(2) a reload between the search and the render changed the note the brain was sent")
+            # (3) A reload comes between the check of the sources and the read of the graph numbers.
+            galaxy.notes[:], galaxy.build_id, workers = [foo_a], "three", []
+            real_meta = galaxy.meta
+
+            def meta_after_reload():
+                if not workers:
+                    workers.append(reload_soon([tea], "three-b"))
+                return real_meta()
+
+            galaxy.meta = meta_after_reload
+            body = ask_chat()
+            del galaxy.meta
+            for worker in workers:
+                worker.join(2.0)
+            if body.get("nodes") != [0] or (body.get("graph") or {}).get("build_id") != "three":
+                trouble.append(f"(3) the sources and the graph numbers come from two states: nodes {body.get('nodes')}, "
+                               f"build {(body.get('graph') or {}).get('build_id')}")
+            # (4) /search: its results and its graph numbers come from one state.
+            galaxy.notes[:], galaxy.build_id, workers = [foo_a], "four", []
+            galaxy.meta = meta_after_reload
+            found = server.search_route({"q": ["foo"]})[1]
+            del galaxy.meta
+            for worker in workers:
+                worker.join(2.0)
+            labels = [hit.get("label") for hit in found.get("results", [])]
+            if labels != ["Foo"] or (found.get("graph") or {}).get("build_id") != "four":
+                trouble.append(f"(4) /search mixed two states: {labels}, build {(found.get('graph') or {}).get('build_id')}")
+    except Exception as error:                          # noqa: BLE001 - a check that stops says so, it never crashes preflight
+        trouble.append(f"the check stopped: {type(error).__name__}: {error}")
+    finally:
+        server.GALAXY, server.ask_model, build.write_graph = real_galaxy, real_ask, real_write
+        with server.SESSIONS_LOCK:
+            server.SESSIONS.pop(session_id, None)
+    if writes:
+        trouble.append(f"build.write_graph was called {len(writes)} times: nothing may write here")
+    report.add(FAIL if trouble else PASS, name, "; ".join(trouble) or
+               "two Foo.md swapped, a reload before the render, a reload before the graph numbers, /search")
 
 
 def check_served_files(report: Report) -> None:
@@ -1083,6 +1223,12 @@ def check_lock(report: Report) -> None:
     # A signature works once: the same signed request a second time is locked out. A newly signed one works.
     once = signed(server.sign_request(key, instance, "GET", "/status"))
     first_kind, first = try_probe(lambda: outsider("GET", "/status", headers=once))
+    # A signed POST is claimed only after its body matched: a caught header sent first with ANOTHER body is refused
+    # and does not use up the true request; the true body then works once; a third time it is refused. The empty
+    # question changes nothing: /chat answers "empty_message" before anything else.
+    post_once = signed(server.sign_request(key, instance, "POST", "/chat", json.dumps(nothing).encode("utf-8")))
+    changed = {"message": "", "session": "preflight-changed"}
+    posts = [try_probe(lambda body=body: outsider("POST", "/chat", body, headers=post_once)) for body in (changed, nothing, nothing)]
     # Empty texts, empty names and a site that is no site: none of these could do anything if the lock were broken.
     attempts = {
         "the page": lambda: outsider("GET", "/"),
@@ -1125,6 +1271,19 @@ def check_lock(report: Report) -> None:
             trouble.append("LET IN: " + what)
     if first_kind != "answer" or first[0] != 200:
         trouble.append("a newly signed request is not let in the first time")
+    if any(kind != "answer" for kind, _ in posts):
+        trouble.append("NOT VERIFIED (no answer): the signed POST sent with another body, then twice with its own")
+    else:
+        try:
+            true_answer = json.loads(posts[1][1][2].decode("utf-8"))
+        except ValueError:
+            true_answer = {}
+        if not refused(*posts[0][1]):
+            trouble.append("LET IN: a signed POST with another body")
+        if posts[1][1][0] != 400 or true_answer.get("error") != "empty_message":
+            trouble.append("a signed POST with its own body is not let in after a try with another body")
+        if not refused(*posts[2][1]):
+            trouble.append("LET IN: the same signed POST a second time")
     if call("GET", "/status", timeout=10)[0] != 200:
         trouble.append("a call with a good signature is not let in")
 
@@ -1269,28 +1428,91 @@ def check_no_investigation_chrome(report: Report) -> None:
                if chromes or profiles else "")
 
 
-def run_node_harness(node: str, core_text: str) -> tuple[dict | None, str]:
-    """Run NODE_HARNESS on one core.js text. (its JSON, "") or (None, why not): Node did not start, took too long,
-    exited with an error, or printed no JSON object."""
+NODE_TIMEOUT_S = 30
+PAGE_CHECKS = build.ROOT / "page_checks.js"     # the page's own rules, run in Node (check_page_rules)
+
+
+def run_node(node: str, script, files: dict[str, str]) -> tuple[str | None, str]:
+    """Write `files` (name -> text) to a new temporary folder and run there: node <script> <those files, in the
+    order given>. `script` is a path, or one of the names in `files` (that one is then not an argument).
+    (its output, "") or (None, why not): Node did not start, took too long, or exited with an error."""
     with tempfile.TemporaryDirectory() as folder:
-        core_file = Path(folder) / "core.js"
-        harness_file = Path(folder) / "harness.js"
-        core_file.write_text(core_text, encoding="utf-8")
-        harness_file.write_text(NODE_HARNESS, encoding="utf-8")
+        paths = {}
+        for name, text in files.items():
+            paths[name] = Path(folder) / name
+            paths[name].write_text(text, encoding="utf-8")
+        script_path = paths.get(str(script)) or Path(script)
+        arguments = [str(path) for name, path in paths.items() if name != str(script)]
         try:
-            run = subprocess.run([node, str(harness_file), str(core_file)], capture_output=True, text=True,
-                                 encoding="utf-8", errors="replace", timeout=30, check=False)
+            run = subprocess.run([node, str(script_path), *arguments], cwd=folder, capture_output=True, text=True,
+                                 encoding="utf-8", errors="replace", timeout=NODE_TIMEOUT_S, check=False)
         except subprocess.TimeoutExpired:
-            return None, "Node.js took longer than 30 seconds"
+            return None, f"Node.js took longer than {NODE_TIMEOUT_S} seconds"
         except (OSError, subprocess.SubprocessError) as error:
             return None, f"Node.js did not start ({type(error).__name__})"
     if run.returncode != 0:
         return None, f"Node.js exited with code {run.returncode}: " + short(run.stderr or run.stdout or "no output", 200)
+    return run.stdout, ""
+
+
+def run_node_harness(node: str, core_text: str) -> tuple[dict | None, str]:
+    """Run NODE_HARNESS on one core.js text. (its JSON, "") or (None, why not): Node did not start, took too long,
+    exited with an error, or printed no JSON object."""
+    out, why = run_node(node, "harness.js", {"harness.js": NODE_HARNESS, "core.js": core_text})
+    if out is None:
+        return None, why
     try:
-        result = json.loads(run.stdout)
+        result = json.loads(out)
     except ValueError:
-        return None, "it printed no JSON: " + short(run.stderr or run.stdout or "no output", 200)
+        return None, "it printed no JSON: " + short(out or "no output", 200)
     return (result, "") if isinstance(result, dict) else (None, "it printed JSON that is not an object")
+
+
+def page_result(out: str) -> tuple[dict | None, str]:
+    """The one line of JSON that page_checks.js prints: {"pass": int, "fail": int, "failures": [text, ...]}."""
+    lines = out.strip().splitlines()
+    if len(lines) != 1:
+        return None, f"it printed {len(lines)} lines, not one line of JSON"
+    try:
+        result = json.loads(lines[0])
+    except ValueError:
+        return None, "its line is not JSON: " + short(lines[0], 120)
+    counts = [result.get(key) for key in ("pass", "fail")] if isinstance(result, dict) else []
+    if (len(counts) != 2 or not all(isinstance(count, int) and not isinstance(count, bool) for count in counts)
+            or not isinstance(result.get("failures"), list) or not all(isinstance(f, str) for f in result["failures"])):
+        return None, "its JSON is not {\"pass\": number, \"fail\": number, \"failures\": [texts]}"
+    return result, ""
+
+
+def check_page_rules(report: Report, ctx: dict) -> None:
+    """The page's own rules (replies, the galaxy file, the microphone), run in Node by page_checks.js on the core.js
+    and app.js that the SERVER serves. A harness that did not run, or that checked nothing, proves nothing."""
+    name = "The page keeps its rules for replies, the galaxy file and the microphone"
+    if not PAGE_CHECKS.is_file():
+        report.add(FAIL, name, f"{PAGE_CHECKS.name} is missing in the project folder.")
+        return
+    node = shutil.which("node")
+    if not node:
+        report.add(WARN, name, "Not checked: it needs Node.js.")
+        return
+    sources = {}
+    for served in ("core.js", "app.js"):
+        kind, got = try_probe(lambda served=served: call("GET", "/" + served, timeout=10))
+        if kind != "answer" or got[0] != 200:
+            report.add(FAIL, name, f"The server did not serve {served} ({got if kind != 'answer' else got[0]}).")
+            return
+        sources[served] = got[1].decode("utf-8", "replace")
+    out, why = run_node(node, PAGE_CHECKS, sources)
+    result, why = page_result(out) if out is not None else (None, why)
+    if result is None:
+        report.add(FAIL, name, f"{PAGE_CHECKS.name} did not run to its end: {why}")
+    elif result["pass"] == 0:
+        report.add(FAIL, name, f"{PAGE_CHECKS.name} checked no rule.")
+    elif result["fail"] or result["failures"]:
+        shown = "; ".join(short(failure, 120) for failure in result["failures"][:5])
+        report.add(FAIL, name, f"{result['fail']} of {result['pass'] + result['fail']} rules failed: {shown or 'no names given'}")
+    else:
+        report.add(PASS, name, f"{result['pass']} rules")
 
 
 def check_voice_rules(report: Report, ctx: dict) -> None:
@@ -1406,11 +1628,26 @@ def check_tag_intent(report: Report) -> None:
     intent = server.TAG_INTENT["TEARDOWN"]
     trouble = [f"missed: {said!r}" for said in asks if not intent(said)]
     trouble += [f"let in: {said!r}" for said in mentions + about + refused if intent(said)]
+    # The site of a tag must be named in the part that ASKS, not in a refused part or a part about an old teardown.
+    bound = (("Do not tear down stripe.com, then tear down example.com", "example.com", True),
+             ("Do not tear down stripe.com, then tear down example.com", "stripe.com", False),
+             ("Tear down stripe.com but don't take igloo.inc apart", "stripe.com", True),
+             ("Tear down stripe.com but don't take igloo.inc apart", "igloo.inc", False),
+             ("Don't x-ray this site, tear down stripe.com", "this", False),
+             ("Don't x-ray this site, tear down stripe.com", "stripe.com", True),
+             ("x-ray this site", "this", True), ("Tear down stripe.com", "evil.example", False))
+    trouble += [f"a tag for {site} after {said!r} is {'refused' if wanted else 'accepted'}"
+                for said, site, wanted in bound if server.tag_site_named(site, said) != wanted]
+    for said in asks:                   # every request that names an address accepts a tag for that address
+        named = re.search(r"\b[a-z0-9-]+\.[a-z]{2,}\b", said)
+        if named and not server.tag_site_named(named.group(), said):
+            trouble.append(f"a tag for {named.group()} after {said!r} is refused")
     if not server.TAG_INTENT["REMEMBER"]("remember that the homepage needs a new photo"):
         trouble.append("the REMEMBER intent no longer matches \"remember that the homepage needs a new photo\"")
     report.add(FAIL if trouble else PASS, name,
                "; ".join(trouble) or f"{len(asks)} requests let in; {len(mentions)} mentions, {len(about)} sentences "
-                                     f"about a teardown and {len(refused)} refusals kept out")
+                                     f"about a teardown and {len(refused)} refusals kept out; {len(bound)} tags bound "
+                                     "to the part that asks")
 
 
 def main() -> int:
@@ -1432,6 +1669,7 @@ def main() -> int:
         check_brain_choice_saved(report)
         check_teardown_receipt_turn(report)
         check_teardown_cancel(report)
+        check_sources_stay_true(report)
         check_served_files(report)
         check_config_hidden(report, ctx)
         check_other_sites(report)
@@ -1439,6 +1677,7 @@ def main() -> int:
         check_persona_home(report)
         check_pinned_libraries(report)
         check_voice_rules(report, ctx)
+        check_page_rules(report, ctx)
         check_tag_intent(report)
         check_teardown_kit(report)
         check_teardown_offline(report, ctx)

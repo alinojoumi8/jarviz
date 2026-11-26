@@ -80,7 +80,7 @@ Still to prove:
 
 Proven with the real brain and a real public site (igloo.inc):
 
-- [x] Last run: `PREFLIGHT: 27 pass, 1 fail, 0 warn` and `DRILL: 67 pass, 0 fail`. The one fail is the OpenAI account: it has no credit (see "Brains"). Preflight has 28 checks now.
+- [x] Last run: `PREFLIGHT: 29 pass, 1 fail, 0 warn` and `DRILL: 72 pass, 0 fail`. The one fail is the OpenAI account: it has no credit (see "Brains"). Preflight has 30 checks now.
 - [x] The drill passed with a hidden browser, and also with the Chrome window on screen (`python drill.py --visible`). The snapshot from the visible window is a real picture.
 - [x] A full teardown in about one minute: 96 files, 14.7 MB, Three.js r165, GSAP 3.12.5, postprocessing 6.35.5.
 - [x] The card shows the 8 steps live, then the snapshot, the stack and the totals. The reader shows the whole note.
@@ -121,6 +121,16 @@ Review:
   - A second start of Jarviz no longer rebuilds the galaxy under the Jarviz that runs. A new `notes_dir` is followed without a restart.
   - The microphone: a late result after "off" saves nothing. The page never adds a note on top of an old picture of the galaxy.
   - The teardown receipt goes to the turn that started it. A cancel from a test can stop only its own job.
+- [x] CodeRabbit read the fixes again and wrote 14 replies. 1 took a finding back, 5 asked only for the test result, and 8 had a real remaining point. All 8 are fixed:
+  - In "do not tear down stripe.com, then tear down example.com", only example.com can be torn down.
+  - A signed POST uses up its signature only after its body was checked.
+  - The address check looks up the name that Chrome opens, with its "www.".
+  - On a Mac or Linux, only a real Chrome that names the test profile is stopped.
+  - "Forget that" does not touch a note from a galaxy that was built again. The page compares its galaxy with the server at the start.
+  - A note is known by its path, not by its title, so two notes with one title are never mixed up.
+  - The drill says "put back" only when the end of its job is confirmed.
+  - A late teardown answer no longer closes the reader or opens the card.
+- [x] The rules of the page now have their own test file, `page_checks.js` (67 rules). Preflight runs it.
 - 12 findings are not changed, on purpose:
   - The drill deletes its own test note also when a program changed it. A test note is not your work.
   - A cancel that comes while the note is saved: Jarviz already answers "too late, the note is saved".

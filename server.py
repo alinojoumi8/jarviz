@@ -587,10 +587,14 @@ class Galaxy:
             content = render_capture(name, fact, self._related_title(fact), source)
             return self.birth_note(f"{CAPTURES_DIR}/{name}.md", content)
 
-    def forget_last(self, index: int, label: str) -> dict:
-        """Undo the newest capture: move its file to captures/.trash and take its star away."""
+    def forget_last(self, index: int, label: str, build_id: str | None = None) -> dict:
+        """Undo the newest capture: move its file to captures/.trash and take its star away. `build_id`: the galaxy
+        the receipt came from. When the galaxy was built again since (another notes folder, or build.py), the same
+        number and title can be another note: then nothing moves."""
         with self.lock:
             self.refresh_if_rebuilt()
+            if build_id is not None and build_id != self.build_id:
+                raise ValueError("the galaxy was built again since that note was saved")
             note = self.note(index)
             if note is None or index != len(self.notes) - 1:
                 raise ValueError("only the newest note can be forgotten")
@@ -727,12 +731,13 @@ class Session:
         self.lock = threading.Lock()                        # two requests from one tab can overlap
         self.turns: deque = deque(maxlen=HISTORY_TURNS)     # [what the user said, what Jarviz replied, receipts]
         self.last_tokens: frozenset = frozenset()
-        self.last_sources: list[tuple[int, str]] = []       # (index, title): a stale index is never trusted
+        self.last_sources: list[tuple[int, str]] = []       # (index, path): a stale index is never trusted
         self.used = time.monotonic()
         self._undo: tuple | None = None                     # what the newest record() changed, for take_back()
 
     def snapshot(self) -> tuple[list[dict], frozenset, list[int]]:
-        """The history, the last keywords, and the last sources that still are the same notes."""
+        """The history, the last keywords, and the last sources that still are the same notes: the note at that
+        index still has the same path. A title is no identity: two folders can each hold a Foo.md."""
         with self.lock:
             history = []
             for said, replied, receipts in self.turns:
@@ -742,18 +747,19 @@ class Session:
                     lines = "\n".join(f"- {line}" for line in receipts)
                     history.append({"role": "user", "content": f"<receipts>\n{lines}\n</receipts>"})
             tokens, sources = self.last_tokens, list(self.last_sources)
-        still_there = [index for index, title in sources
-                       if (note := GALAXY.note(index)) is not None and note.label == title]
-        return history, tokens, still_there
+        with GALAXY.lock:
+            still = [index for index, path in sources if still_there(index, {index: path})]
+        return history, tokens, still
 
     def record(self, said: str, replied: str, tokens, nodes: list[int], receipt: str | None = None,
-               labels: dict[int, str] | None = None) -> list:
-        """Add one turn and return it. `labels`: the title each index had when the notes were offered (a source
-        is kept with that title). Without it, the title the index has now."""
-        if labels is None:
-            sources = [(index, note.label) for index in nodes if (note := GALAXY.note(index)) is not None]
+               paths: dict[int, str] | None = None) -> list:
+        """Add one turn and return it. `paths`: the path of each note the brain was shown, by its number (a source
+        is kept with that path). Without it, the path the index has now."""
+        if paths is None:
+            with GALAXY.lock:
+                sources = [(index, note.path) for index in nodes if (note := GALAXY.note(index)) is not None]
         else:
-            sources = [(index, labels[index]) for index in nodes if index in labels]
+            sources = [(index, paths[index]) for index in nodes if index in paths]
         turn = [said, replied, [receipt] if receipt else []]
         with self.lock:
             dropped = self.turns[0] if len(self.turns) == self.turns.maxlen else None
@@ -896,8 +902,11 @@ def _about_from(clause: str) -> int:
     return min(starts, default=len(clause))
 
 
-def asks_for_teardown(sentence: str) -> bool:
-    """Rule (A) or rule (B) above, on what is left when the parts about a teardown are taken out."""
+def asking_part(sentence: str) -> str:
+    """The part of the user's sentence that ASKS: what is left when the parts about a teardown that is there, about
+    the past, or refused are taken out of each clause. Rules (A) and (B) are tested on it, and the site of a
+    [TEARDOWN:...] tag must be named in it: in "Do not tear down stripe.com, then tear down example.com" only
+    example.com is asked for."""
     kept, start = [], 0
     for end in [*CLAUSE_END_RE.finditer(sentence), None]:
         clause = sentence[start:end.start() if end else len(sentence)]
@@ -905,7 +914,12 @@ def asks_for_teardown(sentence: str) -> bool:
         if end:
             kept.append(end.group())
             start = end.end()
-    rest = " ".join(kept)
+    return " ".join(kept)
+
+
+def asks_for_teardown(sentence: str) -> bool:
+    """Rule (A) or rule (B) above, on the part of the sentence that asks (asking_part)."""
+    rest = asking_part(sentence)
     return bool(TEARDOWN_VERB_RE.search(rest)
                 or (TEARDOWN_QUESTION_RE.search(rest) and SITE_WORD_RE.search(rest)))
 
@@ -916,9 +930,10 @@ LONE_TAG_RE = re.compile(r"\s*\[[A-Z][A-Z_]{2,}(?:\s*:[^\[\]]*)?\]\s*")
 
 
 def reply(answer: str, nodes=(), *, ok: bool = True, error: str | None = None,
-          detail: str | None = None, action: dict | None = None, **extra) -> dict:
-    """The one shape every answer has: {"answer": ..., "nodes": [indexes used], ...}."""
-    body = {"ok": ok, "answer": answer, "nodes": list(nodes), "graph": GALAXY.meta()}
+          detail: str | None = None, action: dict | None = None, graph: dict | None = None, **extra) -> dict:
+    """The one shape every answer has: {"answer": ..., "nodes": [indexes used], ...}. `graph`: graph numbers read
+    in the same locked step as the nodes (chat_route). Without it, the numbers now."""
+    body = {"ok": ok, "answer": answer, "nodes": list(nodes), "graph": GALAXY.meta() if graph is None else graph}
     if error:
         body["error"] = error
     if detail:
@@ -973,23 +988,20 @@ def note_block(index: int, note: build.Note) -> str:
     return f'<note number="{index}" title="{title}" folder="{folder}">\n{text}\n</note>'
 
 
-def render_turn(question: str, offered: list[int]) -> tuple[str, dict[int, str]]:
-    """What the brain reads for one question: the matching notes, then the question. Also the title of each note
-    it was shown, by its number: from the same copy of the index as the text."""
-    with GALAXY.lock:
-        shown = [(index, note) for index in offered if (note := GALAXY.note(index)) is not None]
-        total = len(GALAXY.notes)
+def render_turn(question: str, shown: list[tuple[int, build.Note]], total: int) -> str:
+    """What the brain reads for one question: the matching notes, then the question. It renders the note OBJECTS
+    of one snapshot (chat_route), never a second lookup by number: a new index cannot slip another note in."""
     blocks = [note_block(index, note) for index, note in shown]
     body = "\n".join(blocks) if blocks else "No note matched this message."
     parts = [f'<notes total_in_second_brain="{total}">\n{body}\n</notes>', f"<question>\n{question}\n</question>"]
-    return "\n\n".join(parts), {index: note.label for index, note in shown}
+    return "\n\n".join(parts)
 
 
-def still_the_same(index: int, labels: dict[int, str]) -> bool:
-    """True when the note at `index` is still the one that was offered under that number (a new index can come in
-    while the brain thinks)."""
+def still_there(index: int, paths: dict[int, str]) -> bool:
+    """True when the note at `index` is still the one that was offered under that number: the same path inside the
+    notes folder. A title is no identity (two folders can each hold a Foo.md). Call it with GALAXY.lock held."""
     note = GALAXY.note(index)
-    return note is not None and index in labels and note.label == labels[index]
+    return note is not None and index in paths and note.path == paths[index]
 
 
 # -------------------------------------------------------------------- routes
@@ -1001,13 +1013,16 @@ def chat_route(payload: dict) -> tuple[int, dict]:
     session = get_session(payload.get("session"))
     GALAXY.refresh_if_rebuilt()
 
-    history, last_tokens, last_sources = session.snapshot()
     tokens = frozenset(build.tokenize(question))
-    offered = [index for index, _, _ in GALAXY.search(tokens, last_tokens)]
-    carried = [index for index in last_sources if index not in offered]
-    offered += carried[: max(0, RETRIEVE_TOP - len(offered))]
-
-    turn, labels = render_turn(question, offered)       # labels: the title of each note the brain was shown
+    with GALAXY.lock:       # ONE snapshot: the notes that are scored are the notes the brain is sent
+        history, last_tokens, last_sources = session.snapshot()
+        offered = [index for index, _, _ in GALAXY.search(tokens, last_tokens)]
+        carried = [index for index in last_sources if index not in offered]
+        offered += carried[: max(0, RETRIEVE_TOP - len(offered))]
+        shown = [(index, note) for index in offered if (note := GALAXY.note(index)) is not None]
+        total = len(GALAXY.notes)
+    paths = {index: note.path for index, note in shown}     # the identity of each note the brain was shown
+    turn = render_turn(question, shown, total)
     try:
         text = ask_model("chat", history + [{"role": "user", "content": turn}])
     except BrainTrouble as error:
@@ -1023,11 +1038,14 @@ def chat_route(payload: dict) -> tuple[int, dict]:
     elif LONE_TAG_RE.fullmatch(answer):
         answer = LINES["unknown_tag"]
     # Only notes the brain says it used move the camera. No SOURCES line means the graph holds still. A number
-    # whose note is not the one the brain was shown any more (a new index came in) is dropped.
-    nodes = list(dict.fromkeys(index for index in declared or [] if still_the_same(index, labels)))
+    # whose note is not the one the brain was shown any more (a new index came in) is dropped. The check and the
+    # graph numbers of the reply are one locked step, so the page reads the numbers of the state that was checked.
+    with GALAXY.lock:
+        nodes = list(dict.fromkeys(index for index in declared or [] if still_there(index, paths)))
+        graph = GALAXY.meta()
     answer = answer or LINES["empty"]
-    session.record(question, answer, tokens, nodes, labels=labels)
-    return 200, reply(answer, nodes, sources_declared=declared is not None)
+    session.record(question, answer, tokens, nodes, paths=paths)
+    return 200, reply(answer, nodes, graph=graph, sources_declared=declared is not None)
 
 
 def do_remember(fact: str, said: str, session: Session, source: str = SOURCE_USER) -> tuple[int, dict]:
@@ -1051,12 +1069,14 @@ def remember_route(payload: dict) -> tuple[int, dict]:
 
 
 def forget_route(payload: dict) -> tuple[int, dict]:
-    index, label = payload.get("index"), payload.get("label")
-    if isinstance(index, bool) or not isinstance(index, int) or not isinstance(label, str):
+    """{"index", "label", and "build": the build_id of the galaxy the receipt came from}. "build" is optional."""
+    index, label, build_id = payload.get("index"), payload.get("label"), payload.get("build")
+    if (isinstance(index, bool) or not isinstance(index, int) or not isinstance(label, str)
+            or (build_id is not None and not isinstance(build_id, str))):
         line = LINES["forget_failed"].format(reason="I was not told which note.")
         return 400, reply(line, ok=False, error="bad_request")
     try:
-        receipt = GALAXY.forget_last(index, label)
+        receipt = GALAXY.forget_last(index, label, build_id)
     except (OSError, ValueError) as error:
         line = LINES["forget_failed"].format(reason=reason_of(error))
         return 409, reply(line, ok=False, error="forget_failed")
@@ -1099,9 +1119,11 @@ def search_route(query: dict) -> tuple[int, dict]:
     """What the search index finds for ?q=, without asking the brain."""
     GALAXY.refresh_if_rebuilt()
     question = clean_text((query.get("q") or [""])[0], MAX_MESSAGE_CHARS)
-    hits = GALAXY.search(frozenset(build.tokenize(question)))       # index, score and label from one copy
+    with GALAXY.lock:       # the results and the graph numbers come from one state
+        hits = GALAXY.search(frozenset(build.tokenize(question)))
+        graph = GALAXY.meta()
     results = [{"index": index, "label": label, "score": round(score, 2)} for index, score, label in hits]
-    return 200, {"ok": True, "results": results, "graph": GALAXY.meta()}
+    return 200, {"ok": True, "results": results, "graph": graph}
 
 
 def tag_remember(argument: str, question: str, session: Session, payload: dict) -> tuple[int, dict]:
@@ -1290,18 +1312,26 @@ def teardown_image_route(query: dict) -> tuple:
     return 200, data, "image/png"
 
 
+def tag_site_named(site_text: str, sentence: str) -> bool:
+    """True when the user's sentence names the site of a [TEARDOWN:...] tag in the part that ASKS (asking_part).
+    "this" counts only when that part says "this site". A site named only in a refused part ("do not tear down X")
+    or in a part about an old teardown is not named. A text that is no address is left to start_teardown (it
+    refuses it)."""
+    asked = asking_part(sentence)
+    if not site_text or site_text.lower() in THIS_SITE:
+        return bool(THIS_SAID_RE.search(asked))
+    site = teardown.parse_site(site_text) if teardown is not None else None
+    return site is None or named_by_user(site.host, asked)
+
+
 def tag_teardown(argument: str, question: str, session: Session, payload: dict) -> tuple[int, dict]:
-    """The brain asked for a teardown. It runs only for a site the user's own sentence names."""
+    """The brain asked for a teardown. It runs only for a site the user's own sentence asks for."""
     site_text, _, asked = argument.partition("|")
     site_text = clean_text(site_text, 300)
+    if not tag_site_named(site_text, question):
+        return 200, reply(LINES["teardown_not_named"], error="not_named")
     if not site_text or site_text.lower() in THIS_SITE:
-        if not THIS_SAID_RE.search(question):               # "this" counts only when the user said "this site"
-            return 200, reply(LINES["teardown_not_named"], error="not_named")
         site_text = "this"
-    else:
-        site = teardown.parse_site(site_text) if teardown is not None else None
-        if site is not None and not named_by_user(site.host, question):
-            return 200, reply(LINES["teardown_not_named"], error="not_named")
     return start_teardown(site_text, clean_text(asked, 300) or question, session, question,
                           headless=payload.get("headless") is True)
 
@@ -1316,7 +1346,8 @@ def tag_teardown(argument: str, question: str, session: Session, payload: dict) 
 #     with it (X-Jarviz-Sign). A signature is good for one request, for two minutes, and only for
 #     THIS start of the server (INSTANCE). So another program that sits on port 4700 while Jarviz is
 #     stopped gets nothing that it can use, also not after Jarviz starts again. A signature that is
-#     sent a second time is refused (claim_signature), so a caught one cannot be played again.
+#     sent a second time is refused (claim_signature), so a caught one cannot be played again. It is
+#     claimed only when the request is proven whole: a POST after its body matched the signature.
 #   - A signature is never traded for the cookie. The cookie IS the key: the door gives it only to
 #     a caller that brought the key itself.
 #   - `python server.py --link` shows the link only after the server PROVED that it holds the key
@@ -1511,7 +1542,8 @@ def resolve_static(url_path: str) -> Path | None:
 
 
 class Handler(BaseHTTPRequestHandler):
-    _signed_body: str | None = None     # set by _unlocked for a signed request: the hash its body must have
+    _signed_body: str | None = None     # set by _unlocked for a signed POST: the hash its body must have
+    _signed_claim: str | None = None    # ...and its signature, claimed by _signed_body_ok after the body check
     server_version = "Jarviz"
     sys_version = ""
 
@@ -1546,6 +1578,8 @@ class Handler(BaseHTTPRequestHandler):
         route = POST_ROUTES.get(self.path.partition("?")[0])
         if route is None:
             return self._send_json(404, {"ok": False, "error": "not_found"})
+        # EVERY POST route gets its payload from _read_json, and only from it: there a signed body is checked
+        # against its signature and the signature is claimed (_signed_body_ok). No route runs without that.
         payload = self._read_json()
         if payload is not None:
             self._run(route, payload)
@@ -1588,18 +1622,29 @@ class Handler(BaseHTTPRequestHandler):
         return False
 
     def _unlocked(self) -> bool:
-        """The page lock. This is the ONE place that decides whether a caller holds the page key."""
-        self._signed_body = None
+        """The page lock. This is the ONE place that decides whether a caller holds the page key. A signature works
+        once: it is claimed only when the request is proven whole. A GET has no body, so here. A POST is proven
+        only when its body is read: _signed_body_ok finishes this check, before any route runs."""
+        self._signed_body = self._signed_claim = None
         signed = self.headers.get(SIGN_HEADER)
         if signed is not None:          # a tool: it signs the request and never sends the key
             covered = signed_body_hash(signed, self.command, self.path)
             if covered is None or (self.command != "POST" and covered != EMPTY_BODY_HASH):
                 return False
-            if not claim_signature(signed):     # the same signature a second time: locked like any other request
-                return False
-            self._signed_body = covered     # _read_json checks the body against it
-            return True
+            if self.command == "POST":  # a caught header sent with ANOTHER body must not use up the true request
+                self._signed_body, self._signed_claim = covered, signed
+                return True
+            return claim_signature(signed)      # the same signature a second time: locked like any other request
         return self._cookie_ok()        # a browser: the cookie
+
+    def _signed_body_ok(self, raw: bytes) -> bool:
+        """The end of _unlocked for a signed POST: the body must be the one the signature covers, and only then is
+        the signature claimed (it works once). A caller with the cookie has nothing to check here."""
+        if self._signed_body is None:
+            return True
+        if not hmac.compare_digest(hashlib.sha256(raw).hexdigest(), self._signed_body):
+            return False                # the signature was made for another body: its nonce stays unused
+        return claim_signature(self._signed_claim)
 
     def _cookie_ok(self) -> bool:
         """True when the caller brought the page key itself, as a cookie. Every cookie with our name is
@@ -1669,8 +1714,8 @@ class Handler(BaseHTTPRequestHandler):
             raw = self.rfile.read(length)
         except OSError:
             raw = b""
-        if self._signed_body is not None and not hmac.compare_digest(hashlib.sha256(raw).hexdigest(), self._signed_body):
-            self._send_json(403, LOCKED_BODY)       # the signature was made for another body
+        if not self._signed_body_ok(raw):
+            self._send_json(403, LOCKED_BODY)       # another body, or a signature that was used before
             return None
         try:
             payload = json.loads(raw.decode("utf-8"))

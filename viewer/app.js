@@ -591,6 +591,7 @@
     const response = await fetch('/status', { cache: 'no-store' });
     const status = await response.json();
     if (status.ok === false) return status;         // the page has lost its key: the caller shows status.answer
+    syncGraph(status.graph);                        // the file on screen may be older than the galaxy: then it is read again
     showBrain(status.active);
     const spoken = status.lines || {};
     for (const name of Object.keys(lines)) {
@@ -756,17 +757,17 @@
     if (owner && reply.error === 'failed') Teardown.failureTold();   // the cancel reply said why the job failed
     if (reply.brain && reply.ok !== false) showBrain(reply.brain);
     if (type === 'remember') {
-      lastCapture = action.receipt;
+      lastCapture = { ...action.receipt, build: reply.graph && reply.graph.build_id };   // the galaxy it came from
       placeBirths([action.receipt], found, !owner);
     } else if (type === 'forget') {
       if (found === 'base') removeNote(action.index);  // after a new read the file already holds the truth
       lastCapture = null;
     } else if (type === 'teardown') {
-      Teardown.follow(action.job);                    // a teardown started: the card shows its steps
+      Teardown.follow(action.job, { track: !owner });  // a teardown started: the card shows its steps (late: at its end)
     } else if (type === 'teardown_cancel') {
-      Teardown.cancelled();
+      Teardown.cancelled();                           // noted: the job's end stays quiet, the card is not touched
     } else if (!owner) {
-      return;                     // a late answer moves no camera; the card above follows the job, and speaks nothing
+      return;                     // a late answer moves no camera and changes no card; a teardown above is only tracked
     } else {
       Focus.apply(Core.planFocus(reply.nodes));
     }
@@ -782,8 +783,9 @@
 
   function forgetLast() {
     if (!lastCapture) return say(lines.nothing_to_forget);
-    return send('/forget', { index: lastCapture.index, label: lastCapture.title, session: SESSION },
-      lines.forget_unreachable);
+    const body = { index: lastCapture.index, label: lastCapture.title, session: SESSION };
+    if (typeof lastCapture.build === 'string' && lastCapture.build) body.build = lastCapture.build;
+    return send('/forget', body, lines.forget_unreachable);
   }
 
   const switchBrain = name => send('/brain', { name }, lines.brain_unreachable);
@@ -820,6 +822,7 @@
     let quietEnd = false;       // the user cancelled: Jarviz already said so
     let failTold = false;       // the cancel reply already said why the followed job failed
     let round = 0;              // goes up at each follow(): a status answer from an older round is dropped
+    let tracked = false;        // the job is only tracked (a late reply): the card shows it at its end, not before
     let opening = 0;            // the newest request to open the reader: closeReader drops it
 
     const fetchJson = async path => (await fetch(path, { cache: 'no-store' })).json();
@@ -903,6 +906,7 @@
 
     async function finish(job, meta) {
       following = null;
+      tracked = false;                                // the end is shown, also for a job that was only tracked
       const told = (quietEnd && job.state === 'cancelled') || (failTold && job.state === 'failed');
       failTold = false;
       if (job.state !== 'done') {
@@ -943,21 +947,23 @@
       const job = status.job;
       if (!job || job.id !== following) { following = null; return; }
       if (job.state === 'running') {
-        paintJob(job);
+        if (!tracked) paintJob(job);
         timer = setTimeout(poll, POLL_MS);
         return;
       }
       await finish(job, status.graph);
     }
 
-    function follow(job) {
+    // Watch a job: its end, its new notes and its result arrive. `track` (a late reply): the reader and
+    // the card stay as they are, so the newer sentence keeps the screen. The card shows the job at its end.
+    function follow(job, options = {}) {
       if (!job || !job.id) return;
       round += 1;
       failTold = false;
       following = job.id;
       misses = 0;
-      closeReader();
-      paintJob(job);
+      tracked = Boolean(options.track);
+      if (!tracked) { closeReader(); paintJob(job); }
       clearTimeout(timer);
       timer = setTimeout(poll, POLL_MS);
     }

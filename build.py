@@ -349,6 +349,8 @@ def main(argv: list[str]) -> int:
     notes, links, _ = build(notes_dir)
     folders = len({note.group for note in notes})
     print(f"Indexed {len(notes)} notes in {folders} folders, {len(links)} links -> viewer/graph-data.js")
+    if len(argv) > 1 and notes_dir != configured_notes_dir():
+        print("Jarviz follows \"notes_dir\" in config.json, so a running Jarviz loads that folder, not this one.")
     return 0 if notes else 1
 
 
