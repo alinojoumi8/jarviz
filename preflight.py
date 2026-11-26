@@ -992,32 +992,47 @@ def check_teardown_cancel(report: Report) -> None:
 
 def check_signature_once(report: Report) -> None:
     """A signature is claimed once, and never when its time window is over: a body that comes late cannot make an
-    old signature work, also not after its first claim was pruned. Pure: claim_signature with made-up signatures and
-    a made-up clock, on nonces that only this check uses (they are removed afterwards)."""
+    old signature work, also not after its first claim was pruned. The time is read inside the lock. Pure:
+    claim_signature with made-up signatures and a made-up clock, on nonces that only this check uses (they are
+    removed afterwards)."""
     name = "A signature is claimed once, and never after its time window"
     trouble: list[str] = []
     window, stamp = server.SIGN_WINDOW_S, 2_000_000_000
-    nonces = [f"preflight-once-{secrets.token_hex(6)}" for _ in range(3)]
-    old, fresh, expiring = (f"{stamp}.{nonce}.x.y" for nonce in nonces)
+    nonces = [f"preflight-once-{secrets.token_hex(6)}" for _ in range(4)]
+    old, fresh, expiring, ordered = (f"{stamp}.{nonce}.x.y" for nonce in nonces)
+
+    def at(seconds: float):                         # a made-up clock that always says stamp + seconds
+        return lambda: stamp + seconds
+
     try:
-        if server.claim_signature(old, now=stamp + window + 5) or server.claim_signature(old, now=stamp + window + 6):
+        if server.claim_signature(old, at(window + 5)) or server.claim_signature(old, at(window + 6)):
             trouble.append("a stamp older than the window was claimed")
-        if not server.claim_signature(fresh, now=stamp + 1):
+        if not server.claim_signature(fresh, at(1)):
             trouble.append("a fresh signature was not claimed the first time")
-        if server.claim_signature(fresh, now=stamp + 2):
+        if server.claim_signature(fresh, at(2)):
             trouble.append("a fresh signature was claimed twice")
-        if not server.claim_signature(expiring, now=stamp + window - 1):
+        if not server.claim_signature(expiring, at(window - 1)):
             trouble.append("a signature at the end of its window was not claimed the first time")
-        if server.claim_signature(expiring, now=stamp + window + 1):
+        if server.claim_signature(expiring, at(window + 1)):
             trouble.append("a signature that expired between two claims was claimed again")
-        if server.claim_signature(expiring, now=stamp + 10 * window):     # its first claim is pruned by now
+        if server.claim_signature(expiring, at(10 * window)):     # its first claim is pruned by now
             trouble.append("an expired signature was claimed again after its first claim was pruned")
+        # The time is read while the lock is held: the time that is checked is the time of the claim.
+        held: list[bool] = []
+
+        def watched_clock() -> float:
+            held.append(server.USED_LOCK.locked())
+            return stamp + 1
+
+        if not server.claim_signature(ordered, watched_clock) or held != [True]:
+            trouble.append(f"the time of a claim is not read inside the lock (lock held at each read: {held})")
     finally:
         with server.USED_LOCK:
             for nonce in nonces:
                 server.USED_SIGNATURES.pop(nonce, None)
     report.add(FAIL if trouble else PASS, name, "; ".join(trouble) or
-               "an old stamp twice, a fresh one twice, one that expires between two claims and after the prune")
+               "an old stamp twice, a fresh one twice, one that expires between two claims and after the prune; "
+               "the time is read inside the lock")
 
 
 def check_sources_stay_true(report: Report) -> None:

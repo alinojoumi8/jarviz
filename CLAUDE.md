@@ -52,7 +52,8 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
 - A signature works once: `claim_signature` keeps its nonce until its time is over. The same signed request a
   second time is locked out. Every tool call is signed anew. A signature is claimed only when the request is proven
   whole: a GET in `_unlocked`, a POST after its body matched (`_signed_body_ok`, called from `_read_json`). Every
-  POST route takes its payload from `_read_json` only. A signature whose time is over is never claimed.
+  POST route takes its payload from `_read_json` only. A signature whose time is over is never claimed, and the
+  time of a claim is read inside the lock.
 - A signature is never traded for the cookie: `Handler._door` gives the cookie only to a caller that brought the
   key itself. A signature names the start of the server (`INSTANCE`), so it is worth nothing after a restart.
 - No tool and no test sends the key itself, in a header, a cookie or an address. `python server.py --link` shows
@@ -130,16 +131,19 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
 - A teardown receipt goes on the turn that started the job (`Session.record` returns the turn). A start that is
   refused leaves no turn behind.
 - `run_rea` runs only the pinned REA version. On a Mac or Linux a process is "our Chrome" only when the system
-  says that its program is Chrome (`ps -o comm=`, joined by pid in `posix_table`) and it names the profile in
-  `--user-data-dir=` (or Chrome's crash helper names it in `--database=`) (`names_profile`). Another program is
-  never stopped. A process list that cannot be read is "could not look".
+  says that its program is the browser that `find_chrome()` gives, the `chrome` file beside it, one of its Mac
+  helpers, or Chrome's crash helper (`ps -o comm=`, joined by pid in `posix_table`; `is_chrome_program`), and it
+  names the profile in `--user-data-dir=` (the crash helper in `--database=`). Another program is never stopped.
+  A process on the profile whose program is not known, or a process list that cannot be read, is "could not
+  look": nothing is stopped on a guess, and no check says "clean".
 - The identity of a note is its notes folder and its path (`note_id`), not its title. The sources of a reply and
   its graph numbers come from one locked step (`chat_route`, `search_route`). Every capture receipt carries
   `"build"`, written under the lock. `/forget` needs it: a capture from a galaxy that was built again is not
   forgotten. The page sends the build of the receipt, not the build of the reply.
-- The page does nothing by node number on a galaxy that it could not read again (`syncGraph` gives `'failed'`).
-- The drill counts only an end that is confirmed (`follow_job`). Only a good status answer counts (`job_of`).
-  An end that is not confirmed is a FAIL.
+- Node numbers belong to one build of the galaxy. The page uses the node numbers of a reply or a receipt only
+  when their `build` is the build on screen, and never on a galaxy that it could not read again.
+- The drill counts only an end that is confirmed (`follow_job`). Only a good status answer counts (`job_of`: it
+  has the key `job`), and a job ends only on `done`, `failed` or `cancelled`. An end that is not confirmed is a FAIL.
 - `main()` takes the port first and loads the galaxy after it. A second start that finds the port busy changes
   nothing. `Galaxy.refresh_if_rebuilt` follows the `notes_dir` that `config.json` names now.
 - Library fingerprints live in ONE table (`FINGERPRINTS`). A "presence" pattern must be a string that only that

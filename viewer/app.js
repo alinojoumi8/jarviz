@@ -534,10 +534,22 @@
     return 'reloaded';
   }
 
+  // The page's numbers no longer say what is on screen: read the file now. If that read fails, the
+  // numbers stay unknown, so the next reply reads again.
+  function doubtGraph() {
+    graphState = { build_id: graphState.build_id, rev: -1 };
+    reloadGraph().catch(error => console.warn('Could not refresh the galaxy', error));
+  }
+
   // A reply's new notes, by what syncGraph found. 'base': they are born here, in order. 'reloaded': the
   // file already holds them, so only the newest is pulsed and focused, and only when its place holds the
-  // same note. 'failed': the galaxy stays as it is.
+  // same note. 'failed': the galaxy stays as it is. A receipt counts only in the build it was made in:
+  // one with another build, or none, is about another galaxy, so nothing is done by its numbers.
   function placeBirths(receipts, found, quiet = false) {
+    if (!receipts.every(receipt => receipt.build && receipt.build === graphState.build_id)) {
+      if (found === 'base') doubtGraph();             // the numbers moved on without these notes: the file decides
+      return;
+    }
     if (found === 'base') {
       receipts.forEach((receipt, index) => addNote(receipt, { quiet: quiet || index < receipts.length - 1 }));
       return;
@@ -751,6 +763,8 @@
     const action = reply.ok === false ? null : reply.action || null;
     const type = action ? action.type : null;
     const found = await syncGraph(reply.graph, type === 'remember' || type === 'forget' ? 1 : 0);
+    // Node numbers belong to one build: they count only when the galaxy on screen is the reply's own build.
+    const numbered = found !== 'failed' && Boolean(reply.graph) && reply.graph.build_id === graphState.build_id;
     // A newer sentence started while this one waited: it owns the answer. This reply only mends the galaxy.
     const owner = mine === sends;
     if (owner) say(reply.answer || '', reply.ok === false);   // also after a failed read: the save did happen
@@ -758,9 +772,9 @@
     if (reply.brain && reply.ok !== false) showBrain(reply.brain);
     if (type === 'remember') {
       lastCapture = action.receipt;                   // its `build` names the galaxy it was saved in (the server's lock)
-      placeBirths([action.receipt], found, !owner);
+      if (numbered) placeBirths([action.receipt], found, !owner);
     } else if (type === 'forget') {
-      if (found === 'base') removeNote(action.index);  // after a new read the file already holds the truth
+      if (found === 'base' && numbered) removeNote(action.index);  // after a new read the file already holds the truth
       lastCapture = null;
     } else if (type === 'teardown') {
       Teardown.follow(action.job, { track: !owner });  // a teardown started: the card shows its steps (late: at its end)
@@ -768,7 +782,7 @@
       Teardown.cancelled();                           // noted: the job's end stays quiet, the card is not touched
     } else if (!owner) {
       return;                     // a late answer moves no camera and changes no card; a teardown above is only tracked
-    } else if (found !== 'failed') {                  // node numbers only on a galaxy that is known to be right
+    } else if (numbered) {                            // not after a failed read, not on another build
       Focus.apply(Core.planFocus(reply.nodes));
     }
   }

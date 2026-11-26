@@ -59,17 +59,17 @@ def tree(folder: Path) -> dict[str, int]:
 
 
 def job_of(status: int, raw: bytes) -> dict:
-    """The job in ONE status answer. Only a good answer counts: HTTP 200, a JSON object, "ok" not false. Then the
-    job's view, or {} when there is no job. Anything else (an error page, a 500, {"ok": false}) raises BadAnswer:
-    it is no answer, never "no job"."""
+    """The job in ONE status answer. Only a good answer counts: HTTP 200, a JSON object, "ok" not false, and the key
+    "job" with an object or null. Then the job's view, or {} for null (no job). Anything else (an error page, a 500,
+    {"ok": false}, {} with no "job") raises BadAnswer: it is no answer, never "no job"."""
     try:
         body = json.loads(raw.decode("utf-8"))
     except (ValueError, UnicodeDecodeError):
         body = None
-    if status != 200 or not isinstance(body, dict) or body.get("ok") is False:
+    if (status != 200 or not isinstance(body, dict) or body.get("ok") is False or "job" not in body
+            or not (body["job"] is None or isinstance(body["job"], dict))):
         raise BadAnswer(f"HTTP {status}")
-    job = body.get("job")
-    return job if isinstance(job, dict) else {}
+    return body["job"] or {}
 
 
 def job_now() -> dict:
@@ -82,6 +82,7 @@ def cancel(job_id: str | None) -> dict:
 
 
 ENDED, NOT_OURS, NOT_CONFIRMED = "ended", "not ours", "not confirmed"
+END_STATES = ("done", "failed", "cancelled")     # the only states that end a job; "running" goes on
 SILENT_RETRY_S = 10         # a status request that gets no answer is tried again for this long, then the drill gives up
 POLL_S = 0.5
 
@@ -90,15 +91,18 @@ def follow_job(job_id: str | None, limit: float, ask, ask_cancel, clock=time.mon
     """Poll OUR job until its end is CONFIRMED. Pure: `ask` gives the status view of the job (it raises SERVER_GONE
     when no answer comes), `ask_cancel` asks for the cancel, `clock` and `sleep` are the time. Returns (verdict, the
     last view of our job):
-      ENDED          a view of our job with a state that is not "running";
+      ENDED          a view of our job with an end state (done, failed, cancelled);
       NOT_OURS       another job's id answers (or none);
       NOT_CONFIRMED  no answer for SILENT_RETRY_S in a row, or still running after the cancel at `limit` and
-                     CANCEL_WAIT_S more. An end that is not confirmed is NOT an end: the job can still write."""
+                     CANCEL_WAIT_S more. An end that is not confirmed is NOT an end: the job can still write.
+    A view of our job with a missing or unknown state is no answer: it is tried again like one."""
     job, cancelled, silent_since = {}, False, None
     deadline = clock() + limit
     while True:
         try:
             view = ask()
+            if view.get("id") == job_id and view.get("state") not in ("running", *END_STATES):
+                raise BadAnswer(f"the state {view.get('state')!r}")     # an unknown or missing state ends nothing
             silent_since = None
         except SERVER_GONE:
             view, silent_since = None, clock() if silent_since is None else silent_since
@@ -108,7 +112,7 @@ def follow_job(job_id: str | None, limit: float, ask, ask_cancel, clock=time.mon
             if view.get("id") != job_id:
                 return NOT_OURS, view
             job = view
-            if view.get("state") != "running":
+            if view.get("state") in END_STATES:
                 return ENDED, view
         if clock() >= deadline:
             if cancelled:
@@ -164,7 +168,11 @@ def follow_checks() -> list[tuple[str, bool, str]]:
              ("a job that ends after the cancel is a confirmed end", [good(running)] * 12 + [good(done)], 5, (ENDED, done, 1)),
              ("another job's id is \"not ours\"", [good(running), good(other)], 60, (NOT_OURS, other, 0)),
              ("a good answer with no job is \"not ours\"", [good(running), good(None)], 60, (NOT_OURS, {}, 0))]
-    for what, bad in (("an HTTP 500", error_500), ("an HTML error page", html), ('{"ok": false}', refused)):
+    no_job_key = (200, b"{}")                       # a good answer has the key "job"
+    stateless, weird = good({"id": "job1"}), good({"id": "job1", "state": "weird"})
+    for what, bad in (("an HTTP 500", error_500), ("an HTML error page", html), ('{"ok": false}', refused),
+                      ("{} with HTTP 200", no_job_key), ("a job with no state", stateless),
+                      ('a job with the state "weird"', weird)):
         cases.append((f"{what} once, then done, is a confirmed end", [bad, good(done)], 60, (ENDED, done, 0)))
         cases.append((f"{what} until the retry limit is not a confirmed end", [good(running), bad], 60,
                       (NOT_CONFIRMED, running, 0)))

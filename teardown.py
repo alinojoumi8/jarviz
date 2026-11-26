@@ -293,7 +293,7 @@ def posix_table(commands: str, programs: str) -> list[tuple[int, str, str]]:
     """Join the two `ps` lists by pid: (pid, command line, executable). The command line cannot tell the program
     from its first argument ("python3 chrome_tools.py ..."), so the executable comes from `comm`: on Linux the
     name of the executable, cut to 15 characters ("chrome", "chrome_crashpad"); on a Mac its full path, with spaces.
-    A process whose executable is not in the second list gets "": it is never ours."""
+    A process whose executable is not in the second list gets "": its program is not known (see pids_on_profile)."""
     names = _pid_lines(programs)
     return [(pid, command, names.get(pid, "")) for pid, command in _pid_lines(commands).items()
             if "chrom" in command.casefold()]
@@ -324,24 +324,46 @@ def _process_table() -> list[tuple[int, str, str]] | None:
     return posix_table(done.stdout.decode("utf-8", "replace"), named.stdout.decode("utf-8", "replace"))
 
 
-def names_profile(command: str, folder, windows: bool | None = None, program: str = "") -> bool:
-    """True when a process runs on `folder` (or a folder inside it) as its profile path.
-    Windows: the path anywhere in the command line, because the query there lists chrome.exe only.
-    Elsewhere `ps` lists every program with "chrom" anywhere in its line, so two things must hold:
-    (a) the PROGRAM is Chrome: the name of its executable (`program`, from `ps -o comm=`; its last path part,
-        which can hold spaces: "Google Chrome Helper (Renderer)") holds "chrom". No executable: not ours;
-    (b) the profile is named by --user-data-dir=<folder or inside it>, or, for Chrome's own crash helper
-        (chrome_crashpad_handler), by --database=<inside the folder>.
-    Anything else (an editor that opens chrome_debug.log, a script called chrome_tools.py) is never ours."""
-    windows = os.name == "nt" if windows is None else windows
-    needle = str(folder).replace("\\", "/").rstrip("/").casefold()
-    text = command.replace("\\", "/")
-    if windows:
-        return needle in text.casefold()
-    executable = str(program or "").replace("\\", "/").rstrip("/").rsplit("/", 1)[-1].casefold()
-    if "chrom" not in executable:
+COMM_CHARS = 15                     # Linux cuts the name in `ps -o comm=` to this many characters
+CRASH_HELPERS = frozenset({"chrome_crashpad_handler", "chrome_crashpad"})   # Chrome's own crash helper (Linux: cut)
+
+
+def chrome_names(browser) -> frozenset[str]:
+    """The names that the program of the Chrome Jarviz starts can have: the name of the browser that find_chrome()
+    gives, the name of the file it points to, and the binary "chrome" beside that file (on Linux, google-chrome
+    is a script that runs it). No browser: no names, so no process is ours."""
+    if not browser:
+        return frozenset()
+    path = Path(browser)
+    names = {path.name}
+    try:
+        real = path.resolve()
+        names.add(real.name)
+        if (real.parent / "chrome").is_file():
+            names.add("chrome")
+    except OSError:
+        pass
+    return frozenset(names)
+
+
+def is_chrome_program(program: str, names) -> bool:
+    """True when `program` (from `ps -o comm=`; its last path part) is the Chrome that Jarviz starts: one of
+    `names` (chrome_names), the same cut to 15 characters (Linux), one of its Mac helpers ("<name> Helper",
+    "<name> Helper (Renderer)" ...), or Chrome's crash helper. A name that only holds "chrom" (chrome_backup) is not."""
+    executable = str(program or "").replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+    if not executable or not names:
         return False
-    _, _, rest = text.partition(" --")
+    for name in names:
+        if executable in (name, name[:COMM_CHARS], f"{name} Helper") or (
+                executable.startswith(f"{name} Helper (") and executable.endswith(")")):
+            return True
+    return executable in CRASH_HELPERS
+
+
+def _profile_option(command: str, needle: str, database: bool) -> bool:
+    """True when an option of the command line names the profile: --user-data-dir=<the folder or inside it>, or,
+    when `database`, --database=<inside the folder> (the crash helper)."""
+    _, _, rest = command.replace("\\", "/").partition(" --")
     for option in ("--" + part for part in rest.split(" --")) if rest else ():
         name, equals, value = option.partition("=")
         value = value.strip().strip("\"'").rstrip("/").casefold()
@@ -349,17 +371,54 @@ def names_profile(command: str, folder, windows: bool | None = None, program: st
             continue
         if name.casefold() == "--user-data-dir" and (value == needle or value.startswith(needle + "/")):
             return True
-        if name.casefold() == "--database" and "crashpad" in executable and value.startswith(needle + "/"):
+        if database and name.casefold() == "--database" and value.startswith(needle + "/"):
             return True
     return False
 
 
+def names_profile(command: str, folder, windows: bool | None = None, program: str = "", names=frozenset()) -> bool:
+    """True when a process runs on `folder` (or a folder inside it) as its profile path.
+    Windows: the path anywhere in the command line, because the query there lists chrome.exe only.
+    Elsewhere `ps` lists every program with "chrom" anywhere in its line, so two things must hold:
+    (a) the PROGRAM is the Chrome that Jarviz starts (is_chrome_program, with `names` = chrome_names);
+    (b) the profile is named by --user-data-dir=<folder or inside it>, or, for Chrome's own crash helper, by
+        --database=<inside the folder>.
+    Anything else (an editor that opens chrome_debug.log, a script called chrome_tools.py) is never ours."""
+    windows = os.name == "nt" if windows is None else windows
+    needle = str(folder).replace("\\", "/").rstrip("/").casefold()
+    if windows:
+        return needle in command.replace("\\", "/").casefold()
+    if not is_chrome_program(program, names):
+        return False
+    executable = str(program).replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+    return _profile_option(command, needle, database=executable in CRASH_HELPERS)
+
+
+def pids_on_profile(table, folder, names, windows: bool | None = None) -> list[int] | None:
+    """The pids in a process table (pid, command line, program) that run on `folder`. Pure. On a Mac or Linux a
+    process that names the profile but whose program is not known (it was not in the second `ps` list) could be
+    ours or not: nobody knows. Then the answer is None ("could not look"), so nothing is killed on a guess and no
+    check says "clean"."""
+    windows = os.name == "nt" if windows is None else windows
+    needle = str(folder).replace("\\", "/").rstrip("/").casefold()
+    pids = []
+    for pid, command, program in table:
+        if not program and not windows:
+            if _profile_option(command, needle, database=True):
+                return None
+            continue
+        if names_profile(command, folder, windows=windows, program=program, names=names):
+            pids.append(pid)
+    return pids
+
+
 def chrome_pids_using(folder: Path) -> list[int] | None:
-    """Every Chrome process whose command line names `folder` as (part of) its profile path. None: could not look."""
+    """Every Chrome process of Jarviz's own browser that runs on `folder` as (part of) its profile path.
+    None: could not look."""
     table = _process_table()
     if table is None:
         return None
-    return [pid for pid, command, program in table if names_profile(command, folder, program=program)]
+    return pids_on_profile(table, folder, chrome_names(find_chrome()))
 
 
 def _kill(pid: int) -> None:
@@ -2519,43 +2578,63 @@ def _offline_bay_checks(reply: str, evidence: dict) -> list[tuple[str, bool, str
     """More offline checks: which processes are ours, which sites may open, the pinned REA, the profiles folder,
     and the bay's start, cancel and picture. No browser, no network, no REA run, no real job thread."""
     results = []
-    # Which processes are ours: on a Mac or Linux only Chrome itself (its executable, from `ps -o comm=`), and only
-    # with the profile in --user-data-dir= (or, for its crash helper, in --database=). Made-up `ps` lists; the home
-    # folder has a space, as a Mac one can have.
+    # Which processes are ours: on a Mac or Linux only the Chrome that Jarviz starts (its program, from `ps -o comm=`,
+    # is that browser, one of its helpers, or its crash helper), and only with the profile in --user-data-dir= (or,
+    # for the crash helper, in --database=). Made-up `ps` lists; the home folder has a space, as a Mac one can have.
     root = "/Users/j s/.jarvis-tools/rea/profiles"
     mac_chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
     mac_helpers = "/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework.framework/Helpers/"
     mac_renderer = mac_helpers + "Google Chrome Helper (Renderer).app/Contents/MacOS/Google Chrome Helper (Renderer)"
-    posix = [  # pid, command line, executable ("" = not in the second list), ours
-        (101, f"/opt/google/chrome/chrome --type=renderer --user-data-dir={root}/job1 --lang=en", "chrome", True),
-        (102, f"/opt/google/chrome/chrome_crashpad_handler --database={root}/job1/Crashpad --url=x", "chrome_crashpad", True),
-        (103, f"/usr/bin/python3 /tmp/chrome_tools.py --user-data-dir={root}/job1", "python3", False),
-        (104, f"node --redirect-warnings={root}/job1/chrome_debug.log", "node", False),
-        (105, f"vim {root}/job1/chrome_debug.log", "vim", False),
-        (106, f"/opt/google/chrome/chrome --database={root}/job1/Crashpad", "chrome", False),
-        (107, "/usr/bin/chromium --user-data-dir=/home/u/.config/chromium", "chromium", False),
-        (108, f"/opt/google/chrome/chrome --user-data-dir={root}-old/job1", "chrome", False),
-        (109, f"/opt/google/chrome/chrome --user-data-dir={root}/job1", "", False),
-        (201, f"{mac_chrome} --user-data-dir={root}/job1 --no-first-run", mac_chrome, True),
-        (202, f"{mac_renderer} --type=renderer --user-data-dir={root}/job1", mac_renderer, True),
-        (203, f"{mac_helpers}chrome_crashpad_handler --database={root}/job1/Crashpad", mac_helpers + "chrome_crashpad_handler", True),
-        (204, f"/usr/bin/python3 /Users/j s/chrome_tools.py --user-data-dir={root}/job1", "/usr/bin/python3", False)]
-    commands = "\n".join(f"{pid:>6} {command}" for pid, command, _, _ in posix)
-    programs = "\n".join(f"{pid:>6} {program}" for pid, _, program, _ in posix if program)
-    table = {pid: (command, program) for pid, command, program in posix_table(commands, programs)}
+    mac_gpu = mac_helpers + "Google Chrome Helper (GPU).app/Contents/MacOS/Google Chrome Helper (GPU)"
+    linux_chrome, linux_chromium = frozenset({"google-chrome", "chrome"}), frozenset({"chromium-browser"})
+    groups = [  # (the browser names, [(pid, command line, program ("" = not in the second list), ours)])
+        (linux_chrome, [
+            (101, f"/opt/google/chrome/chrome --type=renderer --user-data-dir={root}/job1 --lang=en", "chrome", True),
+            (102, f"/opt/google/chrome/chrome_crashpad_handler --database={root}/job1/Crashpad --url=x", "chrome_crashpad", True),
+            (103, f"/usr/bin/python3 /tmp/chrome_tools.py --user-data-dir={root}/job1", "python3", False),
+            (104, f"node --redirect-warnings={root}/job1/chrome_debug.log", "node", False),
+            (105, f"vim {root}/job1/chrome_debug.log", "vim", False),
+            (106, f"/opt/google/chrome/chrome --database={root}/job1/Crashpad", "chrome", False),
+            (107, "/usr/bin/chromium --user-data-dir=/home/u/.config/chromium", "chromium", False),
+            (108, f"/opt/google/chrome/chrome --user-data-dir={root}-old/job1", "chrome", False),
+            (109, f"/home/u/bin/chrome_backup --user-data-dir={root}/job1", "chrome_backup", False),
+            (110, "chromedriver --port=9515", "", False)]),          # no program, and no profile: it is left out
+        (linux_chromium, [
+            (301, f"/usr/lib/chromium-browser/chromium-browser --type=renderer --user-data-dir={root}/job1",
+             "chromium-browser"[:COMM_CHARS], True),
+            (302, f"/opt/google/chrome/chrome --user-data-dir={root}/job1", "chrome", False)]),
+        (frozenset({"Google Chrome"}), [
+            (201, f"{mac_chrome} --user-data-dir={root}/job1 --no-first-run", mac_chrome, True),
+            (202, f"{mac_renderer} --type=renderer --user-data-dir={root}/job1", mac_renderer, True),
+            (203, f"{mac_gpu} --type=gpu-process --user-data-dir={root}/job1", mac_gpu, True),
+            (204, f"{mac_helpers}chrome_crashpad_handler --database={root}/job1/Crashpad", mac_helpers + "chrome_crashpad_handler", True),
+            (205, f"/usr/bin/python3 /Users/j s/chrome_tools.py --user-data-dir={root}/job1", "/usr/bin/python3", False)])]
+
+    def table_of(rows) -> list:
+        commands = "\n".join(f"{pid:>6} {command}" for pid, command, _, _ in rows)
+        programs = "\n".join(f"{pid:>6} {program}" for pid, _, program, _ in rows if program)
+        return posix_table(commands, programs)
+
     wrong: list = []
-    for pid, _, _, ours in posix:
-        command, program = table.get(pid, ("", ""))
-        if names_profile(command, root, windows=False, program=program) != ours:
-            wrong.append(pid)
+    for names, rows in groups:
+        got = pids_on_profile(table_of(rows), root, names, windows=False)
+        if got != [pid for pid, _, _, ours in rows if ours]:
+            wrong.append(f"{sorted(names)}: {got}")
+    # A process that names the profile but whose program is not known: nobody knows whose it is ("could not look").
+    unknown = groups[0][1] + [(111, f"/opt/google/chrome/chrome --user-data-dir={root}/job1", "", False)]
+    if pids_on_profile(table_of(unknown), root, linux_chrome, windows=False) is not None:
+        wrong.append("a process on the profile with no known program did not give 'could not look'")
+    if pids_on_profile(table_of(groups[0][1]), root, frozenset(), windows=False) != []:
+        wrong.append("with no browser found, a process was ours")
     windows = [(r'"C:\Program Files\Google\Chrome\Application\chrome.exe" --type=gpu-process '
                 r'--user-data-dir=C:\Users\u\.jarvis-tools\rea\profiles\job1', True),
                (r'"C:\Program Files\Google\Chrome\Application\chrome.exe" "--user-data-dir=C:\Users\u\.jarvis-tools\rea\profiles\job1"', True),
                (r'"C:\Program Files\Google\Chrome\Application\chrome.exe" --user-data-dir=C:\Users\u\AppData\Local\Google\Chrome', False)]
     wrong += [line for line, ours in windows if names_profile(line, r"C:\Users\u\.jarvis-tools\rea\profiles", windows=True) != ours]
-    one_job = names_profile(posix[0][1], root + "/job1", windows=False, program="chrome")
-    results.append(("a process is ours only when Chrome itself runs on a job profile; a script or an editor is not",
-                    not wrong and one_job and len(table) == len(posix), f"wrong: {wrong}, rows {len(table)}"))
+    one_job = names_profile(groups[0][1][0][1], root + "/job1", windows=False, program="chrome", names=linux_chrome)
+    results.append(("a process is ours only when Jarviz's own Chrome runs on a job profile; a look-alike or a script "
+                    "is not, and an unknown program on the profile is 'could not look'",
+                    not wrong and one_job, f"wrong: {wrong}"))
     # Which sites may open: the same rule for the server and the command line. The lookup is a stub.
     asked: list[str] = []
 

@@ -6,7 +6,7 @@
    page did. Nothing goes to the network, and no file is read except the two that are named.
 
    preflight runs it:   node page_checks.js viewer/core.js viewer/app.js
-   It prints ONE line on stdout, JSON: {"pass": 73, "fail": 0, "failures": []}. The exit code is 0 when it
+   It prints ONE line on stdout, JSON: {"pass": 79, "fail": 0, "failures": []}. The exit code is 0 when it
    ran to its end, also when a rule failed. Any other exit code means it could not run (a file is
    missing, or the page code threw while it loaded); the reason is on stderr.
    For people:          node page_checks.js viewer/core.js viewer/app.js --list   (the name of every check)
@@ -594,6 +594,69 @@ story('no node numbers on a galaxy that could not be read', {
     `${q.J().Focus.current().primary} / ${q.$('panel-title').textContent}`);
 });
 
+story('node numbers belong to one build of the galaxy', {
+  rebuilt: 'a reply about a galaxy that was built again before the read shows its answer and lights no star',
+  sameBuild: 'a reply from the same build with a newer rev still lights its stars',
+  otherBase: 'a capture whose receipt names another build adds and focuses nothing, and shows its answer',
+  inStep: 'after such a capture the page reads the file, so the next reply lights its stars again',
+  sameLabel: 'a receipt from another build does not focus a note with the same index and name',
+  teardown: 'a teardown whose notes come from another build focuses nothing; its card and result still show',
+}, async (t, open) => {
+  let p = await open({ handlers: {
+    '/chat': () => chatReply('About B', 6, [1]),
+    'graph-data.js': () => graphFile(galaxy(0, ['P', 'Q', 'R'], 'b3')),        // built again meanwhile
+  } });
+  await p.J().handleInput('tell me about B');
+  await p.tick(2500);
+  let focus = p.J().Focus.current();
+  t.check('rebuilt', focus.primary === null && focus.lit.length === 0 && p.$('panel').hidden === true
+    && p.$('answer').textContent === 'About B' && labels(p) === 'P,Q,R', `primary ${focus.primary} / ${labels(p)}`);
+
+  p = await open({ handlers: {
+    '/chat': () => chatReply('About B', 7, [1]),
+    'graph-data.js': () => graphFile(galaxy(7, ['A', 'B', 'C', 'D'])),
+  } });
+  await p.J().handleInput('tell me about B');
+  await p.tick(0);
+  t.check('sameBuild', p.J().Focus.current().primary === 1 && p.$('panel-title').textContent === 'B', String(p.J().Focus.current().primary));
+
+  let chat = () => chatReply('About C', 6, [2]);
+  p = await open({ handlers: {
+    '/remember': () => rememberReply(6, 3, 'T', 'b0'),                          // one step ahead, but from build b0
+    'graph-data.js': () => graphFile(galaxy(6, ['A', 'B', 'C'])),
+    '/chat': () => chat(),
+  } });
+  await p.J().handleInput('remember that T');
+  await p.tick(1000);
+  t.check('otherBase', p.J().data().nodes.length === 3 && p.J().Focus.current().primary === null && p.$('answer').textContent === 'Saved T',
+    `${labels(p)} / ${p.J().Focus.current().primary}`);
+  await p.J().handleInput('tell me about C');
+  await p.tick(0);
+  t.check('inStep', count(p.fetchLog, 'graph-data.js') === 1 && p.J().Focus.current().primary === 2,
+    `${count(p.fetchLog, 'graph-data.js')} reads, primary ${p.J().Focus.current().primary}`);
+
+  p = await open({ handlers: {
+    '/remember': () => Object.assign(rememberReply(0, 3, 'T', 'b1'), { graph: meta(0, 'b2') }),
+    'graph-data.js': () => graphFile(galaxy(0, ['A', 'B', 'C', 'T'], 'b2')),   // another build, T at the same place
+  } });
+  await p.J().handleInput('remember that T');
+  await p.tick(1000);
+  t.check('sameLabel', p.J().Focus.current().primary === null && labels(p) === 'A,B,C,T' && p.$('answer').textContent === 'Saved T',
+    `primary ${p.J().Focus.current().primary}`);
+
+  const result = { births: [receipt(3, 'Teardown x', 'b1')], spoken: 'Done', seconds: 40, label: 'Teardown · x', host: 'x', name: 'n',
+                   stack: [], totals: '', snapshot: '' };
+  p = await open({ handlers: {
+    '/teardown/status': () => ({ ok: true, job: job('j1', 'done', { result }), graph: meta(0, 'b2') }),
+    'graph-data.js': () => graphFile(galaxy(0, ['A', 'B', 'C', 'Teardown x'], 'b2')),
+  } });
+  p.J().Teardown.follow(job('j1', 'running'));
+  await p.tick(2000);
+  focus = p.J().Focus.current();
+  t.check('teardown', focus.primary === null && p.$('td-title').textContent === 'Teardown · x' && p.$('answer').textContent === 'Done',
+    `primary ${focus.primary} / ${p.$('td-title').textContent} / ${p.$('answer').textContent}`);
+});
+
 story('forget names the galaxy of its capture', {
   build: 'forget sends the build from the capture\'s receipt, with index, label and session',
   receipt: 'forget sends the receipt\'s build even when the reply\'s graph numbers name another build',
@@ -601,7 +664,7 @@ story('forget names the galaxy of its capture', {
   none: 'a receipt with no build (an old server) sends no build field, and the server\'s refusal is shown',
   late: 'a capture from a late reply keeps its receipt\'s build',
 }, async (t, open) => {
-  let remembered = rememberReply(6, 3, 'T', 'r1');
+  let remembered = rememberReply(6, 3, 'T');
   let forgetAnswer = () => ({ ok: false, answer: 'Refused line', nodes: [], graph: meta(6), error: 'forget_failed' });
   const p = await open({ handlers: {
     '/remember': () => remembered,
@@ -614,7 +677,7 @@ story('forget names the galaxy of its capture', {
   await p.J().handleInput('forget that');
   await p.tick(0);
   const sent = forgets();
-  t.check('build', sent.length === 1 && sent[0].build === 'r1' && sent[0].index === 3 && sent[0].label === 'T'
+  t.check('build', sent.length === 1 && sent[0].build === 'b1' && sent[0].index === 3 && sent[0].label === 'T'
     && typeof sent[0].session === 'string', JSON.stringify(sent));
   t.check('refused', p.$('answer').textContent === 'Refused line' && p.$('answer').classList.contains('trouble'));
   remembered = Object.assign(rememberReply(7, 4, 'U', 'r2'), { graph: meta(0, 'b9') });   // the reply names another build

@@ -1516,13 +1516,14 @@ USED_LOCK = threading.Lock()
 MAX_USED_SIGNATURES = 4096              # only good signatures come in here. When it is full: refuse, never forget
 
 
-def claim_signature(value: str, now: float | None = None) -> bool:
+def claim_signature(value: str, clock=time.time) -> bool:
     """A signature works once. True the first time a good signature comes; False when its nonce was used before,
     when its time window is over (it is checked again here: a body can come late), or when the table is full. A
-    nonce is kept until the time window of its signature ends; after that its stamp alone refuses it."""
+    nonce is kept until the time window of its signature ends; after that its stamp alone refuses it. The time is
+    read INSIDE the lock, so the time that is checked is the time of the claim. `clock`: the time (a test gives one)."""
     stamp, nonce = value.split(".")[:2]
-    now = time.time() if now is None else now
     with USED_LOCK:
+        now = clock()
         for old in [old for old, until in USED_SIGNATURES.items() if until < now]:
             del USED_SIGNATURES[old]
         if abs(now - int(stamp)) > SIGN_WINDOW_S:      # expired: never claimed, so a pruned nonce cannot come back
