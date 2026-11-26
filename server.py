@@ -539,12 +539,15 @@ class Galaxy:
                 except OSError:
                     pass                            # the error that stopped the birth is the one to report
                 raise
-            self._born[note.path] = hashlib.sha256(data).hexdigest()
+            # The fingerprint names THIS creation of the note: a later capture with the same title, path and index but
+            # other text has other bytes. Two captures with exactly the same bytes count as the same note.
+            born = self._born[note.path] = hashlib.sha256(data).hexdigest()
             return {
                 "index": index,
                 "title": note.label,
                 "file": note.path,
                 "build": self.build_id,     # the galaxy this number belongs to, read under the same lock (/forget)
+                "born": born,               # the sha256 (hex, all 64 characters) of the bytes written (/forget)
                 "related": self._nearest(note, [a for a, _ in new_links]),
                 "node": {"id": index, "label": note.label, "group": note.group, "excerpt": note.excerpt},
                 "links": [{"source": a, "target": b} for a, b in sorted(new_links)],
@@ -588,10 +591,12 @@ class Galaxy:
             content = render_capture(name, fact, self._related_title(fact), source)
             return self.birth_note(f"{CAPTURES_DIR}/{name}.md", content)
 
-    def forget_last(self, index: int, label: str, build_id: str) -> dict:
+    def forget_last(self, index: int, label: str, build_id: str, born: str) -> dict:
         """Undo the newest capture: move its file to captures/.trash and take its star away. `build_id`: the galaxy
         the receipt came from (its "build"). When the galaxy was built again since (another notes folder, or
-        build.py), the same number and title can be another note: then nothing moves."""
+        build.py), the same number and title can be another note: then nothing moves. `born`: the fingerprint of
+        the creation on the receipt. A later capture with the same title can sit at the same path and index: only
+        the note that this receipt was made for is forgotten."""
         with self.lock:
             self.refresh_if_rebuilt()
             if build_id != self.build_id:
@@ -601,6 +606,8 @@ class Galaxy:
                 raise ValueError("only the newest note can be forgotten")
             if note.label != label or not note.path.startswith(CAPTURES_DIR + "/"):
                 raise ValueError("that note is not a capture")
+            if self._born.get(note.path) != born:
+                raise ValueError("that is not the note this receipt was made for")
             source = self._note_path(note.path)
             trash = self.notes_dir / CAPTURES_DIR / TRASH_DIR
             trash.mkdir(parents=True, exist_ok=True)
@@ -1008,15 +1015,18 @@ def render_turn(question: str, shown: list[tuple[int, build.Note]], total: int) 
     return "\n\n".join(parts)
 
 
-def note_id(note: build.Note) -> tuple[str, str]:
-    """The identity of a note of the galaxy now: (the notes folder, its path in that folder). The path alone is not
-    enough: another notes folder can hold the same shop/Foo.md. Call it with GALAXY.lock held."""
-    return str(GALAXY.notes_dir), note.path
+def note_id(note: build.Note) -> tuple[str, str, str | None]:
+    """The identity of a note of the galaxy now: (the notes folder, its path in that folder, the fingerprint of its
+    creation in this run, or None for a note this run did not make). The path alone is not enough: another notes
+    folder can hold the same shop/Foo.md, and a later capture with the same title can take the same path and number.
+    Call it with GALAXY.lock held."""
+    return str(GALAXY.notes_dir), note.path, GALAXY._born.get(note.path)
 
 
 def still_there(index: int, ids: dict[int, tuple]) -> bool:
     """True when the note at `index` is still the one that was offered under that number: the same note_id (the
-    same notes folder and the same path in it). A title is no identity. Call it with GALAXY.lock held."""
+    same notes folder, the same path in it, the same creation). A title is no identity. Call it with GALAXY.lock
+    held."""
     note = GALAXY.note(index)
     return note is not None and index in ids and note_id(note) == ids[index]
 
@@ -1086,15 +1096,16 @@ def remember_route(payload: dict) -> tuple[int, dict]:
 
 
 def forget_route(payload: dict) -> tuple[int, dict]:
-    """{"index", "label", "build"}: all three from the capture's receipt. "build" (the galaxy the receipt came from,
-    a text) is REQUIRED: without it the same number and title could be a note of another galaxy."""
-    index, label, build_id = payload.get("index"), payload.get("label"), payload.get("build")
+    """{"index", "label", "build", "born"}: all four from the capture's receipt. "build" (the galaxy the receipt
+    came from) and "born" (the fingerprint of that creation of the note) are REQUIRED texts: without them the same
+    number and title could be a note of another galaxy, or a later capture with the same first words."""
+    index, label, build_id, born = (payload.get(name) for name in ("index", "label", "build", "born"))
     if (isinstance(index, bool) or not isinstance(index, int) or not isinstance(label, str)
-            or not isinstance(build_id, str)):
+            or not isinstance(build_id, str) or not isinstance(born, str)):
         line = LINES["forget_failed"].format(reason="I was not told which note.")
         return 400, reply(line, ok=False, error="bad_request")
     try:
-        receipt = GALAXY.forget_last(index, label, build_id)
+        receipt = GALAXY.forget_last(index, label, build_id, born)
     except (OSError, ValueError) as error:
         line = LINES["forget_failed"].format(reason=reason_of(error))
         return 409, reply(line, ok=False, error="forget_failed")

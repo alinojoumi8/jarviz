@@ -113,7 +113,7 @@ Review:
   - "What did my teardown of stripe.com say?" does not ask for a new teardown.
 - The other 2 findings are one limit that is not closed. It is written under "Not proven" below.
 - [x] CodeRabbit read those fixes again and gave 13 findings. 10 are fixed (a put-back never writes over another file, a take-back checks the file that it will delete, "can you summarize my teardown" starts nothing, and 7 smaller ones). 3 were not real: a trace and a small test showed it.
-- [x] CodeRabbit is now installed on GitHub. Its first review of the whole pull request gave 18 major and 37 minor findings. 43 are fixed. The ones that matter most:
+- [x] CodeRabbit is now installed on GitHub. Its first review of the whole pull request gave 18 major and 37 minor findings. 44 are fixed. The ones that matter most:
   - "Do not tear down stripe.com" no longer passes as a request. "How did my teardown of stripe.com work?" no longer starts a new teardown from the page.
   - A signed request from a tool works one time only.
   - The brain test asks a real question. (It found that the OpenAI account has no credit.)
@@ -140,14 +140,14 @@ Review:
   - A note is known by its notes folder and its path.
 - [x] A fourth set of 5 replies: 1 closed its thread, 4 had a small point, all 4 fixed. The time of a signature is read inside the lock. On a Mac or Linux only the exact Chrome that Jarviz starts counts, and a process that nobody can name stops nothing. The drill takes only the end states it knows. The page uses a node number only for the galaxy it belongs to. `page_checks.js` has 79 rules now.
 - [x] A fifth set of 4 replies: 2 tiny points fixed (the drill wants a job with an id; the page lights a note only on the exact state of the galaxy that the answer was made from). 1 point is not changed, on purpose: on a Mac or Linux, Jarviz knows "its" Chrome by the program's name and by the test profile in its command line, not by the full file path of the program. A program with Chrome's exact name that runs on Jarviz's own test profile is treated as that Chrome. This part runs only on a Mac or Linux, and this computer has Windows, so more changes there cannot be tested here.
-- [x] A sixth set of 3 replies: 1 line fixed (on a Mac or Linux, "no browser found" now means "could not look", not "clean"). 1 point is not changed, on purpose: when another tab forgets a note and saves the same text again while a question waits, Jarviz treats the new note as the old one. They have the same title, the same file and the same text. A forget moves a note to the trash, and the trash keeps it.
+- [x] A sixth set of 3 replies: 1 line fixed (on a Mac or Linux, "no browser found" now means "could not look", not "clean").
+- [x] One more reply corrected me, and it was right: two notes can have the same title and another text, because a title takes only the first 7 words. Now every saved note carries a fingerprint of its own text. "Forget that" works only for the note with that fingerprint, so an old receipt can never move another note to the trash.
 - The other 5 replies say one thing: preflight must be all green. Its one fail is the OpenAI account with no credit. Add credit, or take the OpenAI key out of `config.json` (then that brain is not tested), and run `python preflight.py`.
-- 12 findings are not changed, on purpose:
+- 11 findings are not changed, on purpose:
   - The drill deletes its own test note also when a program changed it. A test note is not your work.
   - A cancel that comes while the note is saved: Jarviz already answers "too late, the note is saved".
   - A link file (symlink) inside your notes folder is read. The folder is yours.
   - The lock keeps `_door` (the key in the address) next to `_unlocked`. A security review read this design.
-  - An undo that is sent twice can move a new note with the same name to the trash. The trash keeps it.
   - A tag inside the brain's sentence still runs. The brain writes its line and the tag together, and the tag runs only when you asked.
   - When a note is saved during a teardown that fails, the Jarviz note can stay. Jarviz says which notes stay.
   - Preflight does not download the two libraries to check their hash. The browser does that at each start.

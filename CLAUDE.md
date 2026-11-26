@@ -136,10 +136,11 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
   names the profile in `--user-data-dir=` (the crash helper in `--database=`). Another program is never stopped.
   A process on the profile whose program is not known, a process list that cannot be read, or no browser found
   is "could not look": nothing is stopped on a guess, and no check says "clean".
-- The identity of a note is its notes folder and its path (`note_id`), not its title. The sources of a reply and
-  its graph numbers come from one locked step (`chat_route`, `search_route`). Every capture receipt carries
-  `"build"`, written under the lock. `/forget` needs it: a capture from a galaxy that was built again is not
-  forgotten. The page sends the build of the receipt, not the build of the reply.
+- The identity of a note is its notes folder, its path and, for a note of this run, the fingerprint of the bytes
+  that were written (`note_id`), not its title. The sources of a reply and its graph numbers come from one locked
+  step (`chat_route`, `search_route`). Every capture receipt carries `"build"` and `"born"` (that fingerprint),
+  written under the lock. `/forget` needs both, taken from the receipt: it moves a note only when it is the same
+  creation, in the same galaxy. Two captures with exactly the same bytes count as the same note.
 - Node numbers belong to one state of the galaxy. The page uses the node numbers of a reply only when the galaxy
   on screen is exactly the reply's snapshot (the same `build_id` and the same `rev`), a receipt only when its
   `build` is the build on screen, and never on a galaxy that it could not read again.

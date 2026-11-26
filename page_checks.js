@@ -6,7 +6,7 @@
    page did. Nothing goes to the network, and no file is read except the two that are named.
 
    preflight runs it:   node page_checks.js viewer/core.js viewer/app.js
-   It prints ONE line on stdout, JSON: {"pass": 82, "fail": 0, "failures": []}. The exit code is 0 when it
+   It prints ONE line on stdout, JSON: {"pass": 84, "fail": 0, "failures": []}. The exit code is 0 when it
    ran to its end, also when a rule failed. Any other exit code means it could not run (a file is
    missing, or the page code threw while it loaded); the reason is on stderr.
    For people:          node page_checks.js viewer/core.js viewer/app.js --list   (the name of every check)
@@ -162,7 +162,7 @@ function galaxy(rev, labels, build_id = 'b1') {
 }
 const graphFile = data => 'window.GRAPH = ' + JSON.stringify(data) + ';\n';
 const receipt = (index, label, build = 'b1') => ({ index, title: label, file: 'captures/' + label + '.md', related: 0, build,
-  node: { id: index, label, group: 'captures', excerpt: '' }, links: [{ source: index, target: 0 }] });
+  born: 'born-' + label, node: { id: index, label, group: 'captures', excerpt: '' }, links: [{ source: index, target: 0 }] });
 const rememberReply = (rev, index, label, build = 'b1') => ({ ok: true, answer: 'Saved ' + label, nodes: [index], graph: meta(rev),
   action: { type: 'remember', receipt: receipt(index, label, build) } });
 const chatReply = (answer, rev, nodes = []) => ({ ok: true, answer, nodes, graph: meta(rev) });
@@ -701,7 +701,9 @@ story('forget names the galaxy of its capture', {
   receipt: 'forget sends the receipt\'s build even when the reply\'s graph numbers name another build',
   refused: 'a refused forget shows the server\'s line',
   none: 'a receipt with no build (an old server) sends no build field, and the server\'s refusal is shown',
-  late: 'a capture from a late reply keeps its receipt\'s build',
+  born: 'forget sends the receipt\'s born (that one creation of the note) next to its build',
+  noBorn: 'a receipt with no born sends no born field, and the server\'s refusal is shown',
+  late: 'a capture from a late reply keeps its receipt\'s build and born',
 }, async (t, open) => {
   let remembered = rememberReply(6, 3, 'T');
   let forgetAnswer = () => ({ ok: false, answer: 'Refused line', nodes: [], graph: meta(6), error: 'forget_failed' });
@@ -736,6 +738,18 @@ story('forget names the galaxy of its capture', {
   const third = forgets()[2];
   t.check('none', Boolean(third) && !('build' in third) && third.index === 4 && p.$('answer').textContent === 'No build line',
     `${JSON.stringify(third)} / ${p.$('answer').textContent}`);
+  t.check('born', sent[0].born === 'born-T' && forgets()[1].born === 'born-U' && third.born === 'born-V',
+    JSON.stringify(forgets().map(body => body.born)));
+  remembered = rememberReply(2, 5, 'W', 'b9');                                 // a receipt without its born
+  delete remembered.action.receipt.born;
+  forgetAnswer = () => ({ ok: false, answer: 'No born line', nodes: [], graph: meta(1, 'b9'), error: 'forget_failed' });
+  await p.J().handleInput('remember that W');
+  await p.tick(1000);
+  await p.J().handleInput('forget that');
+  await p.tick(0);
+  const fourth = forgets()[3];
+  t.check('noBorn', Boolean(fourth) && !('born' in fourth) && fourth.build === 'b9' && fourth.index === 5
+    && p.$('answer').textContent === 'No born line', `${JSON.stringify(fourth)} / ${p.$('answer').textContent}`);
 
   const read = deferred();
   const chat = deferred();
@@ -756,7 +770,7 @@ story('forget names the galaxy of its capture', {
   await q.J().handleInput('forget that');
   await q.tick(0);
   const late = q.fetchLog.filter(entry => entry.key === '/forget').map(entry => entry.body)[0];
-  t.check('late', Boolean(late) && late.build === 'b1' && late.index === 3, JSON.stringify(late));
+  t.check('late', Boolean(late) && late.build === 'b1' && late.born === 'born-T' && late.index === 3, JSON.stringify(late));
 });
 
 story('a teardown that failed', {

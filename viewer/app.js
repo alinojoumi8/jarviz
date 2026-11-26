@@ -800,7 +800,9 @@
   function forgetLast() {
     if (!lastCapture) return say(lines.nothing_to_forget);
     const body = { index: lastCapture.index, label: lastCapture.title, session: SESSION };
-    if (typeof lastCapture.build === 'string' && lastCapture.build) body.build = lastCapture.build;
+    for (const name of ['build', 'born']) {          // which galaxy, and which one creation of the note
+      if (typeof lastCapture[name] === 'string' && lastCapture[name]) body[name] = lastCapture[name];
+    }
     return send('/forget', body, lines.forget_unreachable);
   }
 
