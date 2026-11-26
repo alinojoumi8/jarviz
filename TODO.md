@@ -93,6 +93,7 @@ Review:
 - [x] The whole PDF was checked against the code, prompt by prompt. Five gaps were found and fixed (see "The PDF check" below).
 - [x] CodeRabbit ran on the first commit: 44 files, 0 findings.
 - [x] CodeRabbit ran three times on the new work (the lock, the drill, the page lines): 4 small findings, then 2 in the lock tests, then 1 in the lock. All 7 are fixed.
+- [x] The last two CodeRabbit reviews found nothing: the last commit, and then the whole project in one deep review.
 - [x] One more security review read the page lock. Nothing had to be fixed. Three of its ideas made the lock stronger.
 - CodeRabbit used its free review each time, because the project is not on GitHub. Its full review needs the project on GitHub and CodeRabbit installed for it. That is your decision.
 - [x] The code is committed on the branch `first-build`. Nothing is pushed anywhere.

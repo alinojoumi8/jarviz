@@ -977,7 +977,8 @@ def tag_teardown(argument: str, question: str, session: Session, payload: dict) 
 #     a caller that brought the key itself.
 #   - `python server.py --link` shows the link only after the server PROVED that it holds the key
 #     (/lock/proof), because the browser that the link is pasted into does send the key.
-# The key is never in viewer/, never in a response body and never in the console.
+# The key is never in viewer/, never in a response body and never in the server's console. The one
+# command that shows it is `python server.py --link`, in the user's own terminal, when the user asks.
 # What the lock cannot stop:
 #   - A program that runs AS the user. It can read the key file, and config.json too.
 #   - Cookies ignore the port number: another server on 127.0.0.1 that this browser visits can see
