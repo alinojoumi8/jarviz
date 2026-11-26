@@ -431,15 +431,24 @@ class Galaxy:
                 note = build.make_note(target, self.notes_dir)
                 index = len(self.notes)
                 new_links = build.links_for_new(note, self.notes)
+                flipped = build.flipped_wikilinks(note, self.notes)
                 self.notes.append(note)
                 self.links.update(new_links)
-                self.rev += 1
+                # The new note can crowd a shared [[link]], or be the note a shared [[link]] names. Then links
+                # among the older notes change too, so the live galaxy stays what a full rebuild would give.
+                added, removed = build.relink(self.notes, self.links, flipped)
+                self.links |= added
+                self.links -= removed
+                steps = 2 if added or removed else 1     # the page expects one step, so it reads the whole file
+                self.rev += steps
                 try:
                     self._save_graph()
                 except OSError:
                     self.notes.pop()
+                    self.links -= added
+                    self.links |= removed
                     self.links.difference_update(new_links)
-                    self.rev -= 1
+                    self.rev -= steps
                     raise
             except Exception:
                 target.unlink(missing_ok=True)      # no half-born notes: the file goes if the index failed
@@ -509,19 +518,52 @@ class Galaxy:
                 copy += 1
                 destination = trash / f"{stamp}-{copy} {source.name}"
             os.replace(source, destination)
-            dropped = {link for link in self.links if index in link}
-            self.notes.pop()
-            self.links -= dropped
-            self.rev += 1
-            try:
-                self._save_graph()
-            except OSError:
-                os.replace(destination, source)
-                self.notes.append(note)
-                self.links |= dropped
-                self.rev -= 1
-                raise
+            self._drop_newest(lambda: os.replace(destination, source))
             return {"index": index, "title": note.label, "trash": destination.relative_to(self.notes_dir).as_posix()}
+
+    def unbirth(self, receipt: dict) -> None:
+        """The mirror of birth_note, for a note that THIS run made a moment ago (a teardown that failed after it).
+        Only the newest note, and only when it is still the note on the receipt. The file is seconds old, so it
+        is deleted for good, not moved to the trash."""
+        with self.lock:
+            self.refresh_if_rebuilt()
+            index = receipt.get("index") if isinstance(receipt, dict) else None
+            note = self.note(index) if isinstance(index, int) else None
+            if (note is None or index != len(self.notes) - 1
+                    or note.label != receipt.get("title") or note.path != receipt.get("file")):
+                raise ValueError("only the newest note, the one on the receipt, can be taken back")
+            target = self._note_path(note.path)
+            content = target.read_bytes()
+            target.unlink()
+            self._drop_newest(lambda: target.write_bytes(content))
+            folder = target.parent
+            try:
+                if folder != self.notes_dir and folder.is_relative_to(self.notes_dir) and not any(folder.iterdir()):
+                    folder.rmdir()
+            except OSError:
+                pass
+
+    def _drop_newest(self, put_file_back) -> None:
+        """Take the newest note out of the index and save. The links it changed among the other notes are
+        mended (see birth_note). If the save fails, everything is put back, the file too (`put_file_back`)."""
+        index = len(self.notes) - 1
+        note = self.notes.pop()
+        dropped = {link for link in self.links if index in link}
+        self.links -= dropped
+        added, removed = build.relink(self.notes, self.links, build.flipped_wikilinks(note, self.notes))
+        self.links |= added
+        self.links -= removed
+        steps = 2 if added or removed else 1
+        self.rev += steps
+        try:
+            self._save_graph()
+        except OSError:
+            put_file_back()
+            self.notes.append(note)
+            self.links -= added
+            self.links |= removed | dropped
+            self.rev -= steps
+            raise
 
 
 GALAXY = Galaxy()
@@ -593,15 +635,40 @@ TAG_RE = re.compile(r"\[([A-Z][A-Z_]{2,})\s*:\s*([^\[\]]+)\]")
 WHOLE_TAG_RE = re.compile(r"\[([A-Z][A-Z_]{2,})\s*:\s*(.+)\]", re.DOTALL)
 PROMPT_TAG_RE = re.compile(r"<(/?)(notes?|receipts|question)\b", re.IGNORECASE)
 # A tag runs only when the USER asked for that action. Text inside a note can then never order one.
-TAG_INTENT = {
-    "REMEMBER": re.compile(
-        r"\b(?:remember|memori[sz]e|save|log|record|jot|store|remind|write\s+(?:\w+\s+)?down"
-        r"|keep\s+(?:in\s+mind|track)|don'?t\s+(?:let\s+me\s+)?forget"
-        r"|(?:make|take|add|leave|write)\s+(?:\w+\s+){0,3}?note|note\s+(?:that|this|it|down|to\s+self))\b", re.IGNORECASE),
-    "TEARDOWN": re.compile(
-        r"reverse[\s-]*engineer|tear(?:ing)?[\s-]*(?:\S+\s+){0,4}?down|teardown|take\s+(?:\S+\s+){0,4}?apart|x-?ray"
-        r"|\b(?:web\s?site|site|home\s?page|web\s?page|landing\s+page|web\s?app)\b", re.IGNORECASE),
-}
+# A sentence asks for a teardown when (A) it has a teardown verb, such as "reverse engineer" or "take apart",
+# or (B) it asks how a thing is built AND names something site-like ("website", "homepage", or an address such
+# as igloo.inc). "How does the loan work?" has no site, and a site word alone is never enough.
+REMEMBER_RE = re.compile(
+    r"\b(?:remember|memori[sz]e|save|log|record|jot|store|remind|write\s+(?:\w+\s+)?down"
+    r"|keep\s+(?:in\s+mind|track)|don'?t\s+(?:let\s+me\s+)?forget"
+    r"|(?:make|take|add|leave|write)\s+(?:\w+\s+){0,3}?note|note\s+(?:that|this|it|down|to\s+self))\b", re.IGNORECASE)
+TEARDOWN_VERB_RE = re.compile(
+    r"reverse[\s-]*engineer|tear(?:ing)?[\s-]*(?:\S+\s+){0,4}?down|teardown|take\s+(?:\S+\s+){0,4}?apart|x-?ray",
+    re.IGNORECASE)
+TEARDOWN_QUESTION_RE = re.compile(r"""
+    \bhow\s+(?:does|do|did|is|are|was|were)\b .{0,80}?
+    \b(?:work|works|working|built|made|make|makes|do|does|done|animate|animates|animated
+       |render|renders|rendered|load|loads|loaded)\b
+  | \bwhat(?:\s+(?:is|are|does)\b|['’]s\b) .{0,80}?
+    \b(?:built|made|written|running|run\s+on|use|uses|used|using)\b
+  | \btech(?:nology)?\s+stack\b | \bwhat\s+(?:stack|framework|library|libraries)\b | \bunder\s+the\s+hood\b
+""", re.IGNORECASE | re.VERBOSE)
+SITE_WORD_RE = re.compile(      # a site word, or an address-like word (no lookup: the text only)
+    r"\b(?:web\s?site|site|home\s?page|web\s?page|landing\s+page|web\s?app)\b|\b[a-z0-9-]{1,63}\.[a-z]{2,24}\b",
+    re.IGNORECASE)
+
+
+def asks_to_remember(sentence: str) -> bool:
+    return bool(REMEMBER_RE.search(sentence))
+
+
+def asks_for_teardown(sentence: str) -> bool:
+    """Rule (A) or rule (B) above."""
+    return bool(TEARDOWN_VERB_RE.search(sentence)
+                or (TEARDOWN_QUESTION_RE.search(sentence) and SITE_WORD_RE.search(sentence)))
+
+
+TAG_INTENT = {"REMEMBER": asks_to_remember, "TEARDOWN": asks_for_teardown}     # tag -> (the user's sentence) -> bool
 NOTE_TAG_RE = re.compile(r"\[(?=\s*[A-Z][A-Z_]{2,}\s*:)")
 LONE_TAG_RE = re.compile(r"\s*\[[A-Z][A-Z_]{2,}(?:\s*:[^\[\]]*)?\]\s*")
 
@@ -699,7 +766,7 @@ def chat_route(payload: dict) -> tuple[int, dict]:
     answer, declared = split_sources(text)
     tag = find_tag(answer)
     intent = TAG_INTENT.get(tag[0]) if tag else None
-    if tag and intent and intent.search(question):
+    if tag and intent and intent(question):
         return TAG_HANDLERS[tag[0]](tag[1], question, session, payload)
     if tag:
         answer, declared = LINES["not_asked"], []       # the user did not ask for this action
@@ -810,6 +877,7 @@ def _writer_name() -> str:
 
 BAY = teardown.Bay(notes_dir=lambda: GALAXY.notes_dir, ask=_teardown_ask,
                    birth=lambda path, content: GALAXY.birth_note(path, content),
+                   unbirth=lambda receipt: GALAXY.unbirth(receipt),
                    note_titles=lambda: GALAXY.titles(), writer_name=_writer_name, voice=VOICE,
                    plain_line=LINES["teardown_plain"]) if teardown else None
 THIS_SITE = frozenset({"this", "this site", "this page", "this website", "this one"})
@@ -836,6 +904,11 @@ def _teardown_done(job, session: Session) -> None:
     """The receipt for the chat history, so the brain knows what really happened."""
     if job.state == "done":
         session.add_receipt(f'TEARDOWN worked: {job.site.host} was taken apart and the note "{job.result["name"]}" was saved.')
+        return
+    stayed = [str(birth.get("title")) for birth in job.births if isinstance(birth, dict) and birth.get("title")]
+    if stayed:      # a note that could not be taken back is still there: the brain must not say there is none
+        session.add_receipt(f"TEARDOWN did not finish for {job.site.host} ({job.state}). No teardown note was saved. "
+                            f"These notes were made first and stay: {', '.join(stayed)}.")
     else:
         session.add_receipt(f"TEARDOWN did not finish for {job.site.host} ({job.state}). No note was saved.")
 

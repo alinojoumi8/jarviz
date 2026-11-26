@@ -42,7 +42,8 @@ Jarviz has five brains. One is active. The screen shows it at the top (`brain: .
 - Your notes go to the company of the brain that you choose.
 - After you add a key, run `python preflight.py`. It makes one real call to every brain that has a key.
 - [x] Claude: tested with the real key.
-- [ ] OpenAI, DeepSeek, Venice, OpenRouter: tested with a fake provider only. Not proven until a real key is in.
+- [x] OpenAI, DeepSeek, OpenRouter: tested with real keys. Each one answered one real call in preflight.
+- [ ] Venice: its key is in `config.json`, but Venice refuses it ("Authentication failed"). The other brains use the same code and work. Make a new key at Venice and type it into `venice_api_key`. Then run `python preflight.py`.
 
 ## Part One: the foundation
 
@@ -51,7 +52,7 @@ Jarviz has five brains. One is active. The screen shows it at the top (`brain: .
 - [x] **03 Prove where the answer came from.** One note: the camera flies to it. Four or more notes: the cluster lights and the camera stays. Small talk: nothing moves.
 - [x] **04 The butler.** The persona block is at the top of `server.py`. Greeting "Hello, sir." The note count on screen comes from the graph data.
 - [x] **05 Total Recall.** "Remember that ..." writes a real file in `notes/captures/`. A new star is born live. "Forget that" takes the last one back.
-- [x] **06 Preflight.** `preflight.py`. It had 12 live checks at the end of Part One. Now it has 17.
+- [x] **06 Preflight.** `preflight.py`. It had 12 live checks at the end of Part One. Now it has 19, and one more for each extra brain that has a key.
 
 Proven with the real brain:
 
@@ -78,7 +79,7 @@ Still to prove:
 
 Proven with the real brain and a real public site (igloo.inc):
 
-- [x] Last run: `PREFLIGHT: 17 pass, 0 fail, 0 warn` and `DRILL: 51 pass, 0 fail`.
+- [x] Last run: `PREFLIGHT: 22 pass, 1 fail, 0 warn` and `DRILL: 54 pass, 0 fail`. The one fail is the Venice key (see "Brains"). Preflight has 23 checks now, because four more brains have a key.
 - [x] The drill passed with a hidden browser, and also with the Chrome window on screen (`python drill.py --visible`). The snapshot from the visible window is a real picture.
 - [x] A full teardown in about one minute: 96 files, 14.7 MB, Three.js r165, GSAP 3.12.5, postprocessing 6.35.5.
 - [x] The card shows the 8 steps live, then the snapshot, the stack and the totals. The reader shows the whole note.
@@ -97,6 +98,11 @@ Review:
 - [x] One more security review read the page lock. Nothing had to be fixed. Three of its ideas made the lock stronger.
 - The six reviews above ran from this computer with CodeRabbit's free review. The pull request on GitHub gets CodeRabbit's full review when CodeRabbit is installed for the repository.
 - [x] The code is on GitHub, in the public repository `alinojoumi8/jarviz`. The work is on the branch `first-build`, with a pull request to `master`.
+- [x] The Codex review on the GitHub pull request found 4 problems. All 4 are fixed:
+  - A public site can no longer send the clean browser to a private IP address (`is_private_address`).
+  - After a note is born or taken back, the live links are the same as after a full rebuild (`build.relink`).
+  - A teardown tag from the brain runs only for a sentence that asks for a teardown, not one that only mentions a site.
+  - A teardown that fails takes back the Jarviz and REA notes it made (`Galaxy.unbirth`).
 
 The page lock (it was the known gap, it is closed now):
 

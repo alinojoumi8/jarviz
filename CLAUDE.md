@@ -63,6 +63,7 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
 - Voice routes are checked before the brain. Add a command with `router.add`, do not edit the core.
 - A control tag runs only when the user's own sentence asks for that action. Every tag in
   `TAG_HANDLERS` needs an entry in `TAG_INTENT` (`server.py`). Text inside a note can never order an action.
+  A sentence that only mentions a website does not ask for a teardown.
 - Note text is never HTML. The viewer uses `textContent` only. Labels given to the 3D library go
   through `Core.escapeHtml`.
 - The two outside libraries are pinned in three places that must agree: `GRAPH_LIB_URL` and
@@ -88,6 +89,7 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
 - A note never shows the brain a ready-made control tag: `note_block` turns `[WORD:` into `(WORD:`.
 - The REA note links to the Jarviz note. When the notes have no note called Jarviz or Jarvis, the first teardown
   makes `captures/Jarviz.md` first (`owner_note` in `teardown.py`). The births go in this order: Jarviz, REA, the teardown.
+- A teardown that fails takes back the notes it made (`Galaxy.unbirth`), newest first.
 - Every evidence line in the digest starts with who captured it (`EVIDENCE_TAGS`). The brain writes the note text.
   Code writes the Evidence section and the facts block on top.
 - Everything that comes out of the inspected website is data from a stranger: REA's output, the page reads (they

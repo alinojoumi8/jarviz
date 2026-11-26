@@ -880,6 +880,34 @@ def is_local_name(host) -> bool:
     return name in LOCAL_HOSTS or name == "::1" or name.endswith(PRIVATE_ENDINGS)
 
 
+# Carrier-grade NAT space. Python does not count it as private, but VPNs such as Tailscale use it for
+# the computers of one private network.
+SHARED_ADDRESSES = ipaddress.ip_network("100.64.0.0/10")
+
+
+def ip_literal(host) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """The IP address that `host` spells, or None for a host name. Brackets and a %zone may be there.
+    An IPv4 address inside IPv6 (::ffff:10.0.0.1) is given as that IPv4 address."""
+    text = str(host or "").strip()
+    if text.startswith("[") and text.endswith("]"):
+        text = text[1:-1]
+    try:
+        address = ipaddress.ip_address(text.split("%", 1)[0])
+    except ValueError:
+        return None
+    mapped = getattr(address, "ipv4_mapped", None)
+    return mapped if mapped is not None else address
+
+
+def is_private_address(host) -> bool:
+    """True when `host` is an IP address on this computer or on a private network. A name is not an address:
+    it gives False here (resolves_to_private looks a name up). THE ONE RULE for which addresses are private."""
+    address = ip_literal(host)
+    return address is not None and (address.is_private or address.is_loopback or address.is_link_local
+                                    or address.is_reserved or address.is_multicast or address.is_unspecified
+                                    or address in SHARED_ADDRESSES)
+
+
 def resolves_to_private(host: str) -> bool:
     """True when a public-looking name points at this computer or at a private network.
     "localhost" itself is allowed on purpose (the user's own projects). A failed lookup is not a yes."""
@@ -890,15 +918,7 @@ def resolves_to_private(host: str) -> bool:
         found = socket.getaddrinfo(name, None, proto=socket.IPPROTO_TCP)
     except (OSError, UnicodeError):
         return False
-    for item in found:
-        try:
-            address = ipaddress.ip_address(str(item[4][0]).split("%")[0])
-        except ValueError:
-            continue
-        if (address.is_private or address.is_loopback or address.is_link_local or address.is_reserved
-                or address.is_multicast or address.is_unspecified):
-            return True
-    return False
+    return any(is_private_address(str(item[4][0])) for item in found)
 
 
 def safe_url(value, fallback: str) -> str:
@@ -1316,11 +1336,22 @@ def _evidence_id(data: dict) -> str:
 
 
 def _refuse_local_turn(browser: Browser) -> str:
-    """Where is the page now? A public site that sends the browser to this computer is stopped at once."""
-    now = safe_url(browser.current_url(), browser.url)
-    if is_local_name(urlsplit(now).hostname) and not is_local_name(urlsplit(browser.url).hostname):
-        raise TeardownError("redirected", "The site sent the browser to an address on this computer. Jarviz stopped there.")
-    return now
+    """Where is the page now? A public site that sends the browser to this computer or to a private network
+    is stopped at once. The browser's own answer is checked first: safe_url() falls back to the first address,
+    and that would hide the turn. A job that started on the user's own localhost is not checked."""
+    raw = browser.current_url()
+    first = urlsplit(browser.url).hostname or ""
+    if raw and not is_local_name(first):
+        try:
+            host = urlsplit(raw).hostname or ""
+            unread = False
+        except ValueError:                  # an address that cannot be read cannot be proven public
+            host, unread = "", True
+        if (unread or is_local_name(host) or is_private_address(host)
+                or (host and host != first and ip_literal(host) is None and resolves_to_private(host))):
+            raise TeardownError("redirected", "The site sent the browser to an address on this computer or on a "
+                                              "private network. Jarviz stopped there.")
+    return safe_url(raw, browser.url)
 
 
 def capture(browser: Browser, on_step=lambda number: None, on_process=None) -> dict:
@@ -1857,6 +1888,15 @@ def render_note(*, name: str, label: str, site: Site, question: str, seconds: in
 
 # -------------------------------------------------------------------- the bay
 
+def _missing_folders(path: Path) -> list[Path]:
+    """The folders on the way to `path` that are not there yet, deepest first."""
+    missing = []
+    while not path.exists() and path != path.parent:
+        missing.append(path)
+        path = path.parent
+    return missing
+
+
 class Job:
     """One teardown, from the spoken sentence to the note."""
 
@@ -1889,10 +1929,11 @@ class Job:
 class Bay:
     """Runs teardowns one at a time. server.py hands in the few things it needs from the rest of Jarviz."""
 
-    def __init__(self, *, notes_dir, ask, birth, note_titles, writer_name, voice: str, plain_line: str):
+    def __init__(self, *, notes_dir, ask, birth, note_titles, writer_name, voice: str, plain_line: str, unbirth=None):
         self._notes_dir = notes_dir         # () -> Path of the notes folder
         self._ask = ask                     # (system, user_message) -> the brain's text
         self._birth = birth                 # (relative path, content) -> receipt. THE ONE DOOR for notes.
+        self._unbirth = unbirth             # (receipt) -> None: takes back a note this job made. None: they stay
         self._note_titles = note_titles     # () -> the titles of every note, lower case
         self._writer_name = writer_name     # () -> "Claude (claude-opus-5-5)"
         self._voice = voice
@@ -2053,8 +2094,10 @@ class Bay:
         image = evidence.get("snapshot") or b""
         image_path = folder / ASSETS_DIR / f"{name}.png"
         births = job.births                 # kept on the job: a write that fails later must not lose the receipts
+        made_folders: list[Path] = []       # the picture's folders that this job made, deepest first
         try:
             if image:
+                made_folders = _missing_folders(image_path.parent)
                 image_path.parent.mkdir(parents=True, exist_ok=True)
                 image_path.write_bytes(image)
             concept_file = self._notes_dir() / CONCEPT_PATH
@@ -2079,13 +2122,31 @@ class Bay:
         except Exception:
             if not births or births[-1].get("title") != name:
                 image_path.unlink(missing_ok=True)          # no picture without its note
-            raise
+            for path in made_folders:       # rmdir takes only an empty folder, and these are only the job's own
+                try:
+                    path.rmdir()
+                except OSError:
+                    pass
+            self._take_back(job)
+            raise                           # the error that stopped the job, not one from the clean-up
         assets = evidence.get("assets") or {}
         return {"name": name, "label": job.label, "host": job.site.host, "seconds": seconds,
                 "spoken": reply["spoken"], "summary": reply["summary"],
                 "stack": [stack_chip(item) for item in evidence.get("stack") or []][:10],
                 "totals": totals_line(assets), "snapshot": f"{name}.png" if image else "", "births": list(births),
                 "doubts": unsupported_claims(reply["note"], digest)}
+
+    def _take_back(self, job: Job) -> None:
+        """A teardown that failed takes back the notes it made, newest first. An older note cannot go while a
+        newer one stays, so the first one that cannot be taken back stops it. What stays is still on the job."""
+        if self._unbirth is None:
+            return
+        while job.births:
+            try:
+                self._unbirth(job.births[-1])
+            except Exception:               # noqa: BLE001 - the error that stopped the job is the one to report
+                return
+            job.births.pop()
 
     # -- notes on disk (they are still there after a restart)
 
@@ -2187,24 +2248,65 @@ def offline_checks() -> list[tuple[str, bool, str]]:
         results.append(("the reply is cut up, and an unsupported version is flagged", False, error.detail))
     results.append(("bad note names are refused", not any(map(valid_name, ("../config", "a/b", "", "con", "x..y", "A.b"))),
                     "a bad name was accepted"))
-    # A note that is born stays on the job's list when the next write fails. So a test can remove it.
-    with tempfile.TemporaryDirectory() as temp:
-        def failing_birth(path: str, content: str) -> dict:
-            if path == CONCEPT_PATH:
-                raise OSError("no room")
-            return {"file": path, "title": Path(path).stem}
+    # The Jarviz note is born, then the REA note fails. The job takes the Jarviz note back. Without a way to
+    # take it back, it stays on the job's list, so a test can remove it. No picture is left either way.
+    def failed_write(unbirth) -> tuple[Job, bool, list[str]]:
+        with tempfile.TemporaryDirectory() as temp:
+            def failing_birth(path: str, content: str) -> dict:
+                if path == CONCEPT_PATH:
+                    raise OSError("no room")
+                return {"file": path, "title": Path(path).stem}
 
-        bay = Bay(notes_dir=lambda: Path(temp), ask=lambda system, message: reply, birth=failing_birth,
-                  note_titles=lambda: set(), writer_name=lambda: "test", voice="plain", plain_line="{host} is done.")
-        job = Job(Site("https://a.test/", "a.test"), "how does it work", True)
+            bay = Bay(notes_dir=lambda: Path(temp), ask=lambda system, message: reply, birth=failing_birth,
+                      note_titles=lambda: set(), writer_name=lambda: "test", voice="plain", plain_line="{host} is done.",
+                      unbirth=unbirth)
+            job = Job(Site("https://a.test/", "a.test"), "how does it work", True)
+            try:
+                bay._write(job, dict(evidence, snapshot=PNG_SIGNATURE + b"x"))
+                raised = False
+            except OSError as error:
+                raised = str(error) == "no room"
+            left = [path.name for path in Path(temp).rglob("*.png")] + (["teardowns"] if bay.folder().exists() else [])
+        return job, raised, left
+
+    taken: list[dict] = []
+    job, raised, left = failed_write(taken.append)
+    results.append(("a teardown that fails takes back the note it made, and no picture is left",
+                    raised and job.births == [] and taken == [{"file": OWNER_PATH, "title": OWNER_NAME}] and not left,
+                    f"raised {raised}, births {job.births}, taken back {taken}, left {left}"))
+    job, raised, left = failed_write(None)
+    kept = [birth.get("file") for birth in job.births] == [OWNER_PATH] and job.view()["births"] == job.births
+    results.append(("without a way to take it back, the note stays on the job's list, and no picture is left",
+                    raised and kept and not left, f"raised {raised}, births {job.births}, left {left}"))
+    # A public site may not send the clean browser to this computer or to a private network. No lookups here.
+    private = ("192.168.1.1", "10.0.0.5", "172.16.0.9", "169.254.169.254", "127.0.0.1", "::1", "[fd00::1]",
+               "::ffff:10.0.0.1", "0.0.0.0", "100.64.0.1", "fe80::1%eth0")
+    public = ("93.184.216.34", "example.com", "", "[2606:4700::1111]")
+    wrong = [h for h in private if not is_private_address(h)] + [h for h in public if is_private_address(h)]
+    results.append(("private IP addresses are known, and a name or a public address is not one", not wrong, f"wrong: {wrong}"))
+
+    class StubBrowser:
+        url = "https://example.com/"
+
+        def __init__(self, now: str):
+            self.now = now
+
+        def current_url(self) -> str:
+            return self.now
+
+    stopped, let_through = [], []
+    for turn in ("http://192.168.1.1/admin", "http://[fd00::1]/", "http://router.lan/", "http://[::ffff:127.0.0.1]:8080/"):
         try:
-            bay._write(job, dict(evidence, snapshot=PNG_SIGNATURE + b"x"))
-            kept = False
-        except OSError:
-            kept = [birth.get("file") for birth in job.births] == [OWNER_PATH] and job.view()["births"] == job.births
-        pictures = [path.name for path in Path(temp).rglob("*.png")]
-        results.append(("a note that was born stays on the job's list when the next write fails, and no picture is left",
-                        kept and not pictures, f"{job.births} {pictures}"))
+            _refuse_local_turn(StubBrowser(turn))
+            let_through.append(turn)
+        except TeardownError as error:
+            stopped.append(error.code == "redirected")
+    try:
+        same_site = _refuse_local_turn(StubBrowser("https://example.com/next")) == "https://example.com/next"
+    except TeardownError:
+        same_site = False
+    results.append(("a redirect to a private address stops the teardown, a move on the same site does not",
+                    all(stopped) and not let_through and same_site, f"let through {let_through}, same site {same_site}"))
     results.append(("the REA note and the Jarviz note link to each other",
                     f"[[{OWNER_NAME}]]" in concept_note(OWNER_NAME) and f"[[{CONCEPT_NAME}]]" in owner_note()
                     and "[[" not in concept_note(None).split("\n\n")[1], concept_note(None)))

@@ -209,6 +209,41 @@ def links_for_new(note: Note, notes: list[Note]) -> list[tuple[int, int]]:
     return [(i, new_index) for i, other in enumerate(notes) if linked(other, note, unshareable)]
 
 
+def flipped_wikilinks(note: Note, others: list[Note]) -> set[str]:
+    """The wikilinks whose power to join two notes changes when `note` joins or leaves `others`.
+
+    `others` is the list WITHOUT `note`. A link that exactly MAX_SHARED_LINK_NOTES of them use gets crowded
+    when the note comes, and stops being crowded when it goes. The note's own title is a wikilink target too:
+    while the note is there, a shared [[link]] to it does not join the notes that share it.
+    """
+    title = note.folded_title
+    counts = Counter(link for other in others for link in other.wikilinks if link in note.wikilinks or link == title)
+    flipped = {link for link in note.wikilinks if counts[link] == MAX_SHARED_LINK_NOTES}
+    if counts[title] and not any(other.folded_title == title for other in others):
+        flipped.add(title)
+    return flipped
+
+
+def relink(notes: list[Note], links: set[tuple[int, int]], flipped: set[str]) -> tuple[set, set]:
+    """What to add to `links` and what to take away, so the links among the notes that use a flipped wikilink
+    are the ones compute_links() would give. Both are sets of (i, j) pairs with i < j. Other pairs do not change."""
+    if not flipped:
+        return set(), set()
+    pairs: set[tuple[int, int]] = set()
+    for link in flipped:
+        users = [index for index, note in enumerate(notes) if link in note.wikilinks]
+        pairs.update((a, b) for position, a in enumerate(users) for b in users[position + 1:])
+    unshareable = unshareable_wikilinks(notes)
+    to_add, to_remove = set(), set()
+    for i, j in pairs:
+        if linked(notes[i], notes[j], unshareable):
+            if (i, j) not in links:
+                to_add.add((i, j))
+        elif (i, j) in links:
+            to_remove.add((i, j))
+    return to_add, to_remove
+
+
 def keyword_score(query_tokens, note: Note) -> float:
     """Keyword overlap between a question and a note. Title matches weigh more."""
     score = 0.0

@@ -369,6 +369,71 @@ def check_remember(report: Report, ctx: dict) -> None:
         report.add(PASS, name, "written, indexed, used by /chat, then removed")
 
 
+def check_links_stay_true(report: Report) -> None:
+    """A birth or a take-back can change links among the OTHER notes: an 11th note crowds a shared [[link]],
+    and a note named "Topic" stops [[Topic]] from joining the notes that share it. The live links must still
+    be what a full rebuild gives. Pure: notes in a temporary folder, the steps Galaxy takes. No server."""
+    name = "After a note is born or taken back, the links are the same as after a full rebuild"
+    trouble: list[str] = []
+    mended = checked = 0
+    with tempfile.TemporaryDirectory() as folder:
+        notes_dir = Path(folder)
+        notes: list[build.Note] = []
+        links: set[tuple[int, int]] = set()
+
+        def make(title: str, text: str) -> build.Note:
+            path = notes_dir / f"{title}.md"
+            path.write_text(f"# {title}\n\n{text}\n", encoding="utf-8")
+            return build.make_note(path, notes_dir)
+
+        def mend(flipped: set[str]) -> None:
+            nonlocal mended
+            added, removed = build.relink(notes, links, flipped)
+            links.update(added)
+            links.difference_update(removed)
+            mended += len(added) + len(removed)
+
+        def birth(note: build.Note) -> None:            # as Galaxy.birth_note does it
+            flipped = build.flipped_wikilinks(note, notes)
+            new_links = build.links_for_new(note, notes)
+            notes.append(note)
+            links.update(new_links)
+            mend(flipped)
+
+        def take_back() -> None:                        # as Galaxy.forget_last and Galaxy.unbirth do it
+            index = len(notes) - 1
+            note = notes.pop()
+            links.difference_update({link for link in links if index in link})
+            mend(build.flipped_wikilinks(note, notes))
+
+        def same(step: str) -> None:
+            nonlocal checked
+            checked += 1
+            full = set(build.compute_links(notes))
+            if links != full:
+                trouble.append(f"{step}: {len(links - full)} links too many, {len(full - links)} missing")
+
+        words = "alpha bravo charlie delta echo foxtrot golf hotel india juliett kilo".split()
+        for word in words[:build.MAX_SHARED_LINK_NOTES]:
+            birth(make(f"Card {word}", "Linked to [[Shared Idea]]."))
+        same(f"{build.MAX_SHARED_LINK_NOTES} notes share [[Shared Idea]]")
+        birth(make(f"Card {words[build.MAX_SHARED_LINK_NOTES]}", "Linked to [[Shared Idea]]."))
+        same("one more note makes [[Shared Idea]] crowded")
+        take_back()
+        same("that note is taken back")
+        for word in ("lima", "mike"):
+            birth(make(f"Card {word}", "Filed under [[Topic]]."))
+        same("two notes share [[Topic]]")
+        birth(make("Topic", "What the cards are filed under."))
+        same("a note named Topic is born")
+        take_back()
+        same("the note named Topic is taken back")
+    if not trouble and not mended:
+        trouble.append("no link among the other notes changed, so the check proved nothing")
+    report.add(FAIL if trouble else PASS, name,
+               "; ".join(trouble) or f"{checked} steps, each equal to a full rebuild; {mended} links among the other notes mended")
+
+
 def check_served_files(report: Report) -> None:
     name = "The files the browser is served match the files on disk"
     stale, total = [], 0
@@ -716,6 +781,29 @@ def check_voice_rules(report: Report, ctx: dict) -> None:
     report.add(FAIL if rules else PASS, finish_name, "; ".join(rules) or f"FINISH_MS = {finish_ms}")
 
 
+def check_tag_intent(report: Report) -> None:
+    """A [TEARDOWN:...] tag from the brain runs only when the user's sentence asks for a teardown: a teardown verb,
+    or a "how is it built" question that names a site. A sentence that only mentions a website, or a "how" question
+    about the notes, is not enough: a note could then lead the brain to start one. Pure: no server."""
+    name = "A teardown tag runs only for a sentence that asks for a teardown"
+    asks = ("Reverse engineer Stripe's homepage", "tear the Linear site down", "Take igloo.inc apart", "x-ray this site",
+            "how does igloo.inc do that", "How is the Stripe homepage built?", "what is linear.app built with",
+            "What does Vercel's site use?", "what's under the hood of this site", "What tech stack does linear.app use?",
+            "Take apart the old pricing page")
+    mentions = ("What did I write about Stripe's site?", "Summarise my notes on the Hotel Marlowe website",
+                "Which site did we pick for the farmers market stall?", "Open the site visit note",
+                "Is the website launch in my notes?", "Remember that the homepage needs a new photo", "Good morning",
+                "What do we use for invoicing?", "How do I make cold brew?", "How does the loan work?",
+                "How does the roaster maintenance work?", "What is the Wi-Fi password?")
+    intent = server.TAG_INTENT["TEARDOWN"]
+    trouble = [f"missed: {said!r}" for said in asks if not intent(said)]
+    trouble += [f"let in: {said!r}" for said in mentions if intent(said)]
+    if not server.TAG_INTENT["REMEMBER"]("remember that the homepage needs a new photo"):
+        trouble.append("the REMEMBER intent no longer matches \"remember that the homepage needs a new photo\"")
+    report.add(FAIL if trouble else PASS, name,
+               "; ".join(trouble) or f"{len(asks)} requests let in, {len(mentions)} mentions kept out")
+
+
 def main() -> int:
     report = Report()
     config = server.load_config()
@@ -729,6 +817,7 @@ def main() -> int:
         check_key_and_model(report, ctx)
         check_other_brains(report, ctx)
         check_remember(report, ctx)
+        check_links_stay_true(report)
         check_served_files(report)
         check_config_hidden(report, ctx)
         check_other_sites(report)
@@ -736,6 +825,7 @@ def main() -> int:
         check_persona_home(report)
         check_pinned_libraries(report)
         check_voice_rules(report, ctx)
+        check_tag_intent(report)
         check_teardown_kit(report)
         check_teardown_offline(report, ctx)
         check_no_investigation_chrome(report)
