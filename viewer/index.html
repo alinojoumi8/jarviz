@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Jarviz</title>
+<link rel="icon" href="data:,">
+<style>
+  :root {
+    --ink: #e4ecff; --dim: #8593b8; --faint: #55607f;
+    --glass: rgba(9, 13, 27, .68); --line: rgba(140, 170, 255, .2);
+    --accent: #7fd4ff; --gold: #ffd98a; --ok: #6dffb0; --warn: #ffb86b;
+    --font: "Segoe UI", system-ui, -apple-system, Roboto, sans-serif;
+    --mono: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  html, body { height: 100%; margin: 0; background: #01020a; color: var(--ink); font-family: var(--font); overflow: hidden; }
+  #graph { position: fixed; inset: 0; }
+  /* a soft vignette so the edges fall into black */
+  body::after { content: ""; position: fixed; inset: 0; pointer-events: none;
+    background: radial-gradient(ellipse at center, transparent 55%, rgba(0, 0, 0, .6) 100%); }
+  .glass { background: var(--glass); border: 1px solid var(--line); border-radius: 14px;
+    backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); }
+  button { font: inherit; color: inherit; cursor: pointer; }
+  button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  /* top-left: name, note count, who is talking */
+  #hud { position: fixed; top: 16px; left: 18px; z-index: 5; display: flex; flex-wrap: wrap; align-items: center; gap: 8px 10px;
+    max-width: min(560px, 50vw);
+    font-family: var(--mono); font-size: 12px; letter-spacing: .08em; text-transform: uppercase; }
+  #hud .brand { font-weight: 700; letter-spacing: .34em; color: var(--accent); text-shadow: 0 0 14px rgba(127, 212, 255, .7); }
+  .chip { padding: 5px 10px; border-radius: 999px; border: 1px solid var(--line); background: var(--glass); color: var(--dim); }
+  .chip.warn { color: var(--warn); border-color: rgba(255, 184, 107, .45); }
+  #status { display: inline-flex; align-items: center; gap: 7px; }
+  #status i { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); }
+  #status[data-state="listening"] { color: var(--ok); }
+  #status[data-state="listening"] i { background: var(--ok); animation: beat 1.1s ease-in-out infinite; }
+  #status[data-state="thinking"] { color: var(--gold); }
+  #status[data-state="thinking"] i { background: var(--gold); animation: beat .5s ease-in-out infinite; }
+  #status[data-state="speaking"] { color: var(--accent); }
+  #status[data-state="speaking"] i { background: var(--accent); animation: beat .8s ease-in-out infinite; }
+  @keyframes beat { 50% { transform: scale(1.9); opacity: .45; } }
+
+  /* right: the note the answer came from */
+  #panel { position: fixed; top: 16px; right: 18px; bottom: 150px; width: min(370px, 86vw); z-index: 6;
+    padding: 18px 20px; overflow-y: auto; scrollbar-width: thin; }
+  #panel-close { position: absolute; top: 10px; right: 12px; width: 30px; height: 30px; border-radius: 50%;
+    border: 1px solid var(--line); background: transparent; font-size: 18px; line-height: 1; }
+  #panel-group { font-family: var(--mono); font-size: 11px; letter-spacing: .14em; text-transform: uppercase; color: var(--dim);
+    display: flex; align-items: center; gap: 8px; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; box-shadow: 0 0 10px currentColor; background: currentColor; flex: none; }
+  #panel-title { margin: 8px 30px 12px 0; font-size: 21px; line-height: 1.25; font-weight: 600; }
+  #panel-body { font-size: 14px; line-height: 1.6; color: #cbd6f2; }
+  #panel-body p, #panel-body h4 { margin: 0 0 9px; }
+  #panel-body h4 { color: var(--ink); font-size: 14px; }
+  #panel-body ul { margin: 0 0 9px; padding-left: 18px; }
+  #panel-body li { margin-bottom: 4px; }
+  .wikilink { border: 0; padding: 0; background: none; color: var(--accent); border-bottom: 1px dotted rgba(127, 212, 255, .6); }
+  #panel h3 { margin: 16px 0 8px; font-family: var(--mono); font-size: 11px; letter-spacing: .14em; text-transform: uppercase;
+    color: var(--dim); font-weight: 500; }
+  #panel-links { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 6px; }
+  #panel-links button { display: inline-flex; align-items: center; gap: 7px; padding: 5px 10px; border-radius: 999px;
+    border: 1px solid var(--line); background: rgba(255, 255, 255, .03); font-size: 12.5px; }
+  #panel-links button:hover { border-color: var(--accent); }
+
+  #panel-body ol { margin: 0 0 9px; padding-left: 20px; }
+  #panel-body blockquote, #reader-body blockquote { margin: 0 0 10px; padding: 3px 12px; border-left: 2px solid var(--accent); color: var(--ink); }
+
+  /* top-left, under the name: one teardown, live. It sits BELOW the note panel and the dock, so it never covers them. */
+  #teardown { position: fixed; left: 18px; top: 58px; width: min(320px, 86vw); z-index: 5; padding: 13px 15px;
+    overflow-y: auto; scrollbar-width: thin; display: flex; flex-direction: column; gap: 10px; }
+  #td-head { display: flex; align-items: center; gap: 8px; }
+  #td-title { flex: 1; min-width: 0; font-weight: 600; font-size: 14.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #td-head .chip { font-family: var(--mono); font-size: 10px; letter-spacing: .1em; text-transform: uppercase; padding: 3px 8px; color: var(--accent); flex: none; }
+  #td-close { flex: none; width: 26px; height: 26px; border-radius: 50%; border: 1px solid var(--line); background: transparent; font-size: 16px; line-height: 1; }
+  #td-steps { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 5px; font-size: 13px; color: var(--faint); }
+  #td-steps li { display: flex; align-items: center; gap: 9px; }
+  #td-steps li::before { content: ""; flex: none; width: 8px; height: 8px; border-radius: 50%; border: 1px solid var(--faint); }
+  #td-steps li[data-state="done"] { color: var(--dim); }
+  #td-steps li[data-state="done"]::before { background: var(--ok); border-color: var(--ok); }
+  #td-steps li[data-state="now"] { color: var(--ink); }
+  #td-steps li[data-state="now"]::before { background: var(--gold); border-color: var(--gold); animation: beat .8s ease-in-out infinite; }
+  #td-steps li[data-state="stopped"] { color: var(--warn); }
+  #td-steps li[data-state="stopped"]::before { background: var(--warn); border-color: var(--warn); }
+  #td-line { font-size: 13.5px; color: var(--ok); }
+  #td-line.trouble { color: var(--warn); }
+  #td-done { display: flex; flex-direction: column; gap: 10px; }
+  #td-shot { display: block; width: 100%; border-radius: 8px; border: 1px solid var(--line); }
+  #td-chips { display: flex; flex-wrap: wrap; gap: 5px; }
+  #td-chips .chip { font-size: 11.5px; padding: 3px 8px; color: var(--ink); }
+  #td-totals { font-family: var(--mono); font-size: 11px; letter-spacing: .06em; color: var(--dim); }
+  #td-read { align-self: flex-start; padding: 7px 13px; border-radius: 999px; border: 1px solid var(--accent);
+    background: rgba(127, 212, 255, .08); color: var(--accent); font-size: 13px; }
+
+  /* the reader: the whole teardown note. It is fitted between the card and the note panel, above the dock. */
+  #reader { position: fixed; top: 16px; left: 350px; right: 18px; bottom: 150px; z-index: 8; padding: 16px 22px;
+    display: flex; flex-direction: column; gap: 10px; background: rgba(9, 13, 27, .93); }
+  #reader-head { display: flex; align-items: center; gap: 10px; }
+  #reader-title { flex: 1; min-width: 0; margin: 0; font-size: 19px; line-height: 1.25; font-weight: 600; }
+  #reader-head a, #reader-head button { flex: none; padding: 6px 12px; border-radius: 999px; border: 1px solid var(--line);
+    background: rgba(255, 255, 255, .04); color: var(--ink); font-size: 12.5px; text-decoration: none; }
+  #reader-head a:hover, #reader-head button:hover { border-color: var(--accent); }
+  #reader-body { flex: 1; min-height: 0; overflow-y: auto; scrollbar-width: thin; padding-right: 8px; font-size: 14.5px; line-height: 1.65; color: #cbd6f2; }
+  #reader-body h3 { margin: 18px 0 8px; font-size: 16px; color: var(--ink); }
+  #reader-body h4 { margin: 12px 0 6px; font-size: 14.5px; color: var(--ink); }
+  #reader-body p { margin: 0 0 10px; }
+  #reader-body ul, #reader-body ol { margin: 0 0 10px; padding-left: 22px; }
+  #reader-body li { margin-bottom: 5px; }
+  #reader-body img { display: block; max-width: 100%; margin: 0 0 12px; border-radius: 10px; border: 1px solid var(--line); }
+
+  /* bottom-left: folders */
+  #legend { position: fixed; left: 18px; bottom: 18px; z-index: 4; display: flex; flex-direction: column; gap: 5px;
+    font-family: var(--mono); font-size: 11px; letter-spacing: .06em; color: var(--dim); }
+  #legend span { display: flex; align-items: center; gap: 8px; }
+  #legend b { font-weight: 400; color: var(--faint); }
+
+  /* bottom: what you said, what he said, the input bar */
+  #dock { position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%); width: min(720px, 92vw); z-index: 7;
+    display: flex; flex-direction: column; gap: 9px; }
+  #heard { align-self: flex-start; max-width: 90%; padding: 0 6px; font-size: 13px; color: var(--dim); font-style: italic; }
+  #answer { padding: 13px 18px; font-size: 16px; line-height: 1.5; max-height: 30vh; overflow-y: auto; }
+  #answer.trouble { border-color: rgba(255, 184, 107, .5); }
+  #ask { display: flex; align-items: center; gap: 8px; padding: 7px; border-radius: 999px; }
+  #q { flex: 1; min-width: 0; border: 0; background: transparent; color: var(--ink); font: inherit; font-size: 15px; padding: 8px 6px; }
+  #q::placeholder { color: var(--faint); }
+  #q:focus-visible { outline: none; }
+  #ask:focus-within { border-color: rgba(127, 212, 255, .65); box-shadow: 0 0 0 3px rgba(127, 212, 255, .12); }
+  #ask button { flex: none; width: 40px; height: 40px; border-radius: 50%; border: 1px solid var(--line);
+    background: rgba(255, 255, 255, .04); display: grid; place-items: center; }
+  #ask button:hover { border-color: var(--accent); }
+  #ask button:disabled { opacity: .35; cursor: not-allowed; }
+  #ask svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+  #mic[aria-pressed="true"] { color: #04130b; background: var(--ok); border-color: var(--ok); box-shadow: 0 0 18px rgba(109, 255, 176, .55); }
+  #hint { text-align: center; font-family: var(--mono); font-size: 11px; letter-spacing: .14em; text-transform: uppercase; color: var(--faint); }
+
+  .scene-tooltip { font-family: var(--font) !important; font-size: 13px !important; padding: 5px 10px !important;
+    border-radius: 8px !important; background: rgba(9, 13, 27, .9) !important; border: 1px solid var(--line); color: var(--ink) !important; }
+
+  @media (max-width: 760px) { #legend { display: none; } #panel { bottom: 170px; } }
+  @media (prefers-reduced-motion: reduce) { #status i { animation: none !important; } }
+</style>
+</head>
+<body>
+<div id="graph" aria-label="A 3D galaxy of your notes"></div>
+
+<header id="hud">
+  <span class="brand">Jarviz</span>
+  <span id="count" class="chip">0 notes</span>
+  <span id="status" class="chip" data-state="idle" role="status"><i></i><b>idle</b></span>
+  <span id="brain" class="chip" title="The brain that answers. Say: switch brain to ..." hidden></span>
+  <span id="muted" class="chip warn" hidden>muted tab</span>
+</header>
+
+<aside id="panel" class="glass" hidden aria-label="Note">
+  <button id="panel-close" type="button" aria-label="Close the note">&times;</button>
+  <div id="panel-group"></div>
+  <h2 id="panel-title"></h2>
+  <div id="panel-body"></div>
+  <h3 id="panel-links-title">Linked notes</h3>
+  <ul id="panel-links"></ul>
+</aside>
+
+<aside id="teardown" class="glass" hidden aria-label="Teardown">
+  <div id="td-head">
+    <span id="td-title"></span>
+    <span class="chip">via REA</span>
+    <button id="td-close" type="button" aria-label="Close the teardown">&times;</button>
+  </div>
+  <ol id="td-steps" aria-live="polite"></ol>
+  <div id="td-line" role="status" hidden></div>
+  <div id="td-done" hidden>
+    <img id="td-shot" alt="" hidden>
+    <div id="td-chips"></div>
+    <div id="td-totals"></div>
+    <button id="td-read" type="button">Read the full teardown</button>
+  </div>
+</aside>
+
+<section id="reader" class="glass" role="dialog" aria-label="The full teardown" hidden>
+  <div id="reader-head">
+    <h2 id="reader-title"></h2>
+    <a id="reader-obsidian" rel="noreferrer" hidden>Open in Obsidian</a>
+    <button id="reader-close" type="button">Close</button>
+  </div>
+  <div id="reader-body"></div>
+</section>
+
+<nav id="legend" aria-label="Folders"></nav>
+
+<section id="dock">
+  <div id="heard" hidden></div>
+  <div id="answer" class="glass" aria-live="polite" hidden></div>
+  <form id="ask" class="glass" autocomplete="off">
+    <button id="mic" type="button" aria-pressed="false" aria-label="Talk to Jarviz" title="Talk to Jarviz">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>
+    </button>
+    <input id="q" type="text" maxlength="2000" aria-label="Ask Jarviz" placeholder="Ask about your notes, or say &ldquo;remember that&hellip;&rdquo;">
+    <button id="send" type="submit" aria-label="Send" title="Send">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12h15M13 6l6 6-6 6"/></svg>
+    </button>
+  </form>
+  <div id="hint">Click anywhere to wake him</div>
+</section>
+
+<script src="graph-data.js"></script>
+<!-- Pinned to an exact version and checked by hash. Change both on purpose, never "latest". -->
+<script src="https://cdn.jsdelivr.net/npm/3d-force-graph@1.80.2/dist/3d-force-graph.min.js"
+        integrity="sha384-GBG/VW3/k9nOKHgDlgS2DFk3HDPeNndiVa5280Guy62u3QEpZQPuAuB4POI5giZN"
+        crossorigin="anonymous"></script>
+<script src="core.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

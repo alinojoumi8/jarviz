@@ -1,0 +1,4 @@
+# Keep the line ends as they are on disk (LF). Windows start files use CRLF.
+* text=auto eol=lf
+*.bat text eol=crlf
+*.png binary

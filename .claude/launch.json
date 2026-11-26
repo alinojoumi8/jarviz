@@ -1,0 +1,12 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "jarviz",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["server.py"],
+      "port": 4700,
+      "url": "http://127.0.0.1:4700"
+    }
+  ]
+}

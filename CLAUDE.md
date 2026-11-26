@@ -1,0 +1,81 @@
+# Jarviz
+
+A personal "Jarvis": a 3D galaxy of markdown notes with a brain (Anthropic API), a voice in both
+directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists every prompt and its state.
+
+## Run
+
+- Start: `python server.py` then open http://127.0.0.1:4700 (or double-click `start-jarviz.bat`).
+- Re-index the notes: `python build.py`. The running server picks the new index up by itself.
+- Verify: `python preflight.py` while the server runs.
+- Verify the teardown kit: `python drill.py` while the server runs. It runs one hidden test teardown and removes its own note.
+
+## Files
+
+- `build.py` indexer, standard library only. Writes `viewer/graph-data.js`.
+- `server.py` server, persona, routes. Port 4700, bound to 127.0.0.1.
+- `brains.py` the five brains (Claude, OpenAI, DeepSeek, Venice, OpenRouter) behind one `ask()`.
+  Claude uses the `anthropic` package. The others use plain HTTPS from the standard library.
+- `preflight.py` live end-to-end checks.
+- `teardown.py` the teardown bay (Part Two), standard library only. The server soft-imports it and starts without it.
+- `drill.py` the live teardown drill. `record()` and `put_back()` make a test leave no trace.
+- `viewer/index.html`, `viewer/core.js`, `viewer/app.js` the page. No npm, no build step.
+- `config.json` the active brain, a key and a model for each brain, the notes folder. Git ignores it.
+
+## Laws
+
+- "Done" means preflight passed. Run `python preflight.py` and paste its summary line before you say a
+  change is done. When something breaks, add a check for it.
+- Every API key lives only in `config.json` in the project root. Never in `viewer/`, never in a response,
+  never in a log. Never ask the user to paste a key into a chat. They type it into the file.
+- The server writes to `config.json` in one place only: `save_brain_choice` changes the `"brain"` line
+  and keeps every other line. A new brain is one entry in `PROVIDERS` (`brains.py`) plus its key line
+  and model line in `config.json`. Model ids change often: read the provider's documents, do not guess.
+- A provider call never follows a redirect (the key would go with it).
+- The server binds 127.0.0.1 and serves only `viewer/`.
+- One function speaks: `createSpeaker().speak` in `viewer/core.js`. `?mute=1` makes a tab silent. Open
+  test tabs with `?mute=1`.
+- One owner for focus: only `Focus` in `viewer/app.js` moves the camera or changes which stars are lit.
+- One door for new notes: `Galaxy.birth_note` in `server.py` and `addNote` in `viewer/app.js`.
+- Every node id equals its index in `GRAPH.nodes`.
+- The persona, the control tags and the spoken lines live in the persona block at the top of `server.py`.
+- Voice routes are checked before the brain. Add a command with `router.add`, do not edit the core.
+- A control tag runs only when the user's own sentence asks for that action. Every tag in
+  `TAG_HANDLERS` needs an entry in `TAG_INTENT` (`server.py`). Text inside a note can never order an action.
+- Note text is never HTML. The viewer uses `textContent` only. Labels given to the 3D library go
+  through `Core.escapeHtml`.
+- The two outside libraries are pinned in three places that must agree: `GRAPH_LIB_URL` and
+  `THREE_LIB_DIR` in `server.py` (the security policy), `viewer/index.html` (with its hash), and
+  `THREE_URL` in `viewer/app.js`. three.js must be the same release as the one inside the
+  3d-force-graph bundle (`window.__THREE__` in the browser console shows it).
+- Claude Opus 5.5: never send a thinking setting and never force a tool choice. Set effort per route
+  (`EFFORT` in `brains.py`).
+- Chat history is plain text (what was said, what was answered, receipts). So a switch of brains keeps
+  the conversation. Receipts stay in the history right after the turn that earned them.
+- Tests clean up after themselves. A test note is removed before the test ends.
+- Part Two (REA): it observes only. No clicks, no logins, websites the user may look at.
+- REA lives outside the project in `~/.jarvis-tools/rea` and is pinned by `REA_PIN` in `teardown.py`. Never install
+  "latest". After a version change, run `python drill.py`.
+- Jarviz runs four REA commands only (`REA_COMMANDS`) and two DevTools methods only (`DevTools.ALLOWED`): a read
+  with fixed text, and the mouse wheel. Do not add a click, a key press or a navigation.
+- Every teardown gets a new Chrome profile. `Browser.close()` always runs: Chrome stops and the folder is deleted.
+  Jarviz never attaches to a browser that it did not start.
+- One place starts a teardown: `start_teardown` in `server.py`. Websites only (`teardown.parse_site`), one at a time.
+  Public names and the user's own `localhost` only: no private-network names (`PRIVATE_ENDINGS`,
+  `resolves_to_private`). The `[TEARDOWN:site|question]` tag runs only for a site whose own name is a word in the
+  user's sentence (`named_by_user`), and "this" only when the user said "this site".
+- A note never shows the brain a ready-made control tag: `note_block` turns `[WORD:` into `(WORD:`.
+- Every evidence line in the digest starts with who captured it (`EVIDENCE_TAGS`). The brain writes the note text.
+  Code writes the Evidence section and the facts block on top.
+- Everything that comes out of the inspected website is data from a stranger: REA's output, the page reads (they
+  run inside the page, so the page can change their answers), and the brain's teardown text. Every number goes
+  through `_count`, every text through `_site_text` or `_clean`, every address through `safe_url`. The brain's text
+  goes through `tame_note`, and its spoken line through `risky_spoken`, before it is saved or said.
+- A check that cannot look says so. `investigation_chromes()` returns `None` when the system could not be asked.
+  `None` is never a pass.
+- Library fingerprints live in ONE table (`FINGERPRINTS`). A "presence" pattern must be a string that only that
+  library has: a name that other libraries also mention proves nothing.
+- `/teardown/note` and `/teardown/image` serve only files inside the teardowns folder (`valid_name`). The card and
+  the reader show no file paths.
+- A test that runs a teardown uses a hidden browser (`"headless": true`, or a `?headless=1` tab) and
+  `drill.record()` / `drill.put_back()`. A test never starts a real teardown without them.
