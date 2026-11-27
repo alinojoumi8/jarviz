@@ -217,7 +217,8 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
   delete through it); on POSIX every folder is opened from "/" with O_NOFOLLOW and `dir_fd`, the vault and each
   folder below must keep the st_dev/st_ino that was checked, and the file is moved to a random hidden name and
   unlinked there only when it is still the file whose bytes were read (`_folder_delete`). Anything else is put back
-  and is "cleanup not confirmed". Where neither is possible, nothing is deleted and preflight says "cleanup not
+  only by a hard link, which never replaces a name (`_put_back`); without one it stays at the hidden name, and that
+  name is told. Both are "cleanup not confirmed". Where neither is possible, nothing is deleted and preflight says "cleanup not
   confirmed" with the note's path in the notes folder (`delete_fixture_file`).
 - Every check in `main` runs through `run_check`: a check that stops is a FAIL that names only the type of its error,
   never its text, and preflight always ends with its summary. A request that gets no answer is "could not look"

@@ -687,20 +687,14 @@ class CleanupUnsure(Exception):
 
 
 def _put_back(folder: int, hidden: str, name: str) -> bool:
-    """Move what sits at `hidden` back to `name` (both in the open `folder`), never over another file: a hard link
-    cannot replace a name, so it is tried first. Where there is none (a folder, a file system without links): only
-    while `name` is free. True when it is back."""
+    """Move what sits at `hidden` back to `name` (both in the open `folder`), never over another file. Only a hard link
+    does that in one step: it cannot replace a name. Where there is none (a folder, a file system without links), it
+    stays at the hidden name: a check that the name is free, then a rename, could still write over a file made in
+    between (os.rename replaces, and Python has no rename that refuses). True when it is back."""
     try:
         os.link(hidden, name, src_dir_fd=folder, dst_dir_fd=folder, follow_symlinks=False)
-    except FileExistsError:
-        return False
     except (OSError, NotImplementedError):
-        try:
-            os.stat(name, dir_fd=folder, follow_symlinks=False)
-            return False                                # the name is taken: it stays at the hidden name
-        except FileNotFoundError:
-            os.rename(hidden, name, src_dir_fd=folder, dst_dir_fd=folder)
-            return True
+        return False                                    # the name is taken, or no link here: it stays hidden
     os.unlink(hidden, dir_fd=folder)
     return True
 
@@ -715,7 +709,10 @@ def _folder_delete(root: Path, target: Path, born: str, between=None) -> tuple[b
     4. It is moved to a new random hidden name in the same folder, 5. what sits there now must be the file of that fd
        (a name replaced before the move is put back and raises CleanupUnsure), 6. that hidden name is unlinked.
     What remains: a process that watches the folder sees the hidden name after the move and could swap it in the
-    instant before the unlink. Nobody can guess the name before. The same answers as _handle_delete, and "moved"."""
+    instant before the unlink. Nobody can guess the name before. And it is harmless: unlink(hidden, dir_fd=folder)
+    removes only that one name in the folder that was bound by its identity, never what a link points at, so it can
+    only remove what that process put there itself, never a file outside the notes folder. The same answers as
+    _handle_delete, and "moved"."""
     parts = target.relative_to(root).parts
     inner, name = parts[:-1], parts[-1]
     checked, step = [], root
