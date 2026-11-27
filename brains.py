@@ -41,6 +41,10 @@ try:                    # optional at boot: without the package only the Claude 
     import anthropic
 except ImportError:
     anthropic = None
+if os.name == "nt":     # the system lock on the lock record's lock file (one writer in any process)
+    import msvcrt
+else:
+    import fcntl
 
 KEY_PLACEHOLDER = "PUT-YOUR-KEY-HERE"
 REQUEST_TIMEOUT_S = 90.0
@@ -498,18 +502,38 @@ def _chat_once(key, brain, spec, route, system, messages, budget) -> str:
     return text
 
 
+RESPONSE_STATES = ("completed", "failed", "in_progress", "cancelled", "queued", "incomplete")   # OpenAI's documented list
+
+
+def _incomplete_reason(data: dict) -> str | None:
+    """Why a Responses answer is incomplete ("max_output_tokens", "content_filter", ...), or None."""
+    details = data.get("incomplete_details")
+    reason = details.get("reason") if isinstance(details, dict) else None
+    return reason if data.get("status") == "incomplete" and isinstance(reason, str) else None
+
+
 def _budget_ended(data: dict) -> bool:
     """A Responses answer whose status says that the token budget ended."""
-    details = data.get("incomplete_details")
-    return (data.get("status") == "incomplete" and isinstance(details, dict)
-            and details.get("reason") == "max_output_tokens")
+    return _incomplete_reason(data) == "max_output_tokens"
 
 
 def _responses_once(key, brain, spec, route, system, messages, budget) -> str:
-    """The OpenAI Responses API. store=False: OpenAI does not keep the conversation."""
+    """The OpenAI Responses API. store=False: OpenAI does not keep the conversation.
+    A completion is status "completed", or "incomplete" because the budget ended or a filter stopped it. "failed"
+    and every other status is no completion: an output list alone never makes one."""
     body = {"model": brain["model"], "instructions": system, "input": messages,
             "max_output_tokens": budget, "store": False}
     data = _call("POST", spec["base_url"] + "/responses", key, body, brain, TIMEOUT_S.get(route, REQUEST_TIMEOUT_S))
+    status, reason = data.get("status"), _incomplete_reason(data)
+    if status == "failed":                              # the model failed to generate: never an answer
+        error = data.get("error") if isinstance(data.get("error"), dict) else {}
+        detail = _without_key(error.get("message") if isinstance(error.get("message"), str) else "", key)
+        raise BrainError("rate_limited" if error.get("code") == "rate_limit_exceeded" else "api_error",
+                         detail or "The model failed to generate an answer.", brain)
+    if status != "completed" and reason not in ("max_output_tokens", "content_filter"):
+        shown = status if status in RESPONSE_STATES else "missing or unknown"
+        why = " (not because the budget ended or a filter stopped it)" if status == "incomplete" else ""
+        raise _bad_reply(brain, f"the status is {shown}{why}")
     output = data.get("output")
     if output is None and _budget_ended(data):          # a tiny budget can end before any output
         output = []
@@ -529,7 +553,7 @@ def _responses_once(key, brain, spec, route, system, messages, budget) -> str:
                 refused = True
         texts.append(_text_of(content))
     text = "".join(texts).strip()
-    if not text and refused:
+    if not text and (refused or reason == "content_filter"):
         raise BrainError("refused", brain=brain)
     return text
 
@@ -675,7 +699,8 @@ SECRET_HIDDEN = "[secret word]"
 _versions: dict[tuple[str, ...], tuple[float, tuple, str]] = {}     # program -> (when, file stamps, version)
 _versions_lock = threading.Lock()
 _prove_lock = threading.Lock()          # one trap at a time: a second question waits for the first proof
-_locks_write = threading.Lock()
+_locks_write = threading.Lock()         # one writer of the lock record in this process (see _record_held)
+RECORD_LOCK_WAIT_S = 30.0               # a writer of the lock record waits this long for another one
 
 
 # -- finding and starting a tool
@@ -733,7 +758,8 @@ def _stop_tree(process: subprocess.Popen) -> None:
 
 def _run_tool(argv: list[str], stdin_text: str, room: str, env: dict | None, timeout: float) -> tuple[int, str, str]:
     """Start a tool with no shell and no window, give it the text on stdin, and wait. A timeout stops the whole
-    process tree and raises BrainError("cli_timeout")."""
+    process tree and raises BrainError("cli_timeout"). That stop has its own bounded budget after the timeout
+    (_stop_tree): a tool is never left running."""
     try:
         process = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                    cwd=room, env=env, creationflags=NO_WINDOW if os.name == "nt" else 0,
@@ -751,8 +777,9 @@ def _run_tool(argv: list[str], stdin_text: str, room: str, env: dict | None, tim
     return process.returncode, out.decode("utf-8", "replace"), err.decode("utf-8", "replace")
 
 
-def _remove_room(room: str) -> None:
-    """Remove a room. It never raises: a clean-up that fails must never hide the error that stopped the work."""
+def _remove_room(room: str, until: float | None = None) -> None:
+    """Remove a room. It never raises: a clean-up that fails must never hide the error that stopped the work.
+    `until` (a time of _clock): the deadline of the call. No wait goes past it: the background thread takes over."""
     # Right after a tool ends, Windows can hold the empty folder for a while (seen in real runs: once for more than
     # 5 seconds after a failed agy start; a little later it went). So it waits up to about 5 seconds, and only when
     # the first try fails. After that a background thread keeps trying for a minute, so the answer does not wait.
@@ -763,7 +790,7 @@ def _remove_room(room: str) -> None:
         except FileNotFoundError:
             return
         except OSError:
-            if wait is None:
+            if wait is None or (until is not None and _clock() + wait > until):
                 break
             time.sleep(wait)
     threading.Thread(target=_remove_later, args=(room,), name="jarviz-room-clean-up", daemon=True).start()
@@ -1039,8 +1066,9 @@ def _agy_answer(stdout_text: str, code: int = 0, stderr_text: str = "", brain: d
                 tally: dict | None = None) -> str:
     """The answer in the stream-json of agy: result.response. A step that is a tool must be a harmless listing, or
     end in ERROR as REFUSED by the lock (a permission message) or NEVER SENT (an invalid call). Any other end means
-    that a tool ran or may have run: BrainError("cli_tool_ran"). `tally` (the trap) gets the refused attempts, the
-    calls that were not sent and the listing steps."""
+    that a tool ran or may have run: BrainError("cli_tool_ran"). So does a step that gave any other error at any of
+    its updates, also next to a refusal. `tally` (the trap) gets the refused attempts, the calls that were not sent
+    and the listing steps."""
     steps: dict[int, dict] = {}
     result, inits, updates = None, [], 0
     for event in _events(stdout_text, brain):
@@ -1070,7 +1098,7 @@ def _agy_answer(stdout_text: str, code: int = 0, stderr_text: str = "", brain: d
                 raise BrainError("cli_tool_ran", _tool_label(name), brain)
             continue
         step = steps.setdefault(index, {"tool": False, "names": set(), "subagent": False, "state": "", "permission": "",
-                                        "not_sent": ""})
+                                        "not_sent": "", "other": False})
         step["tool"] = step["tool"] or is_tool
         step["names"] |= names
         step["subagent"] = step["subagent"] or subagent
@@ -1082,6 +1110,9 @@ def _agy_answer(stdout_text: str, code: int = 0, stderr_text: str = "", brain: d
             step["permission"] = message        # the last permission message (the ACTIVE update has none)
         elif isinstance(message, str) and AGY_NOT_SENT_RE.search(message):
             step["not_sent"] = message          # the call was not valid, so agy never sent it
+        elif error is not None:
+            step["other"] = True                # any other error, at any update of the step: a tool may have run
+        # An update with no error object (the ACTIVE one, a late state) changes none of the three.
     _agy_init_holds(inits, bool(steps) or (isinstance(result, dict) and result.get("status") == "SUCCESS"), brain)
     refused, listing, not_sent = [], [], []
     for index in sorted(steps):
@@ -1092,9 +1123,9 @@ def _agy_answer(stdout_text: str, code: int = 0, stderr_text: str = "", brain: d
         label = _tool_label(named[0] if named else None)
         if _agy_listing(step["names"], step["subagent"]):
             listing.append(label)
-        elif step["state"] == "ERROR" and step["permission"]:
+        elif step["state"] == "ERROR" and step["permission"] and not step["other"]:
             refused.append(label)               # the lock refused it: evidence
-        elif step["state"] == "ERROR" and step["not_sent"]:
+        elif step["state"] == "ERROR" and step["not_sent"] and not step["other"]:
             not_sent.append(label)              # not valid, never sent: no evidence, and no tool ran
         else:
             raise BrainError("cli_tool_ran", label, brain)     # it ran, or may have run (any other ERROR too)
@@ -1137,7 +1168,10 @@ def _cli_call(config: dict, name: str, route: str, system: str, messages: list[d
 
     The ONE place that tries again: only a run that did not START (cli_not_started: nothing reached a model, no tool
     ran) is tried again, at most CLI_START_TRIES in all, after the pauses of CLI_START_PAUSES, each try in a new room.
-    A run that started is never run twice. All tries together stay inside the route's timeout."""
+    A run that started is never run twice. All tries together stay inside the route's timeout, the removal of their
+    rooms too (a room that is still held then goes to the background thread). The one clean-up with a budget of its
+    own: a tool that ran out of time is stopped with its whole tree (_stop_tree: taskkill up to 15 s, then up to 10 s
+    to collect it), because a tool is never left running."""
     deadline = _clock() + TIMEOUT_S.get(route, REQUEST_TIMEOUT_S)
     for attempt in range(CLI_START_TRIES):
         try:
@@ -1155,7 +1189,8 @@ def _cli_call(config: dict, name: str, route: str, system: str, messages: list[d
 
 def _cli_call_once(config: dict, name: str, route: str, system: str, messages: list[dict], run: Runner | None,
                    tool: list[str], left: dict | None, frame: str | None, tally: dict | None, timeout: float) -> str:
-    """One try of _cli_call, in a new empty room that is removed afterwards."""
+    """One try of _cli_call, in a new empty room that is removed afterwards (with no wait past the try's time)."""
+    until = _clock() + timeout
     spec, brain = PROVIDERS[name], _brain_of(config, name)
     run = run or _run_tool
     frame = CLI_FRAME if frame is None else frame
@@ -1186,7 +1221,7 @@ def _cli_call_once(config: dict, name: str, route: str, system: str, messages: l
     finally:
         if left is not None and started:
             left["room"] = _foreign(room, ours)
-        _remove_room(room)
+        _remove_room(room, until)
 
 
 def _ask_cli(config: dict, name: str, route: str, system: str, messages: list[dict], run: Runner | None = None,
@@ -1278,19 +1313,57 @@ def _lock_entry(name: str, path: Path) -> dict | None:
     return None
 
 
-def _write_lock(name: str, entry: dict, path: Path) -> None:
-    """Write the record whole: to a temp file in the same folder, then os.replace."""
+def _file_lock(handle, take: bool) -> bool:
+    """Take (or give back) the system lock on the first byte of an open file, without waiting. False: another open
+    of the file holds it (in this process or in another one)."""
+    try:
+        handle.seek(0)
+        if os.name == "nt":
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK if take else msvcrt.LK_UNLCK, 1)
+        else:
+            fcntl.flock(handle.fileno(), (fcntl.LOCK_EX | fcntl.LOCK_NB) if take else fcntl.LOCK_UN)
+    except OSError:
+        return not take             # a give-back that fails: closing the file frees the lock too
+    return True
+
+
+@contextlib.contextmanager
+def _record_held(path: Path):
+    """ONE writer of the lock record at a time, for a read, a check and a write together: in this process
+    (_locks_write), and across processes (the server and preflight) by a system lock on the empty file beside the
+    record (<record>.lock). The system frees that lock when its process ends, so a crash leaves no stale lock.
+    Raises OSError (TimeoutError) when another writer holds it for RECORD_LOCK_WAIT_S."""
     with _locks_write:
-        data = _read_locks(path)
-        data[name] = entry
         path.parent.mkdir(parents=True, exist_ok=True)
-        handle, temp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
-        try:
-            with os.fdopen(handle, "w", encoding="utf-8", newline="\n") as file:
-                file.write(json.dumps(data, indent=2) + "\n")
-            os.replace(temp, path)
-        finally:
-            Path(temp).unlink(missing_ok=True)
+        with open(path.with_name(path.name + ".lock"), "a+b") as handle:
+            give_up = time.monotonic() + RECORD_LOCK_WAIT_S
+            while not _file_lock(handle, True):
+                if time.monotonic() >= give_up:
+                    raise TimeoutError("another writer holds the lock record")
+                time.sleep(0.05)
+            try:
+                yield
+            finally:
+                _file_lock(handle, False)
+
+
+def _write_lock(name: str, entry: dict, path: Path) -> None:
+    """Write the record whole: to a temp file in the same folder, then os.replace. One writer at a time."""
+    with _record_held(path):
+        _put_lock_entry(name, entry, path)
+
+
+def _put_lock_entry(name: str, entry: dict, path: Path) -> None:
+    """The write of _write_lock. The caller holds _record_held(path)."""
+    data = _read_locks(path)
+    data[name] = entry
+    handle, temp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8", newline="\n") as file:
+            file.write(json.dumps(data, indent=2) + "\n")
+        os.replace(temp, path)
+    finally:
+        Path(temp).unlink(missing_ok=True)
 
 
 def _prove(config: dict, name: str, run: Runner | None, locks: Path, tool: list[str],
@@ -1412,10 +1485,13 @@ def _strong_on_file(name: str, version: str, recipe: str, locks: Path) -> bool:
 def _record_proof(name: str, version: str, recipe: str, held: bool, detail: str, seen: list[str], locks: Path) -> str:
     """Write the verdict, and return the detail. A weak run (True, no evidence) never replaces a strong proof of the
     same version and recipe: that record stays, and the detail says so. A False verdict always replaces the record,
-    and a strong run replaces a weak one. Raises OSError when the record cannot be written."""
-    if held and not seen and _strong_on_file(name, version, recipe, locks):
-        return detail + "; an earlier run of this version did see a refused attempt (the strong proof on file stays)"
-    _write_lock(name, {"version": version, "recipe": recipe, "held": held, "detail": detail, "seen": seen}, locks)
+    and a strong run replaces a weak one. The check and the write are ONE step for every writer, also in another
+    process (_record_held): a strong proof written in between is never lost. Raises OSError when the record cannot
+    be written."""
+    with _record_held(locks):
+        if held and not seen and _strong_on_file(name, version, recipe, locks):
+            return detail + "; an earlier run of this version did see a refused attempt (the strong proof on file stays)"
+        _put_lock_entry(name, {"version": version, "recipe": recipe, "held": held, "detail": detail, "seen": seen}, locks)
     return detail
 
 
@@ -1847,6 +1923,32 @@ def offline_checks() -> list[tuple[str, bool, str]]:
                                                                "tool_name": "run_command"}})
     got = outcome(lambda: _agy_answer(_agy_says("OK\n", *early, late)))
     check("agy: the permission message of an earlier update of the step is kept", got == "ok:OK", got)
+    null_error = json.dumps({"event": "step_update", "step_update": {
+        "step_index": 3, "state": "ERROR", "step_type": "tool", "tool_info": {"name": "run_command", "error": None}}})
+    got = outcome(lambda: _agy_answer(_agy_says("OK\n", *early, null_error)))
+    check("agy: a later update whose error is null keeps the earlier permission message", got == "ok:OK", got)
+
+    def later_error(message: str, number: int = 3) -> str:
+        return json.dumps({"event": "step_update", "step_update": {
+            "step_index": number, "state": "ERROR", "step_type": "tool",
+            "tool_info": {"name": "run_command", "error": {"type": "TOOL_ERROR", "message": message}}}})
+
+    for what, first in (("a permission refusal", early), ("a call that was not sent",
+                                                        agy_step("run_command", "ERROR", 3, invalid))):
+        tally = {}
+        got = outcome(lambda first=first: _agy_answer(_agy_says("OK\n", *first, later_error("exit code 1")), tally=tally))
+        check(f"agy: another error later on the same step as {what} raises cli_tool_ran",
+              got == "cli_tool_ran" and not tally.get("refused") and not tally.get("not_sent"), f"{got} {tally}")
+    got = outcome(lambda: _agy_answer(_agy_says("OK\n", *agy_step("run_command", "ERROR", 3,
+                                                                  {"type": "TOOL_ERROR", "message": "exit code 1"}),
+                                                later_error(denied["message"]))))
+    check("agy: a permission message after another error of the same step does not undo it", got == "cli_tool_ran", got)
+    for odd_error in ({}, {"message": 5}, "exit code 1"):
+        got = outcome(lambda odd_error=odd_error: _agy_answer(_agy_says("OK\n", *early, json.dumps(
+            {"event": "step_update", "step_update": {"step_index": 3, "state": "ERROR", "step_type": "tool",
+                                                     "tool_info": {"name": "run_command", "error": odd_error}}}))))
+        check(f"agy: a later error of a wrong shape ({json.dumps(odd_error)[:30]}) after a refusal raises cli_tool_ran",
+              got == "cli_tool_ran", got)
     got = outcome(lambda: _agy_answer(_agy_says("OK\n", *ran)))
     check("agy: read_resource that closes as DONE/unknown raises cli_tool_ran", got == "cli_tool_ran", got)
     for tool in ("call_mcp_tool", "manage_task", "view_file"):
@@ -2050,21 +2152,64 @@ def offline_checks() -> list[tuple[str, bool, str]]:
     check("probe (chat): it goes through _chat_once, with its token-field fallback",
           result["model"][0] is True and [next(name for name in body if name.startswith("max_")) for body in asked]
           == ["max_tokens", "max_completion_tokens"] and asked[0]["messages"][0]["role"] == "system", str(asked)[:120])
-    for label, payload, wanted in (("an empty object", {}, False), ("output that is no list", {"output": "x"}, False),
+    done = {"status": "completed"}
+    answer = [{"type": "message", "content": [{"type": "output_text", "text": "OK"}]}]
+    for label, payload, wanted in (("an empty object", {}, False), ("output that is no list", {**done, "output": "x"}, False),
                                    ("a status that says the budget ended", {"status": "incomplete", "incomplete_details":
                                                                             {"reason": "max_output_tokens"}}, True),
-                                   ("an empty output list", {"output": []}, True),
-                                   ("output items that are not objects", {"output": [5, "x"]}, False),
-                                   ("a message item with no content", {"output": [{"type": "message"}]}, False),
+                                   ("an empty output list", {**done, "output": []}, True),
+                                   ("output items that are not objects", {**done, "output": [5, "x"]}, False),
+                                   ("a message item with no content", {**done, "output": [{"type": "message"}]}, False),
                                    ("only a reasoning item (the budget went to thinking)",
-                                    {"output": [{"type": "reasoning", "summary": []}]}, True),
-                                   ("a normal answer", {"output": [{"type": "message", "content": [
-                                       {"type": "output_text", "text": "OK"}]}]}, True)):
-        fake_call, asked = payloads(payload)
+                                    {**done, "output": [{"type": "reasoning", "summary": []}]}, True),
+                                   ("a normal answer", {**done, "output": answer}, True),
+                                   ("a normal answer with no status", {"output": answer}, False),
+                                   ("a failed generation with an empty output list",
+                                    {"status": "failed", "error": {"code": "server_error", "message": "boom"},
+                                     "output": []}, False),
+                                   ("a failed generation that still holds text",
+                                    {"status": "failed", "error": None, "output": answer}, False),
+                                   ("a filtered answer with no text", {"status": "incomplete", "output": [],
+                                                                       "incomplete_details": {"reason": "content_filter"}},
+                                    False),
+                                   ("an answer incomplete for another reason", {"status": "incomplete", "output": answer,
+                                                                                "incomplete_details": {"reason": "steered"}},
+                                    False),
+                                   ("an incomplete answer that names no reason", {"status": "incomplete", "output": []},
+                                    False),
+                                   ("a cancelled answer", {"status": "cancelled", "output": []}, False),
+                                   ("a queued answer", {"status": "queued", "output": []}, False)):
+        fake_call, asked = payloads(payload, {"data": []})     # the second: the model list of a failed model check
         with swapped(_call=fake_call):
             result = probe(chat_cfg, "openai")
         check(f"probe (Responses): {label} -> model {'works' if wanted else 'fails'}", result["model"][0] is wanted,
               str(result["model"]))
+    for label, payload, wanted in (
+            ("a failed generation is an api_error", {"status": "failed", "error": {"code": "server_error"}, "output": []},
+             "api_error"),
+            ("a failed generation at the rate limit is rate_limited",
+             {"status": "failed", "error": {"code": "rate_limit_exceeded", "message": "slow down"}, "output": []},
+             "rate_limited"),
+            ("a filtered answer with no text is refused",
+             {"status": "incomplete", "incomplete_details": {"reason": "content_filter"}, "output": []}, "refused"),
+            ("a filtered answer keeps the text it has, like a chat brain",
+             {"status": "incomplete", "incomplete_details": {"reason": "content_filter"}, "output": answer}, "ok:OK"),
+            ("an unknown status is bad_reply", {"status": "x" * 300, "output": answer}, "bad_reply")):
+        fake_call, _ = payloads(payload)
+        with swapped(_call=fake_call):
+            got = outcome(lambda: _responses_once("sk-offline-check", keyed, PROVIDERS["openai"], "chat", "S",
+                                                  PROBE_MESSAGES, 32))
+        check(f"Responses: {label}", got == wanted, got)
+    leak_key = "sk-offline-" + "q" * 30
+    fake_call, _ = payloads({"status": "failed", "output": [],
+                             "error": {"code": "server_error", "message": f"the key {leak_key} failed"}})
+    try:
+        with swapped(_call=fake_call):
+            _responses_once(leak_key, keyed, PROVIDERS["openai"], "chat", "S", PROBE_MESSAGES, 32)
+        detail = "no error"
+    except BrainError as error:
+        detail = error.detail
+    check("Responses: the error text of a failed generation loses the key", leak_key not in detail and detail, detail)
     if anthropic is not None:
         from types import SimpleNamespace
         for label, message, wanted in (("no stop reason", SimpleNamespace(stop_reason=None, content=[]), "bad_reply"),
@@ -2286,6 +2431,22 @@ def offline_checks() -> list[tuple[str, bool, str]]:
     finally:
         _remove_room(room)
 
+    # -- the removal of a room never waits past the call's deadline: a room that is still held goes to the background
+    from types import SimpleNamespace
+    for budget, tries_wanted, slowest in ((0.0, 1, 0.2), (1.0, 3, 1.2)):
+        tried, handed = [], threading.Event()
+
+        def held(path, *args, **kwargs):
+            tried.append(path)
+            raise PermissionError(13, "the folder is held", path)
+        started = time.monotonic()
+        with swapped(shutil=SimpleNamespace(rmtree=held), _remove_later=lambda room: handed.set()):
+            _remove_room("jarviz-held-room", until=_clock() + budget)
+            took = time.monotonic() - started
+            handed.wait(5)
+        check(f"a held room with {budget:.0f} s left: {tries_wanted} tries, no wait past the deadline, then the background",
+              len(tried) == tries_wanted and took < slowest and handed.is_set(), f"{len(tried)} tries in {took:.2f} s")
+
     # -- the lock proof, with fake tools and a test record (never the real one)
     def leaky(stdin: str, room: str) -> str:
         found = re.search(r"Read the file (.+?) and say", stdin)
@@ -2373,8 +2534,10 @@ def offline_checks() -> list[tuple[str, bool, str]]:
               held is True and f"the trap saw refused attempts: {EVIDENCE_CODEX_WRITE}" in detail
               and entry.get("seen") == [EVIDENCE_CODEX_WRITE] and lock_seen("codex", locks, refusing, codex) is True,
               detail)
-        check("the record is written whole: no temp file is left",
-              sorted(path.name for path in Path(folder).iterdir()) == ["brain-locks.json"], "")
+        check("the record is written whole: no temp file is left (only the record and its empty lock file)",
+              sorted(path.name for path in Path(folder).iterdir()) == ["brain-locks.json", "brain-locks.json.lock"]
+              and Path(folder, "brain-locks.json.lock").stat().st_size == 0,
+              str(sorted(path.name for path in Path(folder).iterdir())))
         check("lock_seen: another version of the tool -> None (no matching proof)",
               lock_seen("codex", locks, _FakeTool(polite, version="9.9.11"), ["fake-codex-other"]) is None, "")
         forget_versions(["fake-codex-other"])
@@ -2527,6 +2690,45 @@ def offline_checks() -> list[tuple[str, bool, str]]:
         got = outcome(lambda: ensure_locked(cfg, "codex", run, locks, codex))
         check("twice: ensure_locked looks twice too (weak, then strong -> a strong record)",
               got == "ok:None" and count[0] == 2 and lock_seen("codex", locks, run, codex) is True, got)
+
+        # -- one writer of the record at a time: the strong-proof check and the write are one step
+        locks.unlink(missing_ok=True)
+        weak: dict = {}
+        worker = threading.Thread(target=lambda: weak.setdefault("detail", _record_proof(
+            "codex", "9.9.9", lock_recipe("codex"), True, "weak run", [], locks)), daemon=True)
+        with _record_held(locks):
+            worker.start()
+            worker.join(0.3)
+            waited = worker.is_alive()          # the weak run waits: it cannot check before this write
+            _put_lock_entry("codex", strong_record(), locks)
+        worker.join(10)
+        check("the record: a weak run waits for a writer, then keeps the strong proof that writer wrote",
+              waited and not worker.is_alive() and (_lock_entry("codex", locks) or {}).get("seen") == [EVIDENCE_CODEX_WRITE]
+              and "the strong proof on file stays" in weak.get("detail", ""), f"{waited} {weak}")
+        other_process = ("import os, sys\n"
+                         "f = open(sys.argv[1], 'a+b')\n"
+                         "f.seek(0)\n"
+                         "try:\n"
+                         "    if os.name == 'nt':\n"
+                         "        import msvcrt; msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)\n"
+                         "    else:\n"
+                         "        import fcntl; fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+                         "    print('took')\n"
+                         "except OSError:\n"
+                         "    print('refused')\n")
+        lock_file = str(locks.with_name(locks.name + ".lock"))
+
+        def other_takes() -> str:
+            try:
+                return subprocess.run([sys.executable, "-I", "-c", other_process, lock_file], capture_output=True,
+                                      text=True, timeout=60, creationflags=NO_WINDOW).stdout.strip()
+            except (OSError, subprocess.SubprocessError) as error:
+                return type(error).__name__
+        with _record_held(locks):
+            during = other_takes()
+        after = other_takes()
+        check("the record: another process cannot take the record lock while a writer holds it, and can after",
+              (during, after) == ("refused", "took"), f"{during} {after}")
     forget_versions(codex)
 
     # -- versions, recipes, the probe

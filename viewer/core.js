@@ -54,12 +54,15 @@
     let waiting = null;     // a line asked for before the first click
     let current = null;     // the line being said: an utterance (browser voice) or a job (server voice)
     let voice = 'browser';
-    let failures = 0;       // server-voice lines that failed in a row
+    let failures = 0;       // server-voice lines that failed in a row (only a line that played to its end resets it)
     let told = false;       // the trouble line was shown since the last part that played well
     let gaveUp = false;     // VOICE_GIVE_UP failures in a row: the server voice is not asked until setVoice
     let generation = 0;     // a new number for every setVoice: a job counts only for the choice it started with
+    let owed = false;       // the page heard "speaking" (onStart) and not yet "ended" (onEnd)
 
     const serverVoice = () => voice !== 'browser' && !gaveUp && Boolean(env.fetchAudio && env.Audio && env.createObjectURL);
+    const tellStart = line => { owed = true; if (env.onStart) env.onStart(line); };
+    const tellEnd = line => { owed = false; if (env.onEnd) env.onEnd(line); };
 
     // THE ONE FUNCTION THAT SPEAKS. Nothing else may make sound.
     function speak(text) {
@@ -80,11 +83,11 @@
       if (chosen) { utterance.voice = chosen; utterance.lang = chosen.lang; }
       utterance.rate = 1.03;
       utterance.pitch = 0.95;
-      utterance.onstart = () => { if (current === utterance && !started && env.onStart) env.onStart(line); };
+      utterance.onstart = () => { if (current === utterance && !started) tellStart(line); };
       utterance.onend = utterance.onerror = () => {
         if (current !== utterance) return;                // an older line that was cut off
         current = null;
-        if (env.onEnd) env.onEnd(line);
+        tellEnd(line);
       };
       current = utterance;
       env.synth.speak(utterance);
@@ -135,11 +138,12 @@
       audio.onended = () => {
         if (!mine()) return;
         release(job);
+        const last = part + 1 >= job.parts;
         if (job.generation === generation) {              // a part that played well, of the voice chosen now
-          failures = 0;
-          told = false;
+          told = false;                                   // a later failure shows its line again
+          if (last) failures = 0;                         // a line counts as played well only when its last part did
         }
-        if (part + 1 >= job.parts) return finish(job);
+        if (last) return finish(job);
         askAhead();
         job.ahead.outcome.then(next => playPart(job, part + 1, next));
       };
@@ -148,7 +152,7 @@
       try { playing = Promise.resolve(audio.play()); } catch (error) { playing = Promise.reject(error); }
       playing.then(() => {
         if (!mine()) return;
-        if (!job.started) { job.started = true; if (env.onStart) env.onStart(job.line); }
+        if (!job.started) { job.started = true; tellStart(job.line); }
         askAhead();
       }, error => { if (mine()) fail(job, error); });
       return undefined;
@@ -165,9 +169,12 @@
       if (url && env.revokeObjectURL) env.revokeObjectURL(url);
     }
 
+    // The end of a line. A line cut off by this one sent no "ended" (the new line goes on speaking). When this line
+    // never started (it could not be played at all), that "ended" is still owed: it is sent now, so the page is
+    // never left "speaking" and deaf.
     function finish(job) {
       current = null;
-      if (job.started && env.onEnd) env.onEnd(job.line);
+      if (owed) tellEnd(job.line);
     }
 
     // A part could not be fetched or played: the browser voice says the line at once, so nothing is lost. The page
@@ -233,7 +240,7 @@
       const wasSpeaking = current !== null;
       cut();                                              // the audio stops at once; parts still on their way are dropped
       if (env.synth) env.synth.cancel();
-      if (wasSpeaking && env.onEnd) env.onEnd('');
+      if (wasSpeaking) tellEnd('');
     }
 
     return { speak, unlock, stop, setVoice, isUnlocked: () => unlocked, isSpeaking: () => current !== null,

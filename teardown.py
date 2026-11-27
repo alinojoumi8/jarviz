@@ -2347,8 +2347,8 @@ class Bay:
                 "doubts": unsupported_claims(reply["note"], digest)}
 
     def _take_back(self, job: Job, folder: Path | None = None, vault: str | None = None) -> None:
-        """A teardown that failed takes back the notes it made, newest first. An older note cannot go while a
-        newer one stays, so the first one that cannot be taken back stops it. What stays is still on the job.
+        """A teardown that failed takes back the notes it made, newest first. The first one that cannot be taken back
+        stops it, so an older note never goes while a newer one stays. What stays is still on the job.
         `folder` and `vault`: the notes folder the job bound itself to. A note made there while the galaxy has moved
         to another folder since is taken back by its file alone (unbirth_left)."""
         if self._unbirth is None:

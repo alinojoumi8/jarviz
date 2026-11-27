@@ -319,6 +319,7 @@
     let primary = null;
     let pinned = null;
     let resumeTimer = null;
+    let moves = 0;                            // goes up at every change of the focus: a timer that waited sees a newer one
 
     function stateOf(id) {
       if (!lit.size) return 'normal';
@@ -373,6 +374,7 @@
     function focusNode(id, also = []) {
       const node = data.nodes[id];
       if (!node) return false;
+      moves += 1;
       primary = id;
       lit = new Set([id, ...(neighbours.get(id) || []), ...also.filter(other => data.nodes[other])]);
       pin(node);
@@ -386,6 +388,7 @@
     function lightCluster(ids) {
       const valid = ids.filter(id => data.nodes[id]);
       if (!valid.length) return false;
+      moves += 1;
       primary = null;
       lit = new Set(valid);
       unpin();
@@ -395,6 +398,7 @@
     }
 
     function clear() {
+      moves += 1;
       primary = null;
       lit = new Set();
       unpin();
@@ -424,6 +428,7 @@
       grabbed: () => { clearTimeout(resumeTimer); spin(false); },
       released: () => rest(IDLE_RESUME_MS),
       current: () => ({ primary, lit: [...lit] }),
+      moves: () => moves,
     };
   })();
 
@@ -480,10 +485,13 @@
     if (options.quiet) return node;
     pulse(node);
     // Node numbers belong to one state of the galaxy: when the galaxy on screen changed before the timer
-    // (a read, a rebuild), the number may name another note now. Then the camera stays.
+    // (a read, a rebuild), the number may name another note now. Then the camera stays. It stays too when the
+    // focus changed meanwhile (a newer answer, a click): the newer focus wins.
     const snapshot = graphState;
+    const moves = Focus.moves();
     setTimeout(() => {
-      if (graphState.build_id === snapshot.build_id && graphState.rev === snapshot.rev && data.nodes[node.id] === node) {
+      if (graphState.build_id === snapshot.build_id && graphState.rev === snapshot.rev && data.nodes[node.id] === node
+          && Focus.moves() === moves) {
         Focus.focusNode(node.id);
       }
     }, REDUCED_MOTION ? 0 : BIRTH_SETTLE_MS);
@@ -873,7 +881,9 @@
       && reply.graph.rev === graphState.rev;
     // A newer sentence started while this one waited: it owns the answer. This reply only mends the galaxy.
     const owner = mine === sends;
-    if (reply.voice && reply.ok !== false) takeVoice(reply.voice);   // a new voice says its own answer
+    // A new voice says its own answer. The choice lives only in this page, so a late /voice answer changes nothing:
+    // the newer sentence replaced the switch, as it replaces a request still in the air.
+    if (owner && reply.voice && reply.ok !== false) takeVoice(reply.voice);
     if (owner) say(reply.answer || '', reply.ok === false);   // also after a failed read: the save did happen
     // The job a /teardown/cancel answer is about (`job_id`). An older server names none.
     const about = typeof reply.job_id === 'string' && reply.job_id ? reply.job_id : null;

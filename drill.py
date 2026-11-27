@@ -15,13 +15,18 @@ session is gone when the server stops.
 """
 from __future__ import annotations
 
+import contextlib
+import hashlib
 import http.client
+import io
 import json
+import os
 import re
 import secrets
 import shutil
 import socket
 import sys
+import tempfile
 import time
 from pathlib import Path
 from urllib.parse import quote
@@ -108,9 +113,20 @@ def follow_job(job_id: str | None, limit: float, ask, ask_cancel, clock=time.mon
                      CANCEL_WAIT_S more; or another job's id answers (or none): our job is gone and its end was never
                      seen. An end that is not confirmed is NOT an end: the job can still have written. The receipts of
                      the last view still count: they are files the job made.
-    A view of our job with a missing or unknown state is no answer: it is tried again like one."""
+    A view of our job with a missing or unknown state is no answer: it is tried again like one. When the silence
+    budget and the job's time run out together, the named cancel still goes out before the drill gives up."""
     job, cancelled, silent_since = {}, False, None
     deadline = clock() + limit
+
+    def send_cancel() -> float:
+        """The cancel of OUR job (by its id), with the wait after it as its budget. The end of that wait."""
+        until = clock() + CANCEL_WAIT_S             # the wait after the cancel starts at its send
+        try:
+            ask_cancel(request_timeout(until - clock()))
+        except SERVER_GONE:
+            pass                        # the next answers say whether it ended
+        return until
+
     while True:
         sent = clock()
         left = min(SILENT_RETRY_S - (sent - silent_since if silent_since is not None else 0), deadline - sent)
@@ -122,6 +138,8 @@ def follow_job(job_id: str | None, limit: float, ask, ask_cancel, clock=time.mon
         except SERVER_GONE:
             view, silent_since = None, sent if silent_since is None else silent_since
             if clock() - silent_since >= SILENT_RETRY_S:
+                if not cancelled and clock() >= deadline:
+                    send_cancel()       # its time ran out in the silence: it must not run on unasked
                 return NOT_CONFIRMED, job
         if view is not None:
             if view.get("id") != job_id:
@@ -132,11 +150,7 @@ def follow_job(job_id: str | None, limit: float, ask, ask_cancel, clock=time.mon
         if clock() >= deadline:
             if cancelled:
                 return NOT_CONFIRMED, job
-            cancelled, deadline = True, clock() + CANCEL_WAIT_S     # the wait after the cancel starts at its send
-            try:
-                ask_cancel(request_timeout(deadline - clock()))
-            except SERVER_GONE:
-                pass                    # the next answers say whether it ended
+            cancelled, deadline = True, send_cancel()
         sleep(POLL_S)
 
 
@@ -203,7 +217,13 @@ def follow_checks() -> list[tuple[str, bool, str]]:
              ("our job gone and a good answer with no job is not a confirmed end, with our last view",
               [good(running), good(None)], 60, (NOT_CONFIRMED, running, 0)),
              ("another job's id from the first answer is not a confirmed end, with no view", [good(other)], 60,
-              (NOT_CONFIRMED, {}, 0))]
+              (NOT_CONFIRMED, {}, 0)),
+             # Polls every 0.5 s until 10 s; the request sent then hangs for the whole 10 s left: the silence budget and
+             # the job's time end together. The named cancel still goes out before the drill gives up.
+             ("silence that ends with the job's time still sends the named cancel", [good(running)] * 20 + ["hang"], 20,
+              (NOT_CONFIRMED, running, 1)),
+             ("silence that ends before the job's time sends no cancel", [good(running)] * 4 + ["hang"], 20,
+              (NOT_CONFIRMED, running, 0))]
     no_job_key = (200, b"{}")                       # a good answer has the key "job"
     stateless, weird = good({"id": "job1"}), good({"id": "job1", "state": "weird"})
     for what, bad in (("an HTTP 500", error_500), ("an HTML error page", html), ('{"ok": false}', refused),
@@ -249,8 +269,75 @@ def follow_checks() -> list[tuple[str, bool, str]]:
     return results
 
 
+def cleanup_checks() -> list[tuple[str, bool, str]]:
+    """Offline: made_by and remove_made with made-up jobs in a temp folder, and the note scan that put_back builds
+    the galaxy from. No server."""
+    results = []
+    ours, elsewhere = "vault-of-the-drill", "vault-of-another-folder"
+    with tempfile.TemporaryDirectory(prefix="jarviz-drill-") as base:
+        notes = Path(base)
+
+        def place(relative: str, text: str) -> tuple[str, str]:
+            path = notes / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(text.encode("utf-8"))
+            return relative, hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+        def job(name: str, *births: dict) -> dict:
+            return {"state": "done", "result": {"name": name, "snapshot": f"{name}.png"}, "births": list(births)}
+
+        note, born = place(f"{teardown.TEARDOWNS_DIR}/t1.md", "the test note")
+        picture, _ = place(f"{teardown.TEARDOWNS_DIR}/{teardown.ASSETS_DIR}/t1.png", "png")
+        concept, concept_born = place(teardown.CONCEPT_PATH, "the REA note")
+        made = made_by(job("t1", {"file": note, "vault": ours, "born": born},
+                           {"file": concept, "vault": ours, "born": concept_born}))
+        results.append(("drill: made_by keeps the vault and the bytes of each file, and the picture its note's vault",
+                        made == [(note, ours, born), (picture, ours, ""), (concept, ours, concept_born)], str(made)))
+        trouble = remove_made(notes, ours, made)
+        results.append(("drill: the test's own files in the drill's notes folder are removed",
+                        not trouble and not any((notes / relative).exists() for relative, _, _ in made), str(trouble)))
+        # The galaxy moved to another folder during the drill: the job chose the name t2 there. A note and a picture
+        # of that name in the drill's own folder are NOT the test's.
+        user_note, user_born = place(f"{teardown.TEARDOWNS_DIR}/t2.md", "the user's own note")
+        user_picture, _ = place(f"{teardown.TEARDOWNS_DIR}/{teardown.ASSETS_DIR}/t2.png", "the user's own picture")
+        user_concept, _ = place(teardown.CONCEPT_PATH, "the user's own REA note")
+        moved = made_by(job("t2", {"file": user_note, "vault": elsewhere, "born": user_born},
+                            {"file": user_concept, "vault": elsewhere, "born": "0" * 64}))
+        trouble = remove_made(notes, ours, moved)
+        results.append(("drill: files made in another notes folder are never removed here, and the clean-up says so",
+                        len(trouble) == 3 and all((notes / relative).exists() for relative in (user_note, user_picture,
+                                                                                               user_concept)),
+                        str(trouble)))
+        unnamed = made_by(job("t2", {"file": user_note, "born": user_born}))     # a receipt that names no folder
+        changed = [(user_note, ours, hashlib.sha256(b"what the test wrote").hexdigest())]
+        trouble = remove_made(notes, ours, unnamed) + remove_made(notes, ours, changed) + remove_made(notes, "", changed)
+        results.append(("drill: a receipt with no folder, a note whose bytes differ, or no recorded folder: nothing goes",
+                        len(trouble) == 4 and (notes / user_note).exists() and (notes / user_picture).exists(),
+                        str(trouble)))
+        # put_back builds the galaxy from build.note_files: a note that cannot be looked at is said, never hidden
+        # (Path.is_file says False in silence since Python 3.14).
+        real_stat, said = os.stat, io.StringIO()
+        blocked = str(notes / user_note)
+
+        def refusing(path, *args, **kwargs):
+            if os.fspath(path) == blocked:
+                raise PermissionError(13, "Permission denied", blocked)
+            return real_stat(path, *args, **kwargs)
+        os.stat = refusing
+        try:
+            with contextlib.redirect_stderr(said):
+                looked = build._regular_file(Path(blocked))
+        finally:
+            os.stat = real_stat
+        results.append(("build: a note that cannot be looked at is skipped and said; a plain file is a note",
+                        looked is False and "Skipped t2.md" in said.getvalue()
+                        and build._regular_file(notes / user_picture) and not build._regular_file(notes),
+                        f"{looked} {said.getvalue().strip()!r}"))
+    return results
+
+
 def offline(report: Report) -> None:
-    for name, passed, detail in teardown.offline_checks() + follow_checks():
+    for name, passed, detail in teardown.offline_checks() + follow_checks() + cleanup_checks():
         report.add(PASS if passed else FAIL, name, "" if passed else detail)
 
 
@@ -297,12 +384,14 @@ def shape(graph: dict) -> tuple[list[str], list[tuple[str, str]]]:
 
 
 def record() -> dict:
-    """How things are before a test teardown: the notes and links in the galaxy, and the teardowns folder."""
+    """How things are before a test teardown: the notes and links in the galaxy, and the teardowns folder. "vault":
+    the fingerprint of the notes folder (server.vault_of), as a receipt names it."""
     notes_dir = build.resolve_notes_dir(server.load_config()["notes_dir"])
     folder = notes_dir / teardown.TEARDOWNS_DIR
     watched = (notes_dir / "captures", folder, folder / teardown.ASSETS_DIR)
     graph = build.read_graph()
-    return {"notes_dir": str(notes_dir), "labels": [node.get("label") for node in graph.get("nodes", [])],
+    return {"notes_dir": str(notes_dir), "vault": server.vault_of(notes_dir),
+            "labels": [node.get("label") for node in graph.get("nodes", [])],
             "shape": shape(graph), "tree": tree(folder), "folders": {str(path): path.is_dir() for path in watched}}
 
 
@@ -313,21 +402,60 @@ def closed_port() -> int:
         return probe.getsockname()[1]
 
 
-def made_by(job: dict) -> list[str]:
-    """The files one test teardown made, as paths inside the notes folder. Nothing else is ever removed.
+def made_by(job: dict) -> list[tuple[str, str, str]]:
+    """The files one test teardown made: (the path inside the notes folder, the "vault" it was written in, the
+    "born" fingerprint of its bytes), from the job's birth receipts. "" where a receipt gives none; the picture has
+    no receipt of its own: it is in the folder of its note, and has no "born". Nothing else is ever removed.
     A job that failed half way can have made the Jarviz note or the REA note: the job lists every birth."""
     result = job.get("result") or {}
     name = result.get("name")
+    births = [birth for birth in (job.get("births") or result.get("births") or []) if isinstance(birth, dict)]
+
+    def receipt(file: str) -> tuple[str, str]:
+        birth = next((birth for birth in births if birth.get("file") == file), {})
+        return tuple(value if isinstance(value, str) else "" for value in (birth.get("vault"), birth.get("born")))
+
     files = []
     if job.get("state") == "done" and teardown.valid_name(name):
-        files.append(f"{teardown.TEARDOWNS_DIR}/{name}.md")
+        note = f"{teardown.TEARDOWNS_DIR}/{name}.md"
+        vault, born = receipt(note)
+        files.append((note, vault, born))
         if result.get("snapshot"):
-            files.append(f"{teardown.TEARDOWNS_DIR}/{teardown.ASSETS_DIR}/{name}.png")
-    births = [birth for birth in (job.get("births") or result.get("births") or []) if isinstance(birth, dict)]
+            files.append((f"{teardown.TEARDOWNS_DIR}/{teardown.ASSETS_DIR}/{name}.png", vault, ""))
     for concept in (teardown.CONCEPT_PATH, teardown.OWNER_PATH):
         if any(birth.get("file") == concept for birth in births):
-            files.append(concept)                       # the REA note or the Jarviz note, only when THIS job made it
+            files.append((concept, *receipt(concept)))  # the REA note or the Jarviz note, only when THIS job made it
     return files
+
+
+def remove_made(notes_dir: Path, vault: str, made: list[tuple[str, str, str]]) -> list[str]:
+    """Remove the test's own files from the notes folder of the drill (`vault`: its fingerprint). A file goes only
+    when its receipt names THAT folder, and a note only while it holds the bytes that were written ("born"). Anything
+    else stays and is said: a file made in another folder (the galaxy moved during the drill) cannot be found from
+    its fingerprint, and a file of the same name here is not the test's. Returns the trouble; it never raises."""
+    trouble: list[str] = []
+    root = notes_dir.resolve()
+    for relative, made_in, born in made:
+        if not vault or made_in != vault:
+            trouble.append(f"{relative} was made in another notes folder (or its receipt names none), so it was left alone")
+            continue
+        target = (notes_dir / relative).resolve()
+        try:
+            if not target.is_relative_to(root):
+                trouble.append(f"{relative} is not inside the notes folder, so it was left alone")
+                continue
+            if relative.endswith(".md"):
+                try:
+                    data = target.read_bytes()
+                except FileNotFoundError:
+                    continue                            # already gone
+                if not born or hashlib.sha256(data).hexdigest() != born:
+                    trouble.append(f"{relative} is not the note the test wrote (its bytes differ), so it was left alone")
+                    continue
+            target.unlink(missing_ok=True)
+        except OSError as error:
+            trouble.append(f"{relative} could not be removed ({error.strerror or error})")
+    return trouble
 
 
 def served_graph(status: int, body) -> dict | None:
@@ -344,19 +472,12 @@ def served_graph(status: int, body) -> dict | None:
     return graph
 
 
-def put_back(state: dict, made: list[str]) -> tuple[bool, str]:
-    """Remove the files in `made` (the test's own), remove folders that the test made and left empty,
-    and build the galaxy again from the notes on disk. It never raises: it reports."""
+def put_back(state: dict, made: list[tuple[str, str, str]]) -> tuple[bool, str]:
+    """Remove the files in `made` (the test's own, see remove_made), remove folders that the test made and left
+    empty, and build the galaxy again from the notes on disk. It never raises: it reports."""
     notes_dir = Path(state["notes_dir"])
     folder = notes_dir / teardown.TEARDOWNS_DIR
-    trouble: list[str] = []
-    for relative in made:
-        target = (notes_dir / relative).resolve()
-        try:
-            if target.is_relative_to(notes_dir.resolve()):
-                target.unlink(missing_ok=True)
-        except OSError as error:
-            trouble.append(f"{relative} could not be removed ({error.strerror or error})")
+    trouble = remove_made(notes_dir, state.get("vault") or "", made)
     for path in (folder / teardown.ASSETS_DIR, folder, notes_dir / "captures"):
         try:
             if not state["folders"].get(str(path)) and path.is_dir() and not any(path.iterdir()):
@@ -404,7 +525,7 @@ def live(report: Report, site: str, keep: Path | None) -> None:
     nodes_before = len(before["labels"])
     session = "drill-" + secrets.token_hex(4)
     ours: list[str] = []            # the ids of the jobs this drill started
-    made: list[str] = []            # the files those jobs made
+    made: list[tuple[str, str, str]] = []   # the files those jobs made, with their vault and born (made_by)
     ends: dict[str, str] = {}       # job id -> the verdict of its newest follow: only ENDED is a confirmed end
 
     def follow(job_id: str, limit: float) -> dict:

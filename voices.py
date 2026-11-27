@@ -137,12 +137,16 @@ def scrub_key(text: str, key: str) -> str:
 
 
 def scrub_keys(text: str, keys: Iterable[str]) -> str:
-    """scrub_key for each of `keys`, the longest first: a key that holds a shorter key is removed whole, so no piece
-    of it is left. Call it on the whole text, BEFORE any cut."""
+    """Every copy of each of `keys` becomes "[key removed]", in ONE pass over the text: at each place the longest key
+    that is there goes whole, so no piece of it is left, and a marker is never searched again. A marker can still
+    join the text beside it into a key (a key that starts with "]"): then nothing of the text is kept. Call it on
+    the whole text, BEFORE any cut. Empty keys and the placeholder are no keys (as in scrub_key)."""
     text = str(text)
-    for key in sorted({str(key or "").strip() for key in keys}, key=len, reverse=True):
-        text = scrub_key(text, key)
-    return text
+    keys = sorted({str(key or "").strip() for key in keys} - {"", KEY_PLACEHOLDER}, key=len, reverse=True)
+    if not keys:
+        return text
+    text = re.sub("|".join(map(re.escape, keys)), KEY_REMOVED, text)
+    return "" if any(key in text for key in keys) else text
 
 
 def key_lines(config: dict) -> dict[str, str]:
@@ -193,8 +197,10 @@ def active_name(config: dict) -> str:
 
 
 def _key_of(config: dict, spec: dict) -> str:
-    """The key from config.json, or "" when there is none yet."""
-    key = str(config.get(spec["key"]) or "").strip()
+    """The key from config.json, or "" when there is none yet. Only a text is a key, as in key_lines: the number
+    12345 or true is no key, and it is never sent."""
+    value = config.get(spec["key"])
+    key = value.strip() if isinstance(value, str) else ""
     return "" if key == KEY_PLACEHOLDER else key
 
 
@@ -241,10 +247,10 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 _OPENER = urllib.request.build_opener(_NoRedirect)
 
 
-def speak(config: dict, text: str, name: str, opener: Opener | None = None) -> tuple[bytes, str]:
+def speak(config: dict, text: str, name: str, opener: Opener | None = None, *, whole: str = "") -> tuple[bytes, str]:
     """The mp3 audio of `text` in the server voice `name` ("deepgram", "elevenlabs") with its lines of config.json,
     and its MIME type. Raises VoiceError. One request: the caller cuts a text longer than MAX_TEXT_CHARS with
-    split_text(). `opener` serves the offline checks only."""
+    split_text(), and gives the text it cut as `whole`. `opener` serves the offline checks only."""
     spec = VOICES.get(name) if isinstance(name, str) else None
     if spec is None or spec["kind"] not in _CALLS:
         why = "The browser voice is spoken by the page itself." if spec else "Jarviz has no server voice of that name."
@@ -261,6 +267,11 @@ def speak(config: dict, text: str, name: str, opener: Opener | None = None) -> t
     if len(text) > MAX_TEXT_CHARS:
         raise VoiceError("voice_too_long", f"The text has {len(text)} characters. One request takes at most "
                          f"{MAX_TEXT_CHARS}: cut it with split_text().", voice, keys)
+    # The text travels in the body. A key of ANY line in it would go to this provider: the text is refused, and the
+    # refusal never quotes it. The whole text too: a hard cut of a very long word can cut a key in two.
+    if any(key in part for key in keys for part in (text, whole if isinstance(whole, str) else "")):
+        raise VoiceError("voice_text_has_key", "The text holds a key of config.json, so it was not sent. A key "
+                         "travels only in the header of its own provider.", voice, keys)   # no request is sent
     trouble = _voice_id_trouble(voice["model"], keys, spec)
     if trouble:
         raise VoiceError("voice_not_found", trouble, voice, keys)         # no request is sent
@@ -378,12 +389,17 @@ def _fetch_audio(build: Callable[[], urllib.request.Request], voice: dict, keys:
 
 
 def _read_capped(response: Any, limit: int) -> bytes:
-    """At most limit + 1 bytes: one more than allowed is enough to know that the answer is too big."""
+    """At most limit + 1 bytes: one more than allowed is enough to know that the answer is too big. An answer that
+    ends before its Content-Length broke off: http.client's read(n) then gives b"" and raises nothing, but its
+    `length` still counts the bytes that never came (no Content-Length: None)."""
     chunks: list[bytes] = []
     size = 0
     while size <= limit:
         chunk = response.read(min(64 * 1024, limit + 1 - size))
         if not chunk:
+            left = getattr(response, "length", None)
+            if isinstance(left, int) and not isinstance(left, bool) and left > 0:
+                raise http.client.IncompleteRead(b"", left)     # voice_unreachable, as a read that breaks off
             break
         chunks.append(chunk)
         size += len(chunk)
@@ -391,16 +407,23 @@ def _read_capped(response: Any, limit: int) -> bytes:
 
 
 def _error_body(error: urllib.error.HTTPError) -> bytes:
+    """At most MAX_ERROR_BYTES of the error body. The answer is closed after it, also when the read fails: the rest
+    of a long body is never read, and the VoiceError keeps the HTTPError as its __context__."""
     try:
         return error.read(MAX_ERROR_BYTES) or b""
     except (OSError, http.client.HTTPException, ValueError, AttributeError):
         return b""                          # the error body did not come (a timeout): the status still says why
+    finally:
+        try:
+            error.close()
+        except (OSError, http.client.HTTPException, ValueError, AttributeError):
+            pass                            # an answer that cannot be closed changes nothing about the status
 
 
 def _json_of(raw: bytes) -> dict:
     try:
         parsed = json.loads(raw.decode("utf-8", "replace"))
-    except ValueError:
+    except (ValueError, RecursionError):    # RecursionError: JSON nested deeper than the decoder goes
         return {}                           # a body cut at MAX_ERROR_BYTES is not JSON: only the status speaks
     return parsed if isinstance(parsed, dict) else {}
 
@@ -490,14 +513,13 @@ def _elevenlabs_error(status: int, payload: dict, voice: dict, keys: Iterable[st
     detail, words = _elevenlabs_error_text(payload)
     if 300 <= status < 400:
         return _redirect_error(status, voice, keys)
-    if status == 429:                               # rate_limit_exceeded, concurrent_limit_exceeded, system_busy
+    code = next((ELEVENLABS_CODES[word] for word in words if word in ELEVENLABS_CODES), None)   # a word decides first
+    if code is None and status == 429:              # rate_limit_exceeded, concurrent_limit_exceeded, system_busy
         code = "voice_busy"
-    elif status == 408 or status >= 500:
+    elif code is None and (status == 408 or status >= 500):
         code = "voice_error"
-    else:
-        code = (next((ELEVENLABS_CODES[word] for word in words if word in ELEVENLABS_CODES), None)
-                or ELEVENLABS_STATUSES.get(status)
-                or ("voice_bad_request" if 400 <= status < 500 else "voice_bad_reply"))
+    elif code is None:
+        code = ELEVENLABS_STATUSES.get(status) or ("voice_bad_request" if 400 <= status < 500 else "voice_bad_reply")
     return VoiceError(code, detail or f"HTTP {status}", voice, keys)
 
 
@@ -572,7 +594,13 @@ def _cut_at(rest: str, limit: int) -> int:
 def probe(config: dict, name: str, opener: Opener | None = None) -> dict:
     """One real, very small request of the server voice `name` on the SAME path as speak(): the text "OK.". A voice
     list does not prove that the key may speak with the voice. Returns {"key": (ok, detail), "voice": (ok, detail)}.
-    ok is True, False, or None for "not checked". None is never a pass."""
+    ok is True, False, or None for "not checked". None is never a pass. Every key of config.json is taken out of
+    each finished text: a text also names lines and known ids, and a key can be one of them."""
+    keys = configured_keys(config)
+    return {part: (ok, scrub_keys(told, keys)) for part, (ok, told) in _probe(config, name, opener).items()}
+
+
+def _probe(config: dict, name: str, opener: Opener | None) -> dict:
     spec = VOICES.get(name) if isinstance(name, str) else None
     if spec is None or spec["kind"] not in _CALLS:
         why = ("The page speaks with the browser voice. The server has nothing to check." if spec
@@ -697,6 +725,34 @@ class _FakeHTTPS(urllib.request.HTTPSHandler):
         return response
 
 
+class _FakeSocket:
+    """What http.client.HTTPResponse reads an answer from: these bytes, no network. It proves what the real answer
+    object does with a body that ends before its Content-Length."""
+
+    def __init__(self, data: bytes):
+        self.data = data
+
+    def makefile(self, mode: str, *args, **kwargs) -> io.BytesIO:
+        return io.BytesIO(self.data)
+
+
+class _ClosingBody(io.BytesIO):
+    """An error body that says whether it was closed. `broken` makes its read fail."""
+
+    def __init__(self, data: bytes, broken: bool = False):
+        super().__init__(data)
+        self.shut, self.broken = False, broken
+
+    def read(self, size: int | None = -1) -> bytes:
+        if self.broken:
+            raise TimeoutError("the error body did not come")
+        return super().read(size)
+
+    def close(self) -> None:
+        self.shut = True
+        super().close()
+
+
 def offline_checks() -> list[tuple[str, bool, str]]:
     """Fast checks with a fake opener: no network, no file. They prove the logic of the code. The real Deepgram is
     proved by probe() (preflight)."""
@@ -731,11 +787,11 @@ def offline_checks() -> list[tuple[str, bool, str]]:
             raise error
         return make
 
-    def run(make, config: dict = cfg, text=" Good evening. ", name="deepgram", opener=None):
+    def run(make, config: dict = cfg, text=" Good evening. ", name="deepgram", opener=None, whole=""):
         """(the VoiceError code, or "ok:<mime>:<bytes>", or "CRASH ..."), the opener, the error."""
         opener = opener or _FakeOpener(make)
         try:
-            data, mime = speak(config, text, name, opener)
+            data, mime = speak(config, text, name, opener, whole=whole)
             return f"ok:{mime}:{len(data)}", opener, data
         except VoiceError as error:
             return error.code, opener, error
@@ -911,6 +967,41 @@ def offline_checks() -> list[tuple[str, bool, str]]:
         check(f"speak: {type(broken).__name__} is voice_unreachable", code == "voice_unreachable", code)
     code, _, _ = run(answer(broken=True))
     check("speak: an answer that breaks off is voice_unreachable", code == "voice_unreachable", code)
+
+    # -- http.client's own answer object: a body that ends before its Content-Length broke off (read(n) says nothing)
+    def wire(body: bytes, length: int | None):
+        head = b"HTTP/1.1 200 OK\r\nContent-Type: audio/mpeg\r\n"
+        head += f"Content-Length: {length}\r\n".encode() if length is not None else b"Connection: close\r\n"
+
+        def make(request):
+            response = http.client.HTTPResponse(_FakeSocket(head + b"\r\n" + body))
+            response.begin()
+            return response
+        return make
+
+    good = f"ok:{AUDIO_MIME}:{len(mp3)}"
+    for what, make, want in (("a body shorter than its Content-Length", wire(mp3, 10000), "voice_unreachable"),
+                             ("a body of exactly its Content-Length", wire(mp3, len(mp3)), good),
+                             ("a body with no Content-Length", wire(mp3, None), good)):
+        for name, base in (("deepgram", cfg), ("elevenlabs", el_cfg)):
+            code, _, _ = run(make, base, name=name)
+            check(f"speak: {what} ({name}) is {want.split(':')[0]}", code == want, code)
+
+    # -- the error body: closed after its first MAX_ERROR_BYTES, also when its read fails (the error is still held)
+    for broken in (False, True):
+        error_body = _ClosingBody(b"x" * (MAX_ERROR_BYTES + 10), broken)
+
+        def closing(request, error_body=error_body):
+            raise urllib.error.HTTPError(request.full_url, 500, "error", http.client.HTTPMessage(), error_body)
+        code, _, error = run(closing)
+        check(f"speak: the error body is closed{' when its read fails' if broken else ''}",
+              code == "voice_error" and error is not None and error_body.shut, code)
+    deep = b"[" * 60000                         # under MAX_ERROR_BYTES, deeper than the JSON decoder goes
+    for name, base in (("deepgram", cfg), ("elevenlabs", el_cfg)):
+        for status, want in ((503, "voice_error"), (401, "voice_key_invalid")):
+            code, _, error = run(refuse(status, raw=deep), base, name=name)
+            check(f"speak: an error body nested too deep for the decoder says the status ({name}, HTTP {status})",
+                  code == want and getattr(error, "detail", "") == f"HTTP {status}", code)
 
     # -- the key never travels on
     _, _, error = run(refuse(401, {"err_msg": f"Invalid credentials for {key}. Key {key} refused."}))
@@ -1088,10 +1179,13 @@ def offline_checks() -> list[tuple[str, bool, str]]:
         (429, new("rate_limit_error", "rate_limit_exceeded"), "voice_busy"),
         (429, new("rate_limit_error", "concurrent_limit_exceeded"), "voice_busy"),
         (429, new("rate_limit_error", "system_busy"), "voice_busy"),
-        (429, new("authentication_error", "invalid_api_key"), "voice_busy"),
+        (429, new("authentication_error", "invalid_api_key"), "voice_key_invalid"),     # the word decides first
+        (429, new("payment_required", "quota_exceeded"), "voice_no_credit"),
+        (429, {}, "voice_busy"),
         (500, new("internal_error", "internal_error"), "voice_error"),
         (503, new("service_unavailable", "maintenance"), "voice_error"),
-        (503, new("authentication_error", "invalid_api_key"), "voice_error"),
+        (503, new("authentication_error", "invalid_api_key"), "voice_key_invalid"),
+        (503, {}, "voice_error"),
         (408, {}, "voice_error"),
         (401, old("quota_exceeded", "You have insufficient quota to complete the request."), "voice_no_credit"),
         (401, old("invalid_api_key", "Invalid API key."), "voice_key_invalid"),
@@ -1345,6 +1439,18 @@ def offline_checks() -> list[tuple[str, bool, str]]:
         check(f"probe elevenlabs: a key in {line} sends no request", not opener.calls and result["voice"][0] is False
               and el_key not in json.dumps(result), str(result))
     check("probe: no answer ever shows a key", shown and not any(key in text or el_key in text for text in shown), "")
+    # A probe text also names known ids and line names. A key that is one of them is taken out of the finished text.
+    for what, config, name, make, value in (
+            ("a known voice id", {**cfg, "openai_api_key": "aura-2-pandora-en"}, "deepgram",
+             refuse(400, {"err_msg": "No such model/language/tier combination found"}), "aura-2-pandora-en"),
+            ("a known model id", {**el_cfg, "venice_api_key": "eleven_v3", "elevenlabs_model": "eleven_v9"},
+             "elevenlabs", refuse(404, new("not_found", "model_not_found")), "eleven_v3"),
+            ("the name of a key line", {**el_cfg, "deepseek_api_key": el_key, "openai_api_key": "deepseek_api_key"},
+             "elevenlabs", answer(), "deepseek_api_key")):
+        result, opener = probed(make, config, name)
+        told = json.dumps(result)
+        check(f"probe: a key that is also {what} is not shown", value not in told and KEY_REMOVED in told
+              and False in (result["key"][0], result["voice"][0]), told)
 
     # -- a key of ANOTHER line of config.json (a brain's, the other voice's) never travels
     el_shaped = "sk_" + "0123456789abcdef" * 3            # made at run time: the shape of an ElevenLabs key (51)
@@ -1406,6 +1512,23 @@ def offline_checks() -> list[tuple[str, bool, str]]:
     check("scrub_keys: no keys, empty keys and the placeholder change nothing",
           scrub_keys(f"a {KEY_PLACEHOLDER}", []) == scrub_keys(f"a {KEY_PLACEHOLDER}", ["", "  ", KEY_PLACEHOLDER])
           == f"a {KEY_PLACEHOLDER}", "")
+    check("scrub_keys: one ordinary key gives what scrub_key gives",
+          scrub_keys("a k3y99 b k3y99", [" k3y99 "]) == scrub_key("a k3y99 b k3y99", "k3y99") == f"a {KEY_REMOVED} b "
+          f"{KEY_REMOVED}", scrub_keys("a k3y99 b k3y99", ["k3y99"]))
+    for keys_, text, why in ((["]tail123", "abcd"], "abcdtail123", "a marker joins the text after it"),
+                             (["abcdefgh", "d]x"], "abcdefghx", "a marker ends a key"),
+                             (["e"], "hello", "the key is inside the marker")):
+        scrubbed = scrub_keys(text, keys_)
+        check(f"scrub_keys: no key is left when {why}", not any(known in scrubbed for known in keys_), repr(scrubbed))
+    rng, leaks = random.Random(11), []
+    for trial in range(400):                        # small keys made of the marker's own characters
+        pool = "abk]e[ dy"
+        keys_ = ["".join(rng.choice(pool) for _ in range(rng.randint(1, 5))) for _ in range(rng.randint(1, 3))]
+        text = "".join(rng.choice(pool) for _ in range(rng.randint(0, 40)))
+        scrubbed, live = scrub_keys(text, keys_), [known.strip() for known in keys_ if known.strip()]
+        if any(known in scrubbed for known in live):
+            leaks.append(f"trial {trial}: {keys_!r} in {text!r} -> {scrubbed!r}")
+    check("scrub_keys: 400 random texts and keys: no key is ever left", not leaks, "; ".join(leaks[:2]))
     check("VoiceError: one key as a text is one key, not its letters", VoiceError("x", "a b ab", None, "ab").detail
           == f"a b {KEY_REMOVED}", VoiceError("x", "a b ab", None, "ab").detail)
     other = {**el_cfg, "deepseek_api_key": ds_key}
@@ -1418,10 +1541,14 @@ def offline_checks() -> list[tuple[str, bool, str]]:
     detail = getattr(error, "detail", "")
     check("keys: no piece of a key of another line is left at the 300-character cut",
           len(detail) <= DETAIL_CHARS and ds_key[:5] not in detail, detail[-20:])
-    _, _, error = run(refuse(401, {"err_msg": f"bad {ds_key} and {el_key}"}), {**cfg, **other})
+    # `other` holds the Deepgram placeholder (default_config): the Deepgram key is put back AFTER it, so the request
+    # is sent and the 401 is the answer that is scrubbed.
+    code, opener, error = run(refuse(401, {"err_msg": f"bad {ds_key} and {el_key} and {key}"}),
+                              {**other, "deepgram_api_key": key})
     detail = getattr(error, "detail", "")
-    check("keys: a key of another line said back in a Deepgram error is removed",
-          ds_key not in detail and el_key not in detail and key not in detail, detail)
+    check("keys: a key of another line said back in a Deepgram error is removed", code == "voice_key_invalid"
+          and len(opener.calls) == 1 and ds_key not in detail and el_key not in detail and key not in detail
+          and detail.count(KEY_REMOVED) == 3, f"{code} {len(opener.calls)} {detail}")
 
     # -- a key that is no header-safe text is never sent (a header would break, and http.client says the value back)
     try:
@@ -1447,6 +1574,14 @@ def offline_checks() -> list[tuple[str, bool, str]]:
             check(f"keys: the probe of a {name} key with {what} sends nothing and never shows it",
                   not opener.calls and result["key"][0] is False and bad not in json.dumps(result)
                   and "voice_key_bad_text" in result["key"][1], str(result))
+    for value in (12345, True, 1.5, ["k3y99"], {"k": "v"}):     # JSON that is no text: no key (as key_lines says)
+        for name, base in (("deepgram", cfg), ("elevenlabs", el_cfg)):
+            config = {**base, VOICES[name]["key"]: value}
+            code, opener, _ = run(answer(), config, name=name)
+            result, probe_opener = probed(answer(), config, name)
+            check(f"keys: a {name} key that is no text ({type(value).__name__}) is no key, and nothing is sent",
+                  code == "voice_key_missing" and not opener.calls and not probe_opener.calls
+                  and describe(config, name)["has_key"] is False and result["key"][0] is False, code)
     for kind in (ValueError, TypeError):
         _, _, error = el_run(fails(kind(f"Invalid header value b'{el_key}\\n'")))
         check(f"keys: a {kind.__name__} on the way out is a VoiceError that names it, never its text",
@@ -1484,6 +1619,28 @@ def offline_checks() -> list[tuple[str, bool, str]]:
     check("key_lines: each key line with its stripped key, no placeholder",
           key_lines({**el_cfg, "anthropic_api_key": " x1 ", "openai_api_key": KEY_PLACEHOLDER})
           == {"anthropic_api_key": "x1", "elevenlabs_api_key": el_key}, "")
+
+    # -- a key of ANY line in the TEXT is never sent: the text travels in the body. The refusal never quotes the text.
+    every_key = {**cfg, "elevenlabs_api_key": el_key, "deepseek_api_key": ds_key, "openrouter_api_key": "k3y99"}
+    for what, text in (("the Deepgram key", f"Zebra, the key is {key}."), ("the ElevenLabs key", f"Zebra {el_key}."),
+                       ("a DeepSeek key", f"Zebra: {ds_key}"), ("a short key inside a word", "Zebra abck3y99def.")):
+        for name in SERVER_VOICES:
+            code, opener, error = run(answer(), every_key, text=text, name=name)
+            said = " ".join(str(getattr(error, field, "")) for field in ("detail", "model", "engine")) + str(error)
+            check(f"keys: a text that holds {what} sends nothing ({name})", code == "voice_text_has_key"
+                  and not opener.calls and "Zebra" not in said
+                  and not any(known in said for known in configured_keys(every_key)), f"{code} {said}")
+    long_word = "x" * 1890 + ds_key + "y" * 40     # one word longer than a request: the hard cut splits the key
+    pieces = split_text(long_word)
+    check("split_text: a hard cut can cut a key in two (why speak takes the whole text)",
+          len(pieces) == 2 and not any(ds_key in piece for piece in pieces), str([len(piece) for piece in pieces]))
+    for at, piece in enumerate(pieces):
+        code, opener, _ = run(answer(), every_key, text=piece, whole=long_word)
+        check(f"keys: piece {at} of a whole text that holds a key sends nothing", code == "voice_text_has_key"
+              and not opener.calls, code)
+    code, opener, _ = run(answer(), every_key, text="Good evening.", whole="Good evening. And a good night.")
+    check("keys: a text and a whole text with no key are sent as before", code.startswith("ok:")
+          and len(opener.calls) == 1 and json_body(opener.calls[0]) == {"text": "Good evening."}, code)
     return results
 
 

@@ -36,6 +36,8 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
   `elevenlabs_model`.
 - `~/.jarvis-tools/brain-locks.json` the lock proofs of the sign-in brains: the tool version and the lock recipe
   that a real trap proved. It is outside the project. Jarviz writes it.
+- `~/.jarvis-tools/brain-locks.json.lock` the empty lock file beside the lock record. It holds nothing. One writer of
+  the record at a time, also across processes (`_record_held`).
 - `~/.jarvis-tools/page-key` the page key (the lock). It is outside the project. The server makes it at the first start.
 
 ## Laws
@@ -58,10 +60,14 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
   the text is in a staging file beside it (`config.json.<pid>.tmp`: made new, never over a file, git ignores it).
   That is the ONE other file that may hold a key. `sweep_config_staging` (from `main()`) removes one that a crash
   left, and never reads it. A file that holds keys is made for its owner only (mode 0600, `_new_private_file`),
-  and a brain switch never makes `config.json` readable for more people than before (`_same_mode_as`).
+  and a brain switch never makes `config.json` readable for more people than before: the staging file takes only the
+  OWNER's permission bits of config.json (`_same_mode_as`), so it is owner-only until the replace (0644 becomes
+  0600, 0600 stays 0600).
 - Preflight proves a brain with one very small real question on the same path as `ask()` (route `"probe"` in
   `EFFORT` and `TIMEOUT_S`). A model list does not prove that a key may ask the model. The answer must have the
-  shape of a completion: an empty text is fine for the tiny budget, a missing envelope is a fail. An error text
+  shape of a completion: an empty text is fine for the tiny budget, a missing envelope is a fail. For the Responses
+  API a completion is status `completed`, or `incomplete` with reason `max_output_tokens` (or `content_filter`:
+  `refused` when no text came). `failed` and every other status is no completion (`_responses_once`). An error text
   from a provider loses the key BEFORE it is cut (`_without_key`); `scrub_key` is the second net.
 - A provider call never follows a redirect (the key would go with it). That holds for the `anthropic` package too:
   `get_client` gives it an HTTP client that follows none.
@@ -85,16 +91,22 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
   Weak: no word came back, no file was made and no tool ran, but no refused attempt was seen. Both let the brain
   answer. Preflight says PASS for strong and WARN for weak. Never call a weak proof strong.
 - The trap looks twice: a run with no evidence is run once more (`_prove_twice`). A weak run never replaces a
-  strong proof of the same version and recipe (`_record_proof`). A False verdict always replaces the record.
+  strong proof of the same version and recipe (`_record_proof`). The check and the write are one step under
+  `_record_held` (a system lock on `brain-locks.json.lock`), so a strong proof that another process writes in between
+  is never lost. A False verdict always replaces the record.
   `check_brain_locks` tries once more when the trap could not look. Two times "could not look" is a FAIL.
 - An agy run that never started (`cli_not_started`: the backend gave no conversation) is tried again, at most
-  `CLI_START_TRIES` times, in `_cli_call` only. A run that started is never asked twice.
+  `CLI_START_TRIES` times, in `_cli_call` only. A run that started is never asked twice. All tries of a sign-in call
+  stay inside the route's timeout, the removal of their rooms too (`_remove_room(room, until)`; a held room goes to
+  the background thread). Only the stop of a tool that ran out of time (`_stop_tree`) has its own bounded budget: a
+  tool is never left running.
 - agy must say at the start of EVERY run that it took the lock (`AGY_INIT`: permission mode `strict`, agent
   `jarviz-brain`). A run that started without those words is `cli_not_locked`, and its answer is thrown away.
 - A tool that ran throws the answer away (`cli_tool_ran`). Codex: any item that is not talk (`CODEX_TALK_ITEMS`).
   agy: a tool step that ends in ERROR is one of three kinds: refused by the lock (a permission message), never
   sent (`AGY_NOT_SENT_RE`: agy threw an invalid call out), or anything else, which may have run. Only the first
-  two keep the answer. The one more exception is `HARMLESS_LISTING` (tools that only list). Never add a tool to it
+  two keep the answer. A step that gave any other explicit error at ANY of its updates may have run, also when
+  another update of it shows a permission or invalid-call message. The one more exception is `HARMLESS_LISTING` (tools that only list). Never add a tool to it
   that can read, write, run a command or reach the web.
 - What a tool says (its events, its error text, its version) is data from a stranger. Types are checked, and a text
   goes through `_cli_detail` (no home folder, no e-mail address) before it travels on.
@@ -110,7 +122,9 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
   second time is locked out. Every tool call is signed anew. A signature is claimed only when the request is proven
   whole: a GET in `_unlocked`, a POST after its body matched (`_signed_body_ok`, called from `_read_json`). Every
   POST route takes its payload from `_read_json` only. A signature whose time is over is never claimed, and the
-  time of a claim is read inside the lock.
+  time of a claim is read inside the lock. In preflight, a replay counts as refused only while its signature is
+  clearly young (`SIGN_REPLAY_LIMIT_S`): the GET replay and the POST replay both measure the age. An older replay is
+  NOT VERIFIED.
 - A signature is never traded for the cookie: `Handler._door` gives the cookie only to a caller that brought the
   key itself. A signature names the start of the server (`INSTANCE`), so it is worth nothing after a restart.
 - No tool and no test sends the key itself, in a header, a cookie or an address. `python server.py --link` shows
@@ -127,11 +141,17 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
   page. The page asks the server for audio (`POST /voice/speak`), the server asks the provider (`voices.speak`) and
   gives the bytes back. A voice call never follows a redirect, and an error text loses the key before it is cut
   (`voices.scrub_key`). What can travel on (`describe`, a `VoiceError`, a probe text) loses EVERY key of
-  `config.json` (`voices.configured_keys`, every `..._api_key` line), not only the voice's own.
+  `config.json` (`voices.configured_keys`, every `..._api_key` line), not only the voice's own. `scrub_keys`
+  removes every key in one pass, the longest first at each place. If a marker would still join the text beside it
+  into a key, nothing of the text is kept. Every finished text of `voices.probe` goes through it too.
 - A voice key is sent only when it is a header-safe text (`KEY_TEXT_RE`: printable ASCII, no space) and when it
   equals, holds or is held by no key of another line (`voice_key_copied`): never a key of another provider. Else
   no request is sent, and the refusal names the lines, never a value. No exception text from building or sending a
-  request travels on: only its name (`voice_not_sent`).
+  request travels on: only its name (`voice_not_sent`). Only a text is a key (`key_lines`, `_key_of`): a number or
+  `true` in a key line is no key and is never sent.
+- A voice never sends a text that holds a key of ANY line of config.json (`voice_text_has_key`). The piece and the
+  whole text it was cut from (`speak(..., whole=)`: a hard cut can split a key) are checked, no request is sent,
+  and the refusal never quotes the text or names a key.
 - A new server voice is one entry in `VOICES` (`voices.py`), its key line and voice line(s) in `config.json`, and
   its own call (`_CALLS`).
 - ElevenLabs: the key is `elevenlabs_api_key`, and it travels in the `xi-api-key` header only. An ElevenLabs request
@@ -139,7 +159,9 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
   the address PATH: it must pass `VOICE_ID_RE` and hold no key of any line, else no request is sent (the same
   for `deepgram_voice`). The model id (`elevenlabs_model`) must pass `ENGINE_ID_RE` the same way. The refusal
   names the line, never the key. Every request names its model and asks for
-  `ELEVENLABS_FORMAT`. A code word of ElevenLabs decides before the HTTP status (`ELEVENLABS_CODES`).
+  `ELEVENLABS_FORMAT`. A code word of ElevenLabs decides before the HTTP status (`ELEVENLABS_CODES`), also before
+  429 and 5xx. Without a known word, 429 is `voice_busy` and 408/5xx is `voice_error`. An answer shorter than its
+  Content-Length is `voice_unreachable`.
 - The default ElevenLabs voice is an Infinity voice (Eldrin), because the Default voices expire on 2026-12-31.
 - `/voice/speak` needs `voice`: the name of a server voice (`voices.SERVER_VOICES`). Anything else is
   `bad_speak_request`, and no provider is asked. A line keeps the voice it started with (`job.voice` in
@@ -147,7 +169,13 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
   too (`job.generation`): after a `setVoice` it counts no failure and no good part for the new choice.
 - The voice choice lives in the browser (`localStorage`, `jarviz_voice`). `POST /voice` only judges a wish and
   answers with a line. The server never writes the choice into `config.json`: it writes that file in two places
-  only. The `"voice"` line there is the default voice, and only the user types it.
+  only. The `"voice"` line there is the default voice, and only the user types it. A `/voice` answer is taken only
+  while its reply owns the turn (`owner` in `handleReply`). A late one changes no voice, no chip and no
+  `jarviz_voice`.
+- `createSpeaker` owes the page one "ended" for each "speaking" (`owed`, `tellStart`, `tellEnd`). A line cut off by
+  a new line sends none. When the new line cannot play at all, `finish` sends it, so the page is never left speaking
+  and deaf. A server-voice line counts as played well only when its last part played: only then does `failures` go
+  back to 0. Each good part lets the trouble line show again (`told`).
 - `createSpeaker().speak` plays the audio of a server voice part by part, or uses the browser voice. A muted tab asks
   for NO audio: every request to a server voice costs money. When a part fails, the browser voice says the whole line
   again from its start (the page does not know where the server cut it), so no line is lost. `/voice/speak` takes at most `MAX_SPEAK_CHARS`, and `voices.split_text` cuts the text (one request
@@ -179,6 +207,15 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
 - Chat history is plain text (what was said, what was answered, receipts). So a switch of brains keeps
   the conversation. Receipts stay in the history right after the turn that earned them.
 - Tests clean up after themselves. A test note is removed before the test ends.
+- A test fixture is removed by hand (`remove_fixture` in `preflight.py`) only when it is certainly the fixture: the
+  receipt's `vault` is this notes folder, every folder on the way is a real folder (no link, no junction:
+  `real_folders`), and its bytes are `born`. The trash copy that /forget names goes through the same checks. A
+  fixture that is gone from its place is "cleanup not confirmed", never a success. An unanswered /forget still leads
+  to that check, and preflight never stops without its summary.
+- What preflight prints from an answer loses EVERY key of config.json (`voices.configured_keys`,
+  `voices.scrub_keys`) BEFORE it is cut.
+- A test that proves a lock holds must see the other thread TRY the lock while the owner holds it, before the owner
+  goes on. A lock that is free at that try is NOT VERIFIED.
 - Part Two (REA): it observes only. No clicks, no logins, websites the user may look at.
 - REA lives outside the project in `~/.jarvis-tools/rea` and is pinned by `REA_PIN` in `teardown.py`. Never install
   "latest". After a version change, run `python drill.py`.
@@ -241,20 +278,28 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
   written under the lock. `/forget` needs both, taken from the receipt: it moves a note only when it is the same
   creation, in the same galaxy. Two captures with exactly the same bytes count as the same note.
 - Every receipt also carries `"vault"`: a fingerprint of the notes folder (`vault_of`), never its path. `unbirth`
-  takes a note back only in the same vault and with the same `born`. A note of another folder is never touched.
+  takes a note back only in the same vault and with the same `born`. A note of another folder is never touched. It
+  finds the note by that identity and its `file`, never by the receipt's number (a rebuild sorts the notes by path).
+  A note that is not the newest is dropped at its place (`_drop_note`), and the galaxy gets a new build id, so no
+  receipt or reply of the old numbers is used for another note.
 - Node numbers belong to one state of the galaxy. The page uses the node numbers of a reply only when the galaxy
   on screen is exactly the reply's snapshot (the same `build_id` and the same `rev`), a receipt only when its
   `build` is the build on screen, and never on a galaxy that it could not read again.
 - The page publishes a revision only when the change it describes is installed. A receipt that cannot be applied
   makes the page doubt the galaxy and read it again. The numbers in the last status of a teardown only say if a
-  fresh read is needed. A timer that focuses a note checks the snapshot and the note again when it fires.
+  fresh read is needed. A timer that focuses a note checks the snapshot and the note again when it fires,
+  and `Focus.moves()`: a focus change since the timer was set (a newer answer, a click) wins.
 - The drill counts only an end that is confirmed (`follow_job`). Only a good status answer counts (`job_of`: it
   has the key `job`, and a job has an `id`), and a job ends only on `done`, `failed` or `cancelled`. An end that is not confirmed is a FAIL.
   When another job or no job answers, the end of our job was not seen: that is "not confirmed", with the last view
   that was ours. `put_back` trusts only a good `/status` answer with whole graph numbers (`served_graph`).
-- In `page_checks.js` a story that throws, runs out of time or leaves a promise rejection behind is a failure.
+- In `page_checks.js` a story that throws (any value, also `null`), runs out of time or leaves a promise rejection
+  behind is a failure. Stories count "speaking ended" by the speaker's own `onEnd` calls (`p.ends`), not by the
+  status chip.
 - `main()` takes the port first and loads the galaxy after it. A second start that finds the port busy changes
-  nothing. `Galaxy.refresh_if_rebuilt` follows the `notes_dir` that `config.json` names now.
+  nothing. `Galaxy.refresh_if_rebuilt` follows the `notes_dir` that `config.json` names now. A `notes_dir` that
+  cannot be resolved (`~nouser/x`) stops the start: one line, the listener closed, exit 1. A folder that is not
+  there still starts.
 - Library fingerprints live in ONE table (`FINGERPRINTS`). A "presence" pattern must be a string that only that
   library has: a name that other libraries also mention proves nothing.
 - `/teardown/note` and `/teardown/image` serve only files inside the teardowns folder (`valid_name`). The card and
@@ -264,3 +309,7 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
   window is `python drill.py --visible`. It still records and puts back.
 - The drill compares the galaxy by its shape (`drill.shape`: note names and link pairs), not by node numbers. A
   galaxy that is built again can number the same notes in another order.
+- `put_back` removes a file only when its receipt names the drill's own notes folder (`record()["vault"]`) and, for a
+  note, while it still holds the receipt's `born` bytes (`remove_made`). Anything else stays, and the clean-up FAILs.
+- When the silence budget and the job's time run out together, `follow_job` still sends the named cancel before it
+  gives up.

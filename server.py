@@ -151,6 +151,7 @@ LINES = {
                       "break, a tab or a letter outside plain ASCII. Please type it again on the line \"{key_line}\".",
     "voice_key_copied": "The {voice} key in config.json is the key of another line, sir, so I sent nothing. {reason}",
     "voice_not_sent": "I could not send the request to the {voice} voice, sir. {reason}",
+    "voice_text_key": "That line holds a key from config.json, sir, so I did not send it to the {voice} voice.",
     "voice_no_credit": "The {voice} account has no credit left, sir.",
     "voice_no_model": "The voice named in config.json, {model}, is not one {voice} knows, sir.",
     "voice_not_allowed": "Your {voice} plan does not allow that voice or model, sir. {reason}",
@@ -234,7 +235,7 @@ VOICE_LINES = {
     "voice_no_credit": "voice_no_credit", "voice_not_found": "voice_no_model", "voice_busy": "voice_busy",
     "voice_unreachable": "voice_offline", "voice_not_allowed": "voice_not_allowed",
     "voice_model_not_found": "voice_no_engine", "voice_key_bad_text": "voice_key_text",
-    "voice_key_copied": "voice_key_copied", "voice_not_sent": "voice_not_sent",
+    "voice_key_copied": "voice_key_copied", "voice_not_sent": "voice_not_sent", "voice_text_has_key": "voice_text_key",
 }
 MAX_SPEAK_CHARS = 6000          # a cost guard: /voice/speak cuts a longer text here, before it splits it into requests
 
@@ -299,12 +300,13 @@ def _new_private_file(path: Path) -> int:
 
 
 def _same_mode_as(descriptor: int, original: Path) -> None:
-    """Give a staging file the permission bits of the config.json it will replace, so a replace never makes the keys
-    readable for more people than before (0600 stays 0600, 0644 stays 0644). Windows keeps no such bits (its mode is a
-    read-only flag only), so there nothing is changed."""
+    """Give a staging file the OWNER's permission bits of the config.json it will replace, and none for the group or
+    others: the staging file stays owner-only until the replace (a crash can leave it), and a replace never makes
+    the keys readable for more people than before (0600 stays 0600, 0400 stays 0400, 0644 becomes 0600). Windows
+    keeps no such bits (its mode is a read-only flag only), so there nothing is changed."""
     if os.name == "nt" or not hasattr(os, "fchmod"):
         return
-    os.fchmod(descriptor, stat.S_IMODE(os.stat(original).st_mode) & 0o777)
+    os.fchmod(descriptor, stat.S_IMODE(os.stat(original).st_mode) & 0o700)
 
 
 def write_starter_config() -> None:
@@ -420,8 +422,8 @@ def save_brain_choice(name: str) -> None:
         # The new text is staged in a file of its own and then put in place in one step: a half-written config.json
         # would lose the keys. The staging file holds the keys too, so it is made new (never over a file that is
         # there, it is not ours), readable by its owner only from the first moment, and always removed. Before the
-        # replace it gets the permission bits of config.json: never wider. A crash between the steps leaves it: main()
-        # sweeps it.
+        # replace it gets the owner's permission bits of config.json: never wider, never for the group or others. A
+        # crash between the steps leaves it: main() sweeps it.
         temp = CONFIG_PATH.with_name(f"{CONFIG_PATH.name}.{os.getpid()}.tmp")
         made = False
         try:
@@ -762,28 +764,28 @@ class Galaxy:
                 copy += 1
                 destination = trash / f"{stamp}-{copy} {source.name}"
             os.replace(source, destination)
-            self._drop_newest(lambda: self._move_back(destination, source), destination)
+            self._drop_note(index, lambda: self._move_back(destination, source), destination)
             self._born.pop(note.path, None)
             return {"index": index, "title": note.label, "trash": destination.relative_to(self.notes_dir).as_posix()}
 
     def unbirth(self, receipt: dict) -> None:
         """The mirror of birth_note, for a note that THIS run made a moment ago (a teardown that failed after it).
-        Only the newest note, only when it is still the note on the receipt, and only when its file still holds
-        the bytes that birth_note wrote. The file is seconds old, so it is deleted for good, not moved to the
-        trash. First it is moved aside, under a name that is not a note. The bytes checked are the bytes of that
-        file, the one that will be deleted. It is deleted only after the galaxy is saved without it.
-        The receipt names its creation fully: the notes folder ("vault") and the bytes ("born"). Another folder can
-        hold a note that Jarviz made at the same path: it is never touched. A rebuild of the SAME folder keeps the
-        take-back working (_born survives a load)."""
+        Only the note on the receipt, and only when its file still holds the bytes that birth_note wrote. The file
+        is seconds old, so it is deleted for good, not moved to the trash. First it is moved aside, under a name that
+        is not a note. The bytes checked are the bytes of that file, the one that will be deleted. It is deleted only
+        after the galaxy is saved without it.
+        The receipt names its creation fully: the notes folder ("vault"), the path ("file") and the bytes ("born").
+        The note is found by that identity, not by the receipt's number: a rebuild of the SAME folder sorts the notes
+        by path, so the note can stand at another place (_born survives a load). Another folder can hold a note that
+        Jarviz made at the same path: it is never touched."""
         with self.lock:
             self.refresh_if_rebuilt()
             if not isinstance(receipt, dict) or receipt.get("vault") != vault_of(self.notes_dir):
                 raise ValueError("that note was made in another notes folder, so nothing there is touched")
-            index = receipt.get("index")
-            note = self.note(index) if isinstance(index, int) else None
-            if (note is None or index != len(self.notes) - 1
-                    or note.label != receipt.get("title") or note.path != receipt.get("file")):
-                raise ValueError("only the newest note, the one on the receipt, can be taken back")
+            index = next((at for at, entry in enumerate(self.notes) if entry.path == receipt.get("file")), None)
+            note = self.notes[index] if index is not None else None
+            if note is None or note.label != receipt.get("title"):
+                raise ValueError("the note on the receipt is not in the galaxy, so nothing is taken back")
             target = self._note_path(note.path)
             written = self._born.get(note.path)
             if written is None:
@@ -806,7 +808,7 @@ class Galaxy:
                     raise OSError(trouble.errno, "The note was changed after it was made, and it could not be put "
                                                  f"back. Its file is now {self._place(aside)}") from trouble
                 raise ValueError("the note was changed after it was made, so it stays")
-            self._drop_newest(lambda: self._move_back(aside, target), aside)
+            self._drop_note(index, lambda: self._move_back(aside, target), aside)
             self._born.pop(note.path, None)
             try:
                 aside.unlink()
@@ -899,22 +901,29 @@ class Galaxy:
         self.links.update(links)
         self.rev = rev
 
-    def _drop_newest(self, put_file_back, kept_at: Path) -> None:
-        """Take the newest note out of the index and save. The links it changed among the other notes are
-        mended (see birth_note). On any error the index in memory is put back first, then the file
-        (`put_file_back`). `kept_at` is where the file waits: when it cannot be put back, the error names that place."""
-        before = (list(self.notes), set(self.links), self.rev)
+    def _drop_note(self, index: int, put_file_back, kept_at: Path) -> None:
+        """Take the note at `index` out of the index and save. The links it changed among the other notes are
+        mended (see birth_note). A note that is not the newest moves the numbers of the notes after it down by one:
+        then the galaxy gets a new build id, as after a rebuild, so no receipt or reply of the old numbers is used
+        for another note. On any error the index in memory is put back first, then the file (`put_file_back`).
+        `kept_at` is where the file waits: when it cannot be put back, the error names that place."""
+        before, build_id = (list(self.notes), set(self.links), self.rev), self.build_id
         try:
-            index = len(self.notes) - 1
-            note = self.notes.pop()
-            self.links -= {link for link in self.links if index in link}
+            newest = index == len(self.notes) - 1
+            note = self.notes.pop(index)
+            kept = {(a - (a > index), b - (b > index)) for a, b in self.links if index not in (a, b)}
+            self.links.clear()
+            self.links.update(kept)
             added, removed = build.relink(self.notes, self.links, build.flipped_wikilinks(note, self.notes))
             self.links |= added
             self.links -= removed
-            self.rev += 2 if added or removed else 1
+            self.rev += 1 if newest and not (added or removed) else 2    # 2: the page reads the whole file again
+            if not newest:
+                self.build_id = build.new_build_id()
             self._save_graph()
         except BaseException as error:
             self._restore(before)
+            self.build_id = build_id
             try:
                 put_file_back()
             except OSError as trouble:              # FileExistsError too: a new file at the old place stays
@@ -1388,8 +1397,8 @@ def voice_speak_route(payload: dict) -> tuple:
     if (not isinstance(name, str) or name not in voices.SERVER_VOICES
             or isinstance(part, bool) or not isinstance(part, int) or not 0 <= part < len(pieces)):
         return 400, reply(LINES["speak_bad_request"], ok=False, error="bad_speak_request")
-    try:
-        audio, kind = voices.speak(load_config(), pieces[part], name)
+    try:                                            # `whole`: a key that the cut split in two is seen there
+        audio, kind = voices.speak(load_config(), pieces[part], name, whole=text)
     except voices.VoiceError as error:              # 503 like a brain that cannot answer (chat_route)
         return 503, reply(voice_line(error), ok=False, error=error.code, detail=error.detail)
     return 200, audio, kind, (("X-Jarviz-Parts", str(len(pieces))),)
@@ -2130,7 +2139,13 @@ def main(argv: list[str]) -> int:
     sweep_config_staging()          # the port is ours: a staging copy of config.json beside it is a crash's leftover
     write_starter_config()          # the one place that makes config.json, once, when there is none
     config = load_config()
-    notes_dir = build.resolve_notes_dir(config["notes_dir"])
+    try:
+        notes_dir = build.resolve_notes_dir(config["notes_dir"])
+    except (OSError, RuntimeError, ValueError):     # RuntimeError: Path.expanduser for "~nouser/x" (_configured_dir)
+        print('The "notes_dir" in config.json names no folder that can be found (an unknown user after "~"?). '
+              "Fix that line, then start again.", file=sys.stderr)
+        httpd.server_close()
+        return 1
     if not notes_dir.is_dir():
         print(f"Notes folder not found: {notes_dir}\nSet \"notes_dir\" in config.json.", file=sys.stderr)
     GALAXY.load(notes_dir)

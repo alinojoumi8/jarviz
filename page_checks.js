@@ -93,15 +93,11 @@ function page(sources, options = {}) {
   }
 
   const elements = new Map();
-  const statusLog = [];                 // every state the status chip showed: idle, thinking, speaking ...
   const document = {
     getElementById(id) {
       if (!elements.has(id)) {
         const node = makeElement(id);
         node.hidden = HIDDEN_AT_START.includes(id);
-        if (id === 'status') {
-          node.dataset = new Proxy({}, { set(target, key, value) { if (key === 'state') statusLog.push(value); target[key] = value; return true; } });
-        }
         elements.set(id, node);
       }
       return elements.get(id);
@@ -239,9 +235,16 @@ function page(sources, options = {}) {
   sandbox.self = sandbox;
   vm.createContext(sandbox);
   vm.runInContext(sources.core, sandbox, { filename: 'core.js' });
+  // Every "speaking ended" call that the speaker makes (its env.onEnd), counted where it is made: a second call
+  // changes nothing on the status chip, so the chip cannot show it.
+  const ends = [];
+  const makeSpeaker = sandbox.JarvizCore.createSpeaker;
+  sandbox.JarvizCore.createSpeaker = env => makeSpeaker(Object.assign({}, env, {
+    onEnd: (...args) => { ends.push(args[0]); return env.onEnd ? env.onEnd(...args) : undefined; },
+  }));
   vm.runInContext(sources.app, sandbox, { filename: 'app.js' });
   return { $: id => document.getElementById(id), J: () => sandbox.Jarviz, tick, fetchLog, handlers, recognizers,
-           controls, graphLog, consoleLines, synth, audios, liveUrls, stored, statusLog };
+           controls, graphLog, consoleLines, synth, audios, liveUrls, stored, ends };
 }
 
 // ------------------------------------------------------------------ small makers
@@ -1168,6 +1171,31 @@ story('a capture whose galaxy is built again before its focus', {
     `${labels(p)} / primary ${focus.primary} / panel ${p.$('panel-title').textContent}`);
 });
 
+story('a capture focus that waits gives way to a newer focus', {
+  answer: 'a newer answer that lights another note before the capture\'s focus timer fires keeps its focus',
+  click: 'a click on another star before that timer fires keeps that star in focus',
+}, async (t, open) => {
+  const p = await open({ handlers: {
+    '/remember': () => rememberReply(6, 3, 'T'),
+    '/chat': () => chatReply('About B', 6, [1]),       // the same galaxy: the capture's numbers are still on screen
+  } });
+  await p.J().handleInput('remember that T');
+  await p.tick(0);                                    // T is born; its focus waits a moment
+  await p.J().handleInput('tell me about B');
+  await p.tick(1000);
+  t.check('answer', p.J().Focus.current().primary === 1 && p.$('panel-title').textContent === 'B' && p.$('answer').textContent === 'About B',
+    `primary ${p.J().Focus.current().primary} / ${p.$('panel-title').textContent}`);
+
+  const q = await open({ handlers: { '/remember': () => rememberReply(6, 3, 'T') } });
+  await q.J().handleInput('remember that T');
+  await q.tick(0);
+  const clickStar = q.graphLog.find(([name]) => name === 'onNodeClick')[1][0];
+  clickStar(q.J().data().nodes[2]);                   // the user picks C while T waits
+  await q.tick(1000);
+  t.check('click', q.J().Focus.current().primary === 2 && q.$('panel-title').textContent === 'C',
+    `primary ${q.J().Focus.current().primary} / ${q.$('panel-title').textContent}`);
+});
+
 story('a cancel answer names its job', {
   lateQuiet: 'a cancel answer about job A that comes after A ended does not silence the end of a later job B',
   sameQuiet: 'a cancel answer that names the followed job keeps that job\'s end quiet',
@@ -1226,8 +1254,8 @@ const deepgramInfo = { name: 'deepgram', label: 'Deepgram', model: 'aura-2-draco
 const statusWith = voice => () => ({ ok: true, active: { label: 'Claude', model: 'm', has_key: true }, lines: {}, graph: meta(5), voice });
 const speakAsks = p => p.fetchLog.filter(entry => entry.key === '/voice/speak').map(entry => entry.body);
 const voiceNotes = p => p.$('answer').children.filter(child => child.className === 'voice-note').map(child => child.textContent);
-// How often the page said "speaking ended": the status chip left "speaking".
-const speakingEnds = p => p.statusLog.filter((state, index) => index > 0 && p.statusLog[index - 1] === 'speaking' && state !== 'speaking').length;
+// How often the speaker said "speaking ended" (its onEnd ran), not how often the status chip left "speaking".
+const speakingEnds = p => p.ends.length;
 const partOf = init => JSON.parse(init.body).part;
 // A tab that speaks (not muted), with a fake browser voice. The greeting that waits for the first click is dropped,
 // so a story counts only its own lines.
@@ -1312,6 +1340,31 @@ story('the voice switch', {
   await r.tick(0);
   t.check('offline', r.$('answer').textContent === 'I could not switch voices. I could not reach the server.'
     && r.$('voice').textContent === 'voice: browser', `${r.$('answer').textContent} / ${r.$('voice').textContent}`);
+});
+
+story('a late voice switch', {
+  kept: 'a /voice answer that comes after a newer sentence changes no voice: the speaker, the chip and jarviz_voice stay',
+  newer: 'the newer answer is said in the voice that was on before, and the late switch says nothing',
+}, async (t, open) => {
+  const read = deferred();
+  const p = await speakingPage(open, { handlers: {
+    '/status': statusWith(voiceOffer('browser')),
+    '/voice': () => ({ ok: true, answer: 'Deepgram it is.', nodes: [], graph: meta(6), voice: deepgramInfo }),
+    '/voice/speak': () => audioResponse(1),
+    'graph-data.js': () => read.promise,
+    '/chat': () => chatReply('The newer answer', 6),
+  } });
+  const a = p.J().handleInput('switch voice to deepgram');     // its answer waits for a read of the galaxy
+  await p.tick(0);
+  const b = p.J().handleInput('what now');           // a newer sentence: it owns the turn
+  await p.tick(0);
+  read.resolve(graphFile(galaxy(6, ['A', 'B', 'C', 'D'])));
+  await a; await b;
+  await p.tick(0);
+  t.check('kept', p.J().speaker.voiceState().name === 'browser' && p.$('voice').textContent === 'voice: browser'
+    && !('jarviz_voice' in p.stored), `${JSON.stringify(p.J().speaker.voiceState())} / ${p.$('voice').textContent} / ${JSON.stringify(p.stored)}`);
+  t.check('newer', p.$('answer').textContent === 'The newer answer' && speakAsks(p).length === 0
+    && p.synth.said.join('|') === 'The newer answer', `${p.$('answer').textContent} / ${speakAsks(p).length} asks / ${JSON.stringify(p.synth.said)}`);
 });
 
 story('the ElevenLabs voice switch', {
@@ -1497,6 +1550,74 @@ story('three server voice failures in a row', {
   const asks = speakAsks(p);
   t.check('again', asks.length === 4 && asks[3].text === 'Back to Deepgram.' && p.$('voice').textContent === 'voice: Deepgram · aura-2-draco-en',
     `${asks.length} asks / ${p.$('voice').textContent}`);
+});
+
+story('a line whose later part fails is a failed line', {
+  counted: 'three lines in a row whose part 0 plays and part 1 fails give the server voice up at the third',
+  fourth: 'the fourth line asks the server voice for nothing: the browser voice says it',
+  note: 'the server\'s trouble line still comes again after each part that played well',
+}, async (t, open) => {
+  const p = await speakingPage(open, { handlers: {
+    '/status': statusWith(voiceOffer('deepgram')),
+    '/voice/speak': (url, init) => (partOf(init) === 0 ? audioResponse(2, 'part0')
+      : refusal(503, { ok: false, error: 'voice_unreachable', answer: 'Deepgram cannot be reached.' })),
+  } });
+  const given = [];
+  for (const line of ['One. More.', 'Two. More.', 'Three. More.']) {
+    p.J().speaker.speak(line);
+    await p.tick(0);
+    p.audios[p.audios.length - 1].end();              // part 0 played well; part 1 cannot be had
+    await p.tick(0);
+    p.synth.finish();                                 // the browser voice said the line
+    await p.tick(0);
+    given.push(p.J().speaker.voiceState().gaveUp);
+  }
+  t.check('counted', given.join() === 'false,false,true' && p.$('voice').textContent === 'voice: browser · Deepgram off',
+    `${given.join()} / ${p.$('voice').textContent}`);
+  const asks = speakAsks(p).length;
+  p.J().speaker.speak('Four.');
+  await p.tick(0);
+  t.check('fourth', speakAsks(p).length === asks && p.synth.said[p.synth.said.length - 1] === 'Four.',
+    `${speakAsks(p).length - asks} more asks / ${JSON.stringify(p.synth.said)}`);
+  t.check('note', voiceNotes(p).length === 3 && voiceNotes(p).every(note => note === 'Deepgram cannot be reached.'), JSON.stringify(voiceNotes(p)));
+});
+
+story('a new line that cannot play ends the line it cut off', {
+  ended: 'with no browser voice, a new line whose audio cannot be had ends the line it cut off: one "speaking ended"',
+  listens: 'after it the microphone hears an ordinary sentence again',
+  played: 'a new line that plays sends no "speaking ended" between the two lines, and one at its end',
+}, async (t, open) => {
+  let plan = () => audioResponse(1);
+  const p = await speakingPage(open, { synth: false, handlers: {
+    '/status': statusWith(voiceOffer('deepgram')),
+    '/voice/speak': () => plan(),
+    '/chat': () => chatReply('Heard you', 5),
+  } });
+  p.J().speaker.speak('The first line.');
+  await p.tick(0);
+  const before = p.J().status();
+  plan = () => refusal(503, { ok: false, error: 'voice_unreachable', answer: 'Deepgram cannot be reached.' });
+  p.J().speaker.speak('The new line.');               // it cuts the first line, and its own audio cannot be had
+  await p.tick(0);
+  t.check('ended', before === 'speaking' && speakingEnds(p) === 1 && p.J().status() !== 'speaking' && !p.J().speaker.isSpeaking(),
+    `${before} then ${p.J().status()} / ${speakingEnds(p)} ends`);
+  await p.tick(1000);                                 // past the echo guard
+  p.$('mic').listeners.click[0]();
+  p.recognizers[0].onresult(finalResult('what now'));
+  await p.tick(1500);
+  t.check('listens', count(p.fetchLog, '/chat') === 1, `${count(p.fetchLog, '/chat')} chats`);
+
+  const q = await speakingPage(open, { synth: false, handlers: {
+    '/status': statusWith(voiceOffer('deepgram')), '/voice/speak': () => audioResponse(1),
+  } });
+  q.J().speaker.speak('The first line.');
+  await q.tick(0);
+  q.J().speaker.speak('The new line.');
+  await q.tick(0);
+  const between = speakingEnds(q);
+  q.audios[1].end();
+  await q.tick(0);
+  t.check('played', between === 0 && speakingEnds(q) === 1 && q.J().status() !== 'speaking', `${between} then ${speakingEnds(q)} ends`);
 });
 
 story('a line of an earlier voice choice counts only for that choice', {
@@ -1700,7 +1821,8 @@ story('an old server without voices', {
 
 story('the harness reports trouble', {
   thrown: 'a story that made all its checks and then threw is reported as a failure',
-  late: 'a story that made all its checks and then never ended is reported as a failure',
+  falsy: 'a story that made all its checks and then threw null is reported as a failure too',
+  late:'a story that made all its checks and then never ended is reported as a failure',
   dropped: 'a promise that the page lets fall is a failure of its story',
   handled: 'a rejection that gets its handler later is no failure',
   expected: 'a rejection that the story expects (t.expectRejection) is no failure',
@@ -1710,6 +1832,8 @@ story('the harness reports trouble', {
   const broken = () => ({ build_id: 'b1', rev: 5, nodes: null, links: [] });       // boot() throws, and nothing catches it
   let got = failed(await inner(async t2 => { t2.check('one', true); throw new Error('boom'); }));
   t.check('thrown', got.length === 1 && /ran to its end/.test(got[0]), JSON.stringify(got));
+  got = failed(await inner(async t2 => { t2.check('one', true); throw null; }));
+  t.check('falsy', got.length === 1 && /ran to its end/.test(got[0]), JSON.stringify(got));
   got = failed(await inner(async t2 => { t2.check('one', true); await new Promise(() => {}); }, 30));
   t.check('late', got.length === 1 && /ran to its end/.test(got[0]), JSON.stringify(got));
   got = failed(await inner(async (t2, open2) => {
@@ -1777,23 +1901,26 @@ async function runStory(entry, sources, limitMs = STORY_MS) {
     if (!p.J()) throw new Error('the page did not boot: ' + p.consoleLines.join(' | '));
     return p;
   };
+  let threw = false;                                  // apart from `trouble`: a story can throw null, 0 or ''
   let trouble = null;
   let limit = null;
   try {
     await Promise.race([entry.run(t, open),
       new Promise((_, fail) => { limit = setTimeout(() => fail(new Error('it did not end: an await never settled')), limitMs); })]);
   } catch (error) {
+    threw = true;
     trouble = error;
   } finally {
     clearTimeout(limit);
   }
   await drain();                                      // a promise dropped in the story's last step is reported now
   running = outer;
+  const why = () => short(trouble && trouble.message || trouble);
   for (const key of Object.keys(entry.checks)) {
-    if (!done.has(key)) results.push({ name: entry.checks[key], ok: false, detail: trouble ? 'not reached: ' + (trouble.message || trouble) : 'not reached' });
+    if (!done.has(key)) results.push({ name: entry.checks[key], ok: false, detail: threw ? 'not reached: ' + why() : 'not reached' });
   }
-  // A story that threw or never ended failed, also when every check it made passed.
-  if (trouble) results.push({ name: `the story "${entry.title}" ran to its end`, ok: false, detail: short(trouble.message || trouble) });
+  // A story that threw (whatever it threw) or never ended failed, also when every check it made passed.
+  if (threw) results.push({ name: `the story "${entry.title}" ran to its end`, ok: false, detail: why() });
   for (const drop of takeDropped(me)) {
     const wanted = expected.findIndex(pattern => pattern.test(drop.text));
     if (wanted >= 0) { expected.splice(wanted, 1); continue; }

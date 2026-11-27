@@ -466,6 +466,11 @@ def check_voice_routes(report: Report, ctx: dict) -> None:
     config = ctx["config"]
     served = {voice: voices.describe(config, voice) for voice in voices.SERVER_VOICES}
     keys, trouble, answers = voice_keys(config), [], []
+    every = voices.configured_keys(config)          # every key of config.json, of a brain or a voice
+
+    def shown(text: object, limit: int) -> str:
+        """A text from an answer, as it may be printed: every key out BEFORE the cut (a cut can leave a piece)."""
+        return short(voices.scrub_keys(str(text), every), limit)
 
     def post(path: str, body: dict, timeout: float = 60) -> tuple[int, dict, bytes, dict]:
         """(status, headers, raw body, the body as JSON or {})."""
@@ -496,7 +501,7 @@ def check_voice_routes(report: Report, ctx: dict) -> None:
     if (not isinstance(block, dict) or block.get("default") != default
             or block.get("voices") != voices.describe_all(config)):
         trouble.append(f"/status does not give the voice block {{'default': {default!r}, 'voices': [...]}}: "
-                       f"{short(json.dumps(block), 160)}")
+                       f"{shown(json.dumps(block), 160)}")
 
     # /voice: it judges the wish
     refused("/voice", {"name": "kazoo"}, 400, "unknown_voice")
@@ -539,13 +544,13 @@ def check_voice_routes(report: Report, ctx: dict) -> None:
                         or headers.get("x-jarviz-parts") != parts or headers.get("cache-control") != "no-store"):
                 trouble.append(f"POST /voice/speak {short(json.dumps(body), 40)} gave HTTP {got} "
                                f"{headers.get('content-type')!r}, parts {headers.get('x-jarviz-parts')!r}"
-                               + (f": {short(parsed.get('answer') or '', 160)}" if parsed else ""))
+                               + (f": {shown(parsed.get('answer') or '', 160)}" if parsed else ""))
         refused("/voice/speak", {"text": two, "part": 5, "voice": voice}, 400, "bad_speak_request")
         said.append(f"{label}: mp3 ({seen['model']}), 1 and 2 pieces")
     if any(key in raw for key in keys for raw in answers):
         trouble.append("AN ANSWER SHOWS A VOICE KEY")
-    if trouble:
-        report.add(FAIL, name, short("; ".join(trouble), 600))
+    if trouble:             # an answer that says a key back: the key is out of what is printed
+        report.add(FAIL, name, shown("; ".join(trouble), 600))
         return
     report.add(PASS, name, "; ".join(said) + ". /status and /voice answer, and a bad request is refused before any "
                                             "provider is asked.")
@@ -556,25 +561,47 @@ def check_voice_routes(report: Report, ctx: dict) -> None:
                   f'say "switch voice to {spec["label"]}".', flush=True)
 
 
-def remove_fixture(notes_dir: Path, receipt: dict) -> tuple[bool, str]:
-    """Remove a test note by hand, for the one case where /forget refused its receipt. Only when it is CERTAINLY
-    the fixture: a regular file inside the notes folder at the receipt's path, whose bytes have the sha256 the receipt
-    names ("born"). A file that changed stays. Nothing else is ever removed. (True, "") or (False, why it stays)."""
+def real_folders(root: Path, folder: Path) -> bool:
+    """True when each folder from `root` (resolved) down to `folder` is a real folder: not a link, not a junction (to
+    lstat a junction IS a folder on Windows), and the real place of `folder` is the place itself. One link on the way
+    can lead out of the notes folder. A folder that is not there raises FileNotFoundError."""
+    step = root
+    for part in folder.relative_to(root).parts:
+        step = step / part
+        mode = step.lstat().st_mode
+        if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode) or os.path.isjunction(step):
+            return False
+    return os.path.normcase(folder.resolve(strict=True)) == os.path.normcase(folder)
+
+
+def remove_fixture(notes_dir: Path, receipt: dict) -> tuple[bool | None, str]:
+    """Remove a test note by hand. Only when it is CERTAINLY the fixture: made in THIS notes folder (the receipt's
+    "vault"), a regular file at the receipt's path, reached through real folders only (real_folders), whose bytes have
+    the sha256 the receipt names ("born"). A file that changed stays. Nothing else is ever removed. (True, ""),
+    (False, why it stays), or (None, why) when nothing is there any more: that proves nothing about where it went.
+    The limit: Windows has no unlink anchored to a checked folder, so the folders are checked again right before."""
     relative, born = receipt.get("file"), receipt.get("born")
     if not isinstance(relative, str) or not isinstance(born, str) or not re.fullmatch(r"[0-9a-f]{64}", born):
         return False, "the receipt does not name the test note fully, so nothing was removed"
+    if receipt.get("vault") != server.vault_of(notes_dir):
+        return False, "the receipt names another notes folder, so nothing was removed"
     root = notes_dir.resolve()
     target = Path(os.path.normpath(root / relative))        # the place itself: a link there is not followed
     if not target.is_relative_to(root) or target.suffix.lower() != ".md":
         return False, "the receipt names a place outside the notes folder, so nothing was removed"
+    linked = f"a folder on the way to {target} is a link or a junction (it can lead out of the notes folder), so it stays"
     try:
+        if not real_folders(root, target.parent):
+            return False, linked
         if not stat.S_ISREG(target.lstat().st_mode):
             return False, f"the test note at {target} is not a plain file any more, so it stays"
         if hashlib.sha256(target.read_bytes()).hexdigest() != born:
             return False, f"the test note at {target} was changed after it was made, so it stays"
+        if not real_folders(root, target.parent):          # once more, right before: the gap is as short as it can be
+            return False, linked
         target.unlink()
     except FileNotFoundError:
-        return False, f"the test note is not at {target} any more"
+        return None, f"the test note is not at {target} any more"
     except OSError as error:
         return False, f"the test note at {target} could not be removed ({error.strerror or error})"
     return True, ""
@@ -622,32 +649,47 @@ def check_remember(report: Report, ctx: dict) -> None:
                     problems.append("/chat did not use the new note in its very next answer (the code word is not in it)")
                 sourced = ("it named the note as a source" if index in (answer.get("nodes") or [])
                            else "it did not name the note as a source")
+    except Exception as error:                      # noqa: BLE001 - a check that stops says so, it never crashes preflight
+        problems.append(f"NOT VERIFIED: the check stopped ({type(error).__name__})" + (
+            "" if receipt else f". If /remember made its test note before its answer was lost, it stays (it holds {token})"))
     finally:
         if receipt:                                  # tests clean up after themselves
-            status, gone = call_json("POST", "/forget", {"index": receipt["index"], "label": receipt["title"],
-                                                         "build": receipt.get("build"), "born": receipt.get("born"),
-                                                         "session": ctx["session"]})
+            kind, got = try_probe(lambda: call_json("POST", "/forget", {
+                "index": receipt.get("index"), "label": receipt.get("title"), "build": receipt.get("build"),
+                "born": receipt.get("born"), "session": ctx["session"]}))
+            status, gone = got if kind == "answer" else (0, {})
             trash_name = (gone.get("action") or {}).get("trash")
-            if status != 200 or not trash_name:
-                # /forget rightly refuses a receipt of a galaxy that was built again while the check ran. Then the
-                # test note goes by hand, but ONLY when it is certainly the fixture.
-                removed, why = remove_fixture(notes_dir, receipt)
-                if removed:
-                    cleanup_note = (f"/forget refused the test note's receipt (HTTP {status}: "
-                                    f"{short(gone.get('answer') or 'no reason', 120)}), as it does when the galaxy is "
-                                    "built again while the check runs. So the check removed the test note itself (its "
-                                    "bytes were the ones it wrote). The index still names it: run python build.py to "
-                                    "bring the index in line.")
-                    if captures.is_dir() and not any(captures.iterdir()) and not captures_was_there:
-                        captures.rmdir()
-                else:
-                    problems.append(f"CLEANUP FAILED: /forget refused (HTTP {status}), and {why}")
+            if status == 200 and trash_name:        # in the trash now: it goes with the same checks as by hand
+                removed, why = remove_fixture(notes_dir, {**receipt, "file": trash_name})
+                said = f"/forget moved the test note to {short(str(trash_name), 120)!r}"
+                folders = ((notes_dir / str(trash_name)).parent, captures)
             else:
-                trash_file = notes_dir / trash_name
-                trash_file.unlink(missing_ok=True)
-                for folder in (trash_file.parent, captures):
+                # /forget rightly refuses a receipt of a galaxy that was built again while the check ran. With no answer,
+                # it may have moved the note or not. Either way the test note goes by hand, but ONLY when it is certainly
+                # the fixture, at its place. A note that is not there any more is NOT a clean-up: not confirmed.
+                removed, why = remove_fixture(notes_dir, receipt)
+                folders = (captures,)
+                if kind == "answer":
+                    said = (f"/forget refused the test note's receipt (HTTP {status}: "
+                            f"{short(gone.get('answer') or 'no reason', 120)}), as it does when the galaxy is built again "
+                            "while the check runs")
+                else:
+                    said = f"/forget got no answer ({got})" if kind == "no_answer" else f"/forget was not sent ({got})"
+                    problems.append(f"NOT VERIFIED: {said}")
+                if removed:
+                    cleanup_note = ((f"{said}. So the check" if kind == "answer" else "The check") + " removed the test "
+                                    "note itself (its bytes were the ones it wrote). The index still names it: run "
+                                    "python build.py to bring the index in line.")
+            if removed:
+                for folder in folders:
                     if folder.is_dir() and not any(folder.iterdir()) and (folder != captures or not captures_was_there):
                         folder.rmdir()
+            elif removed is None:           # gone from its place is no proof that it went to the trash
+                problems.append(f"CLEANUP NOT CONFIRMED: {said}, and {why}" + (
+                    f": the server may have moved it to {server.CAPTURES_DIR}/{server.TRASH_DIR} before its answer "
+                    "was lost" if kind == "no_answer" else ""))
+            else:
+                problems.append(f"CLEANUP FAILED: {said}, and {why}")
             if not cleanup_note and len(build.read_graph().get("nodes", [])) != len(before):
                 problems.append("the node count did not go back after cleanup")
     if problems:
@@ -1415,12 +1457,13 @@ def check_build_survives(report: Report) -> None:
     build.write_graph is a recorder (the real one writes viewer/graph-data.js)."""
     name = "build.py goes on past an entry it cannot look at, and past a notes_dir it cannot work out"
     trouble: list[str] = []
-    real_is_file, real_configured, real_write, writes = Path.is_file, build.configured_notes_dir, build.write_graph, []
+    # build.py looks at an entry with Path.stat (Path.is_file hides the error on Python 3.14), so the fake breaks stat.
+    real_stat, real_configured, real_write, writes = Path.stat, build.configured_notes_dir, build.write_graph, []
 
-    def stuck_is_file(self, *args, **kwargs):
+    def stuck_stat(self, *args, **kwargs):
         if self.name == "Locked.md":
             raise PermissionError(13, "Access is denied")
-        return real_is_file(self, *args, **kwargs)
+        return real_stat(self, *args, **kwargs)
 
     def unknown_home(*args, **kwargs):
         raise RuntimeError("Could not determine home directory.")
@@ -1432,12 +1475,12 @@ def check_build_survives(report: Report) -> None:
             for title in ("Open", "Locked"):
                 (notes / f"{title}.md").write_text(f"# {title}\n\nA note.\n", encoding="utf-8")
             said = io.StringIO()
-            Path.is_file = stuck_is_file
+            Path.stat = stuck_stat
             try:
                 with contextlib.redirect_stderr(said):
                     found = [path.name for path in build.note_files(notes)]
             finally:
-                Path.is_file = real_is_file
+                Path.stat = real_stat
             if found != ["Open.md"] or "Locked.md" not in said.getvalue():
                 trouble.append(f"an entry that cannot be looked at: found {found}, said {said.getvalue().strip()!r}")
             build.configured_notes_dir = unknown_home
@@ -1448,7 +1491,7 @@ def check_build_survives(report: Report) -> None:
     except Exception as error:                          # noqa: BLE001 - a check that stops says so, it never crashes preflight
         trouble.append(f"the check stopped: {type(error).__name__}: {error}")
     finally:
-        Path.is_file, build.configured_notes_dir, build.write_graph = real_is_file, real_configured, real_write
+        Path.stat, build.configured_notes_dir, build.write_graph = real_stat, real_configured, real_write
     report.add(FAIL if trouble else PASS, name, "; ".join(trouble) or
                "the entry was skipped and said, the other note found; the build kept its exit status 0")
 
@@ -1708,22 +1751,32 @@ def check_sources_stay_true(report: Report) -> None:
                 return ask
 
             unverified: list[str] = []
+            free: list[str] = []
 
             def reload_soon(notes: list, build_id: str) -> threading.Thread:
                 """Another request that loads a new index: it waits for the lock, as a real one does. The request side
-                (it holds the lock here) goes on only once the worker is at the lock: so the reload surely waits for
-                the snapshot, and is not just late. A worker that does not get there in time: not verified."""
-                trying = threading.Event()
+                (it holds the lock here) goes on only once the worker has TRIED the lock and found it held: so the
+                reload surely waits for the snapshot, and is not just late. A worker that does not try in time: not
+                verified. A lock that is free at the try: the snapshot does not hold it."""
+                tried, held = threading.Event(), []
 
                 def run() -> None:
-                    trying.set()        # right before the lock: from here on it waits for the snapshot to end
-                    with galaxy.lock:
+                    got = galaxy.lock.acquire(blocking=False)   # the try, while the request side waits for it
+                    held.append(not got)
+                    tried.set()
+                    if not got:
+                        galaxy.lock.acquire()                   # it waits for the snapshot to end
+                    try:
                         galaxy.notes[:] = notes
                         galaxy.build_id = build_id
+                    finally:
+                        galaxy.lock.release()
                 worker = threading.Thread(target=run, daemon=True)
                 worker.start()
-                if not trying.wait(5.0):
+                if not tried.wait(5.0):
                     unverified.append(build_id)
+                elif held != [True]:
+                    free.append(build_id)
                 return worker
 
             def ask_chat() -> dict:
@@ -1834,6 +1887,9 @@ def check_sources_stay_true(report: Report) -> None:
             if unverified:
                 trouble.append(f"NOT VERIFIED: the reload of {', '.join(dict.fromkeys(unverified))} did not reach the "
                                "lock in time, so those steps prove nothing")
+            if free:
+                trouble.append(f"NOT VERIFIED: the reload of {', '.join(dict.fromkeys(free))} found the lock free, so the "
+                               "snapshot did not hold it and those steps prove nothing")
     except Exception as error:                          # noqa: BLE001 - a check that stops says so, it never crashes preflight
         trouble.append(f"the check stopped: {type(error).__name__}: {error}")
     finally:
@@ -2130,10 +2186,14 @@ def check_lock(report: Report) -> None:
     replay_age = max(abs(time.time() - int(signed_at)), time.monotonic() - started)
     # A signed POST is claimed only after its body matched: a caught header sent first with ANOTHER body is refused
     # and does not use up the true request; the true body then works once; a third time it is refused. The empty
-    # question changes nothing: /chat answers "empty_message" before anything else.
-    post_once = signed(server.sign_request(key, instance, "POST", "/chat", json.dumps(nothing).encode("utf-8")))
+    # question changes nothing: /chat answers "empty_message" before anything else. Its third send is timed like the
+    # GET: a refusal proves the rule only while the signature is still young.
+    post_signed_at, post_started = time.time(), time.monotonic()
+    post_once = signed(server.sign_request(key, instance, "POST", "/chat", json.dumps(nothing).encode("utf-8"),
+                                           now=post_signed_at))
     changed = {"message": "", "session": "preflight-changed"}
     posts = [try_probe(lambda body=body: outsider("POST", "/chat", body, headers=post_once)) for body in (changed, nothing, nothing)]
+    post_age = max(abs(time.time() - int(post_signed_at)), time.monotonic() - post_started)
     # Empty texts, empty names and a site that is no site: none of these could do anything if the lock were broken.
     attempts = {
         "the page": lambda: outsider("GET", "/"),
@@ -2197,6 +2257,9 @@ def check_lock(report: Report) -> None:
             trouble.append("a signed POST with its own body is not let in after a try with another body")
         if not refused(*posts[2][1]):
             trouble.append("LET IN: the same signed POST a second time")
+        elif post_age >= SIGN_REPLAY_LIMIT_S:
+            trouble.append(f"NOT VERIFIED: the same signed POST was sent again {post_age:.0f} s after it was signed, "
+                           f"not clearly inside its life of {server.SIGN_WINDOW_S} s, so its refusal proves nothing")
     if call("GET", "/status", timeout=10)[0] != 200:
         trouble.append("a call with a good signature is not let in")
 

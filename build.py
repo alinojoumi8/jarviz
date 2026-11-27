@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
 import sys
 import time
 import unicodedata
@@ -146,10 +147,11 @@ def _skipped_folder(error: OSError) -> None:
 
 
 def _regular_file(path: Path) -> bool:
-    """True for a regular file. An entry that cannot be looked at (Python 3.13 and older can raise here, for
-    example PermissionError) is skipped and said, like a folder that cannot be listed, and the build goes on."""
+    """True for a regular file. An entry that cannot be looked at (for example PermissionError) is skipped and said,
+    like a folder that cannot be listed, and the build goes on. Not Path.is_file: since Python 3.14 it hides that
+    error and says False."""
     try:
-        return path.is_file()
+        return stat.S_ISREG(path.stat().st_mode)
     except OSError as error:
         print(f"Skipped {path.name}: {error.strerror or error}", file=sys.stderr)
         return False

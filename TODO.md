@@ -131,7 +131,7 @@ Still to prove:
 
 Proven with the real brain and a real public site (igloo.inc):
 
-- [x] Last run: `PREFLIGHT: 44 pass, 1 fail, 0 warn` and `DRILL: 97 pass, 0 fail`. The one fail is the OpenAI account: it has no credit (see "Brains"). Preflight has 45 checks now.
+- [x] Last run: `PREFLIGHT: 44 pass, 1 fail, 0 warn` and `DRILL: 104 pass, 0 fail`. The one fail is the OpenAI account: it has no credit (see "Brains"). Preflight has 45 checks now.
 - [ ] The page in the test browser was not opened in the last run: the test browser lost its unlock. The page rules (`page_checks.js`, 108 rules) ran against the files that the server gives out.
 - [x] The drill passed with a hidden browser, and also with the Chrome window on screen (`python drill.py --visible`). The snapshot from the visible window is a real picture.
 - [x] A full teardown in about one minute: 96 files, 14.7 MB, Three.js r165, GSAP 3.12.5, postprocessing 6.35.5.
@@ -259,6 +259,9 @@ Not proven:
   - A teardown with a sign-in brain gives the text of a strange website to a coding agent. The lock is what stands between them. If you want the smallest risk, write teardowns with a key brain.
 - [ ] The sign-in brains on a Mac or Linux. The code has the paths for it, but it ran only on this Windows computer.
 - [ ] The ElevenLabs start voice on a free plan. Eldrin is a voice of the Voice Library, and ElevenLabs says that some voices there need a paid plan. Whether a free plan may use it through the API is not known. If ElevenLabs refuses it, Jarviz says that your plan does not allow that voice, and `python preflight.py` names the line to fix. Then copy the id of a voice from "My Voices" into `elevenlabs_voice`.
+- [ ] A spoken line that holds a key. The server voices refuse such a line and send nothing. Then the browser voice says the line, and some Chrome voices are network voices (Google gets the text).
+- [ ] An REA install at the very moment of a teardown. `run_rea` checks the pinned REA version just before it starts REA. An install that someone runs at that moment can swap the files between the check and the start, and Node reads REA's files only as it runs. Jarviz never installs REA itself.
+- [ ] The removal of the test note on Windows. Preflight checks every folder on the way (no link, no junction) and checks again right before it deletes the note. Windows has no way to delete a file inside a folder that was checked before, so a swap of a folder in that very instant is not excluded.
 - [ ] The clean Chrome and your private network. Jarviz checks the address of the PAGE. It does not see the connections that Chrome makes. There are two cases:
   - The page itself moves to a private address. Jarviz sees that and stops the job. But Chrome has already sent the request that went there. Jarviz reads nothing from that page.
   - The page stays on its public address and asks for things on your home network (a picture, a script, a data call). Jarviz does not see these requests at all, and the job goes on. The same is true when a public name points at a private address only for Chrome.
