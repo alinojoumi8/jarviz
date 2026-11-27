@@ -16,6 +16,7 @@ session is gone when the server stops.
 from __future__ import annotations
 
 import contextlib
+import errno
 import hashlib
 import http.client
 import io
@@ -25,6 +26,7 @@ import re
 import secrets
 import shutil
 import socket
+import stat
 import sys
 import tempfile
 import time
@@ -114,7 +116,9 @@ def follow_job(job_id: str | None, limit: float, ask, ask_cancel, clock=time.mon
                      seen. An end that is not confirmed is NOT an end: the job can still have written. The receipts of
                      the last view still count: they are files the job made.
     A view of our job with a missing or unknown state is no answer: it is tried again like one. When the silence
-    budget and the job's time run out together, the named cancel still goes out before the drill gives up."""
+    budget and the job's time run out together, the named cancel still goes out, and the drill looks for the end as
+    after any cancel: until the wait after it ends, with a new silence budget. Another job's id (or none) still ends
+    the look at once."""
     job, cancelled, silent_since = {}, False, None
     deadline = clock() + limit
 
@@ -138,9 +142,10 @@ def follow_job(job_id: str | None, limit: float, ask, ask_cancel, clock=time.mon
         except SERVER_GONE:
             view, silent_since = None, sent if silent_since is None else silent_since
             if clock() - silent_since >= SILENT_RETRY_S:
-                if not cancelled and clock() >= deadline:
-                    send_cancel()       # its time ran out in the silence: it must not run on unasked
-                return NOT_CONFIRMED, job
+                if cancelled or clock() < deadline:
+                    return NOT_CONFIRMED, job
+                # Its time ran out in the silence: it must not run on unasked. Then the look for its end goes on.
+                cancelled, deadline, silent_since = True, send_cancel(), None
         if view is not None:
             if view.get("id") != job_id:
                 return NOT_CONFIRMED, job       # our job is gone: its end was never seen, and its last view counts
@@ -200,6 +205,7 @@ def follow_checks() -> list[tuple[str, bool, str]]:
         return 200, json.dumps({"ok": True, "job": job}).encode("utf-8")
 
     running, done, other = {"id": "job1", "state": "running"}, {"id": "job1", "state": "done"}, {"id": "job2", "state": "running"}
+    stopped = {"id": "job1", "state": "cancelled"}
     made = {"id": "job1", "state": "running", "births": [{"file": teardown.CONCEPT_PATH, "title": teardown.CONCEPT_NAME}]}
     error_500 = (500, b'{"ok": false, "error": "server_error"}')
     html = (502, b"<html><body>Bad gateway</body></html>")
@@ -223,7 +229,17 @@ def follow_checks() -> list[tuple[str, bool, str]]:
              ("silence that ends with the job's time still sends the named cancel", [good(running)] * 20 + ["hang"], 20,
               (NOT_CONFIRMED, running, 1)),
              ("silence that ends before the job's time sends no cancel", [good(running)] * 4 + ["hang"], 20,
-              (NOT_CONFIRMED, running, 0))]
+              (NOT_CONFIRMED, running, 0)),
+             # After that cancel the drill still looks for the end, as after any cancel: a new silence budget, until the
+             # wait after the cancel ends. Another job's id, or none, still ends the look at once.
+             ("a cancel sent in the silence, then the job's end, is a confirmed end",
+              [good(running)] * 20 + ["hang", good(stopped)], 20, (ENDED, stopped, 1)),
+             ("a cancel sent in the silence, then another job's id, is not a confirmed end, with our last view",
+              [good(running)] * 20 + ["hang", good(other)], 20, (NOT_CONFIRMED, running, 1)),
+             ("a cancel sent in the silence, then no job, is not a confirmed end, with our last view",
+              [good(running)] * 20 + ["hang", good(None)], 20, (NOT_CONFIRMED, running, 1)),
+             ("a cancel sent in the silence, then still running through the wait, is not a confirmed end",
+              [good(running)] * 20 + ["hang", good(running)], 20, (NOT_CONFIRMED, running, 1))]
     no_job_key = (200, b"{}")                       # a good answer has the key "job"
     stateless, weird = good({"id": "job1"}), good({"id": "job1", "state": "weird"})
     for what, bad in (("an HTTP 500", error_500), ("an HTML error page", html), ('{"ok": false}', refused),
@@ -257,6 +273,18 @@ def follow_checks() -> list[tuple[str, bool, str]]:
                     verdict == NOT_CONFIRMED and cancels == 1 and within
                     and ended <= 5 + POLL_S + CANCEL_WAIT_S + REQUEST_FLOOR_S,
                     f"{verdict} at {ended:.1f} s, cancel {sent_cancel}, status after it {after[:3]}"))
+    # The cancel sent in the silence: the look goes on for the wait after it (and no longer), or ends at once when
+    # another job answers.
+    timing = {}
+    for label, last in (("running", good(running)), ("other", good(other))):
+        verdict, _, cancels, ended, requests = follow([good(running)] * 20 + ["hang", last], 20)
+        sent_cancel = [sent for what, sent, _ in requests if what == "cancel"]
+        timing[label] = (verdict, cancels, round(ended - sent_cancel[0], 1) if sent_cancel else None,
+                         sum(1 for what, sent, _ in requests if what == "status" and sent_cancel and sent > sent_cancel[0]))
+    results.append(("drill: after a cancel sent in the silence the look lasts the wait after it; another job ends it at once",
+                    timing["running"][:2] == (NOT_CONFIRMED, 1) and timing["running"][2] is not None
+                    and CANCEL_WAIT_S <= timing["running"][2] <= CANCEL_WAIT_S + POLL_S + REQUEST_FLOOR_S
+                    and timing["other"][:2] == (NOT_CONFIRMED, 1) and timing["other"][3] == 1, str(timing)))
     # The put-back counts only a good status answer with valid graph numbers: anything else proves nothing about
     # what the server holds.
     graph = {"build_id": "b1", "rev": 0, "count": 3}
@@ -266,6 +294,140 @@ def follow_checks() -> list[tuple[str, bool, str]]:
     taken = [answer for answer in bad if served_graph(*answer) is not None]
     results.append(("drill: the put-back takes only a good status answer with valid graph numbers",
                     not taken and served_graph(200, {"ok": True, "graph": graph}) == graph, f"taken: {taken}"))
+    return results
+
+
+def link_checks(notes: Path, ours: str, place) -> list[tuple[str, bool, str]]:
+    """Offline, in the temp notes folder of cleanup_checks: remove_made deletes only the entry that its receipt names,
+    and a note only with the bytes the test wrote, read from the very file that goes. `place(relative, text)` writes
+    a file there and gives (relative, born). Every link it makes is removed again (never what it points to)."""
+    results: list[tuple[str, bool, str]] = []
+    links: list[Path] = []
+    text = "the test note"
+
+    def link(at: Path, to: Path) -> str:
+        """A link at `at` to `to`, and its kind. On Windows a folder gets a junction (it needs no privilege) and a file
+        a symlink, or a junction to the file's folder when this account may not make one: a link at the name too."""
+        at.parent.mkdir(parents=True, exist_ok=True)
+        links.append(at)
+        if os.name == "nt":
+            import _winapi
+            if not to.is_dir():
+                try:
+                    os.symlink(to, at)
+                    return "symlink"
+                except OSError:
+                    to = to.parent
+            _winapi.CreateJunction(str(to), str(at))
+            return "junction"
+        os.symlink(to, at, target_is_directory=to.is_dir())
+        return "symlink"
+
+    def write_in_place(path: Path, data: bytes) -> None:
+        """Write `data` over the start of `path`. On Windows as the most open editor does: it lets others read, write
+        and delete the file meanwhile (FILE_SHARE_READ | WRITE | DELETE), so only the drill's own handle can refuse it."""
+        if os.name != "nt":
+            with open(path, "r+b") as handle:
+                handle.write(data)
+            return
+        import ctypes
+        from ctypes import wintypes
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.CreateFileW.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                                       wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE)
+        kernel.CreateFileW.restype = wintypes.HANDLE
+        kernel.WriteFile.argtypes = (wintypes.HANDLE, wintypes.LPCVOID, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD),
+                                     wintypes.LPVOID)
+        kernel.WriteFile.restype = wintypes.BOOL
+        kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+        handle = kernel.CreateFileW(str(path), 0x40000000, 0x7, None, WIN_OPEN_EXISTING, 0, None)   # GENERIC_WRITE
+        if handle in (None, wintypes.HANDLE(-1).value):
+            raise PermissionError(ctypes.get_last_error(), "the file is held")
+        try:
+            written = wintypes.DWORD()
+            if not kernel.WriteFile(handle, data, len(data), ctypes.byref(written), None):
+                raise OSError(ctypes.get_last_error(), "the write failed")
+        finally:
+            kernel.CloseHandle(handle)
+
+    try:
+        # The name of the note became a link to another note in the vault with the very same bytes.
+        label = "drill: a note whose name became a link to a note with the same bytes: the link and the note stay"
+        other, born = place("captures/user-copy.md", text)
+        named = f"{teardown.TEARDOWNS_DIR}/t3.md"
+        try:
+            kind = link(notes / named, notes / other)
+        except OSError as error:
+            results.append((label, False, f"could not look: no link could be made ({type(error).__name__})"))
+        else:
+            trouble = remove_made(notes, ours, [(named, ours, born)])
+            results.append((label, len(trouble) == 1 and (notes / other).read_bytes() == text.encode("utf-8")
+                            and os.path.lexists(notes / named), f"{kind}: {trouble}"))
+        # A folder on the way is a link to another folder of the vault, which holds a note with the same bytes.
+        label = "drill: a note reached through a linked folder stays, and so does the note behind the link"
+        side = notes / "side"
+        behind, born = place("side/elsewhere/t3.md", text)
+        try:
+            kind = link(side / teardown.TEARDOWNS_DIR, side / "elsewhere")
+        except OSError as error:
+            results.append((label, False, f"could not look: no link could be made ({type(error).__name__})"))
+        else:
+            trouble = remove_made(side, ours, [(f"{teardown.TEARDOWNS_DIR}/t3.md", ours, born)])
+            results.append((label, len(trouble) == 1 and (notes / behind).exists(), f"{kind}: {trouble}"))
+        # An editor saves the note while the drill removes it: in place, or by a new file put over it.
+        for how in ("in place", "by a replace"):
+            named, born = place(f"{teardown.TEARDOWNS_DIR}/t4.md", text)
+            path, saved = notes / named, []
+
+            def save(path=path, how=how, saved=saved) -> None:
+                try:
+                    if how == "in place":
+                        write_in_place(path, b"the user's edit")
+                    else:
+                        fresh = path.with_name("t4.saving")
+                        fresh.write_bytes(b"the user's edit")
+                        os.replace(fresh, path)
+                    saved.append("saved")
+                except OSError:
+                    saved.append("refused")
+            trouble = remove_made(notes, ours, [(named, ours, born)], between=save)
+            kept = path.read_bytes() if path.exists() else None
+            hidden = [entry.name for entry in path.parent.iterdir() if entry.name.endswith(".drill-gone")]
+            # Windows: the handle shuts every writer out, and the unchanged note goes. POSIX: the save goes through,
+            # the second read through the same fd sees it, and the note stays with the change.
+            fine = (saved == ["refused"] and not trouble and kept is None if os.name == "nt"
+                    else saved == ["saved"] and len(trouble) == 1 and kept == b"the user's edit")
+            results.append((f"drill: an editor that saves {how} while the drill removes the note loses nothing",
+                            fine and not hidden, f"save {saved}, trouble {trouble}, left {kept!r}, hidden {hidden}"))
+            path.with_name("t4.saving").unlink(missing_ok=True)
+        # One receipt whose path cannot be looked at is trouble for it alone; a notes folder that cannot be looked at
+        # removes nothing, and the clean-up is not confirmed.
+        first, first_born = place(f"{teardown.TEARDOWNS_DIR}/t5.md", text)
+        later, later_born = place(f"{teardown.TEARDOWNS_DIR}/t6.md", "another test note")
+        module, real = globals(), delete_made_file
+
+        def refusing(root, target, born, between=None):
+            if target.name == "t5.md":
+                raise PermissionError(13, "Permission denied", str(target))
+            return real(root, target, born, between)
+        module["delete_made_file"] = refusing
+        try:
+            trouble = remove_made(notes, ours, [(first, ours, first_born), (later, ours, later_born)])
+        finally:
+            module["delete_made_file"] = real
+        unusable = remove_made(notes / "not-there", ours, [(first, ours, first_born)])
+        results.append(("drill: a path that cannot be looked at is trouble for its receipt alone; an unusable notes "
+                        "folder removes nothing and is not confirmed",
+                        len(trouble) == 1 and "t5.md" in trouble[0] and (notes / first).exists()
+                        and not (notes / later).exists() and len(unusable) == 1 and "not confirmed" in unusable[0],
+                        f"{trouble} {unusable}"))
+    finally:
+        for at in reversed(links):          # the link itself, never what it points to
+            try:
+                os.rmdir(at)                # a junction, or a link to a folder
+            except OSError:
+                with contextlib.suppress(OSError):
+                    os.unlink(at)
     return results
 
 
@@ -292,7 +454,19 @@ def cleanup_checks() -> list[tuple[str, bool, str]]:
         made = made_by(job("t1", {"file": note, "vault": ours, "born": born},
                            {"file": concept, "vault": ours, "born": concept_born}))
         results.append(("drill: made_by keeps the vault and the bytes of each file, and the picture its note's vault",
-                        made == [(note, ours, born), (picture, ours, ""), (concept, ours, concept_born)], str(made)))
+                        made == [(note, ours, born), (concept, ours, concept_born), (picture, ours, "")], str(made)))
+        # The receipt of the teardown note counts in every state: a running view has it before `result` is there, and
+        # a failed job keeps it when the note could not be taken back. The picture needs `result` (its name).
+        primary = {"file": note, "vault": ours, "born": born}
+        seen = {state: made_by({"state": state, "result": None, "births": [primary]})
+                for state in ("running", "failed", "cancelled", "done")}
+        strangers = made_by({"state": "running", "births": [
+            {"file": "captures/other.md", "vault": ours, "born": born},
+            {"file": f"{teardown.TEARDOWNS_DIR}/{teardown.ASSETS_DIR}/t1.md", "vault": ours, "born": born},
+            {"file": f"{teardown.TEARDOWNS_DIR}/CON.md", "vault": ours, "born": born}, {"file": None}, "not a receipt"]})
+        results.append(("drill: made_by reads the teardown note from the births in every state, and no other file",
+                        all(found == [(note, ours, born)] for found in seen.values()) and strangers == [],
+                        f"{seen} {strangers}"))
         trouble = remove_made(notes, ours, made)
         results.append(("drill: the test's own files in the drill's notes folder are removed",
                         not trouble and not any((notes / relative).exists() for relative, _, _ in made), str(trouble)))
@@ -314,6 +488,7 @@ def cleanup_checks() -> list[tuple[str, bool, str]]:
         results.append(("drill: a receipt with no folder, a note whose bytes differ, or no recorded folder: nothing goes",
                         len(trouble) == 4 and (notes / user_note).exists() and (notes / user_picture).exists(),
                         str(trouble)))
+        results += link_checks(notes, ours, place)
         # put_back builds the galaxy from build.note_files: a note that cannot be looked at is said, never hidden
         # (Path.is_file says False in silence since Python 3.14).
         real_stat, said = os.stat, io.StringIO()
@@ -406,7 +581,9 @@ def made_by(job: dict) -> list[tuple[str, str, str]]:
     """The files one test teardown made: (the path inside the notes folder, the "vault" it was written in, the
     "born" fingerprint of its bytes), from the job's birth receipts. "" where a receipt gives none; the picture has
     no receipt of its own: it is in the folder of its note, and has no "born". Nothing else is ever removed.
-    A job that failed half way can have made the Jarviz note or the REA note: the job lists every birth."""
+    The notes come from the births in EVERY state: a job that still runs, or that failed and could not take a note
+    back, holds the receipt of its teardown note while `result` is not there (yet). The picture's name is known only
+    from `result`, so the picture goes only with a done job."""
     result = job.get("result") or {}
     name = result.get("name")
     births = [birth for birth in (job.get("births") or result.get("births") or []) if isinstance(birth, dict)]
@@ -415,46 +592,292 @@ def made_by(job: dict) -> list[tuple[str, str, str]]:
         birth = next((birth for birth in births if birth.get("file") == file), {})
         return tuple(value if isinstance(value, str) else "" for value in (birth.get("vault"), birth.get("born")))
 
+    def teardown_note(file) -> bool:
+        folder, _, base = file.rpartition("/") if isinstance(file, str) else ("", "", "")
+        return folder == teardown.TEARDOWNS_DIR and base.endswith(".md") and teardown.valid_name(base[:-3])
+
     files = []
+    for birth in births:        # the teardown note, the REA note or the Jarviz note: only when THIS job made it
+        file = birth.get("file")
+        if (teardown_note(file) or file in (teardown.CONCEPT_PATH, teardown.OWNER_PATH)) and file not in (
+                made for made, _, _ in files):
+            files.append((file, *receipt(file)))
     if job.get("state") == "done" and teardown.valid_name(name):
         note = f"{teardown.TEARDOWNS_DIR}/{name}.md"
         vault, born = receipt(note)
-        files.append((note, vault, born))
+        if note not in (made for made, _, _ in files):
+            files.append((note, vault, born))       # a done job with no receipt for its note: put_back says so
         if result.get("snapshot"):
             files.append((f"{teardown.TEARDOWNS_DIR}/{teardown.ASSETS_DIR}/{name}.png", vault, ""))
-    for concept in (teardown.CONCEPT_PATH, teardown.OWNER_PATH):
-        if any(birth.get("file") == concept for birth in births):
-            files.append((concept, *receipt(concept)))  # the REA note or the Jarviz note, only when THIS job made it
     return files
 
 
-def remove_made(notes_dir: Path, vault: str, made: list[tuple[str, str, str]]) -> list[str]:
+# -- the delete of a file of the test, tied to the very file that was checked (as preflight's delete_fixture_file)
+# Windows (kernel32 by ctypes): the access, the share, the flags and the info classes that _handle_delete uses.
+WIN_READ_AND_DELETE = 0x80000000 | 0x00010000       # GENERIC_READ | DELETE
+WIN_SHARE_READ = 0x1                                # others may read it, never write, rename or delete it meanwhile
+WIN_OPEN_EXISTING, WIN_OPEN_REPARSE_POINT = 3, 0x00200000   # the entry itself, never what a link there points to
+WIN_ATTRIBUTE_TAG_INFO, WIN_DISPOSITION_INFO = 9, 4
+WIN_DIRECTORY, WIN_REPARSE_POINT = 0x10, 0x400
+WIN_NOT_FOUND = (2, 3)                              # ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND
+KEEPS = {"linked": "is reached through a link or a junction",
+         "not_plain": "is not a plain file (a link or a folder is at its name)",
+         "changed": "is not the file the test wrote (its bytes differ, or another file took its place)",
+         "moved": "is in a folder that was swapped for another after it was checked"}
+
+
+class CleanupUnsure(Exception):
+    """The delete stopped half way. The text says where things are now, by their paths in the notes folder."""
+
+
+def _bytes_are(read, born: str) -> bool:
+    """True when the bytes that `read()` gives, piece by piece until b"", have the sha256 `born`."""
+    digest = hashlib.sha256()
+    while piece := read():
+        digest.update(piece)
+    return digest.hexdigest() == born
+
+
+def _handle_delete(target: Path, born: str | None, between=None) -> tuple[bool | None, str]:
+    """Windows: delete a file of the test through ONE handle on the entry itself. It is opened with no link followed
+    at the entry, and while it is held nobody may write, rename or delete the file: an editor that saves meanwhile is
+    refused (its text stays in the editor), never deleted. Its real path must be `target` itself (a link or a junction
+    on the way shows there), it must be no folder and no reparse point, and for a note its bytes, read through the
+    handle, must be `born` (None: the picture, which has none). Then the delete goes through the same handle.
+    (True, ""), (False, "linked" | "not_plain" | "changed"), or (None, why there is no safe delete); FileNotFoundError
+    when nothing is there. `between`: a test runs it after the checks, right before the delete."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.CreateFileW.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                                       wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE)
+        kernel.CreateFileW.restype = wintypes.HANDLE
+        kernel.GetFinalPathNameByHandleW.argtypes = (wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD)
+        kernel.GetFinalPathNameByHandleW.restype = wintypes.DWORD
+        for call_name in ("GetFileInformationByHandleEx", "SetFileInformationByHandle"):
+            getattr(kernel, call_name).argtypes = (wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD)
+            getattr(kernel, call_name).restype = wintypes.BOOL
+        kernel.ReadFile.argtypes = (wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD),
+                                    wintypes.LPVOID)
+        kernel.ReadFile.restype = wintypes.BOOL
+        kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel.CloseHandle.restype = wintypes.BOOL
+    except (ImportError, OSError, AttributeError) as error:
+        return None, f"kernel32 could not be used ({type(error).__name__})"
+    handle = kernel.CreateFileW(str(target), WIN_READ_AND_DELETE, WIN_SHARE_READ, None, WIN_OPEN_EXISTING,
+                                WIN_OPEN_REPARSE_POINT, None)
+    if handle in (None, wintypes.HANDLE(-1).value):
+        code = ctypes.get_last_error()
+        if code in WIN_NOT_FOUND:
+            raise FileNotFoundError(code, "not found")
+        return None, f"it could not be opened for a delete (WinError {code})"
+    try:
+        buffer = ctypes.create_unicode_buffer(32768)
+        size = kernel.GetFinalPathNameByHandleW(handle, buffer, len(buffer), 0)
+        if not 0 < size < len(buffer):
+            return None, f"its real place could not be read (WinError {ctypes.get_last_error()})"
+        real = buffer.value
+        real = "\\\\" + real[8:] if real.startswith("\\\\?\\UNC\\") else real[4:] if real.startswith("\\\\?\\") else real
+        if os.path.normcase(real) != os.path.normcase(str(target)):
+            return False, "linked"
+        tag = (wintypes.DWORD * 2)()                   # FILE_ATTRIBUTE_TAG_INFO: the attributes, the reparse tag
+        if not kernel.GetFileInformationByHandleEx(handle, WIN_ATTRIBUTE_TAG_INFO, tag, ctypes.sizeof(tag)):
+            return None, f"its kind could not be read (WinError {ctypes.get_last_error()})"
+        if tag[0] & (WIN_DIRECTORY | WIN_REPARSE_POINT):
+            return False, "not_plain"
+        if born is not None:
+            chunk, got, failed = ctypes.create_string_buffer(65536), wintypes.DWORD(), []
+
+            def read() -> bytes:
+                if not kernel.ReadFile(handle, chunk, len(chunk), ctypes.byref(got), None):
+                    failed.append(ctypes.get_last_error())
+                    return b""
+                return chunk.raw[:got.value]
+
+            same = _bytes_are(read, born)
+            if failed:
+                return None, f"its bytes could not be read (WinError {failed[0]})"
+            if not same:
+                return False, "changed"
+        if between:
+            between()
+        delete = ctypes.c_ubyte(1)                      # FILE_DISPOSITION_INFO: DeleteFile = TRUE
+        if not kernel.SetFileInformationByHandle(handle, WIN_DISPOSITION_INFO, ctypes.byref(delete), 1):
+            return None, f"the delete was refused (WinError {ctypes.get_last_error()})"
+    finally:
+        kernel.CloseHandle(handle)
+    return True, ""
+
+
+def _put_back(folder: int, hidden: str, name: str) -> bool:
+    """Move what sits at `hidden` back to `name` (both in the open `folder`), never over another file: only a hard link
+    does that in one step. Where there is none, it stays at the hidden name. True when it is back."""
+    try:
+        os.link(hidden, name, src_dir_fd=folder, dst_dir_fd=folder, follow_symlinks=False)
+    except (OSError, NotImplementedError):
+        return False                                    # the name is taken, or no link here: it stays hidden
+    os.unlink(hidden, dir_fd=folder)
+    return True
+
+
+def _folder_delete(root: Path, target: Path, born: str | None, between=None) -> tuple[bool | None, str]:
+    """POSIX: delete a file of the test in folders that stay open.
+    1. The vault and each folder below it are checked (lstat: a real folder, no link); their identity is kept.
+    2. Every folder from "/" down is opened with O_NOFOLLOW: no link anywhere on the way is followed. The vault and
+       each folder below must be the very one that was checked.
+    3. The file is opened in the last folder with no link followed; for a note its bytes must be `born` (None: the
+       picture). That fd stays open to the end.
+    4. It is moved to a new random hidden name in the same folder. 5. What sits there must be the file of that fd, and
+       a note's bytes, read again through that fd, must still be `born` (an editor that saved in place after the first
+       read shows here). Else it is put back, never over a file, and CleanupUnsure says where things are. 6. The
+       hidden name is unlinked.
+    What remains: a program that opened the file BEFORE the move and writes to it in the instant between the second
+    read and the unlink. POSIX has no delete tied to a check of the bytes; after the move nobody can open the file by
+    its name. The same answers as _handle_delete, and "moved"."""
+    parts = target.relative_to(root).parts
+    inner, name = parts[:-1], parts[-1]
+    checked, step = [], root
+    for part in (None, *inner):
+        step = step if part is None else step / part
+        seen = step.lstat()
+        if stat.S_ISLNK(seen.st_mode) or not stat.S_ISDIR(seen.st_mode):
+            return False, "linked"
+        checked.append((seen.st_dev, seen.st_ino))
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    fds = [os.open(root.anchor, os.O_RDONLY | os.O_DIRECTORY)]
+    try:
+        for part in root.parts[1:]:
+            fds.append(os.open(part, flags, dir_fd=fds[-1]))
+        vault_at = len(fds) - 1
+        for part in inner:
+            fds.append(os.open(part, flags, dir_fd=fds[-1]))
+        if [(found.st_dev, found.st_ino) for found in map(os.fstat, fds[vault_at:])] != checked:
+            return False, "moved"                       # another folder than the one checked
+        folder = fds[-1]
+        seen = os.stat(name, dir_fd=folder, follow_symlinks=False)
+        if not stat.S_ISREG(seen.st_mode):
+            return False, "not_plain"
+        fds.append(os.open(name, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0), dir_fd=folder))
+        handle = fds[-1]
+        opened = os.fstat(handle)
+
+        def unchanged() -> bool:
+            """The bytes of the file of the fd, read from its start: still `born`."""
+            os.lseek(handle, 0, os.SEEK_SET)
+            return born is None or _bytes_are(lambda: os.read(handle, 65536), born)
+
+        if ((opened.st_dev, opened.st_ino) != (seen.st_dev, seen.st_ino) or not stat.S_ISREG(opened.st_mode)
+                or not unchanged()):
+            return False, "changed"
+        if between:
+            between()
+        hidden = f".{secrets.token_hex(16)}.drill-gone"         # new and random: nobody can have made it before
+        try:
+            os.stat(hidden, dir_fd=folder, follow_symlinks=False)
+            return None, "a new hidden name was taken"
+        except FileNotFoundError:
+            pass
+        os.rename(name, hidden, src_dir_fd=folder, dst_dir_fd=folder)
+        where, hidden_at = "/".join((*inner, name)), "/".join((*inner, hidden))
+        try:
+            now = os.stat(hidden, dir_fd=folder, follow_symlinks=False)
+        except OSError:
+            now = None
+        mine = (now is not None and stat.S_ISREG(now.st_mode)
+                and (now.st_dev, now.st_ino) == (opened.st_dev, opened.st_ino))
+        try:
+            same = mine and unchanged()
+        except OSError:
+            same = None                                 # it could not be read again: it is not deleted
+        if same:
+            try:
+                os.unlink(hidden, dir_fd=folder)
+                return True, ""
+            except OSError as error:
+                trouble, advice = (f"the file at {where} could not be removed after it was moved for the delete "
+                                   f"({error.strerror or type(error).__name__})"), "remove it by hand"
+        elif mine and same is False:
+            trouble, advice = f"the file at {where} was changed right before the delete (it was saved meanwhile)", ""
+        elif mine or now is None:
+            trouble = f"the file at {where} could not be checked again after it was moved for the delete"
+            advice = "look at it before you remove it by hand"
+        else:
+            trouble = f"another file took the place of the file at {where} right before the delete"
+            advice = "where the test's file went is not known"
+        os.close(fds.pop())                             # the file's fd: what sits at the hidden name goes back
+        try:
+            back = _put_back(folder, hidden, name)
+        except OSError:
+            back = False
+        if not advice:                                  # the changed file: it is someone's now, and it stays
+            advice = "it stays, with the change" if back else "give it its name back by hand: it holds the change"
+        raise CleanupUnsure(f"{trouble}, and {'it was put back there' if back else f'it was left at {hidden_at}'}: {advice}")
+    finally:
+        for fd in reversed(fds):
+            os.close(fd)
+
+
+def delete_made_file(root: Path, target: Path, born: str | None, between=None) -> tuple[bool | None, str]:
+    """The delete that no link and no swap of a folder can redirect, and that checks the bytes of the very file it
+    removes: through a handle on the file (Windows) or inside folders opened with no link followed (POSIX). Neither:
+    (None, why), and nothing is deleted (fail closed)."""
+    if os.name == "nt":
+        return _handle_delete(target, born, between)
+    if ({os.open, os.stat, os.unlink, os.rename} <= os.supports_dir_fd and os.stat in os.supports_follow_symlinks
+            and hasattr(os, "O_NOFOLLOW") and hasattr(os, "O_DIRECTORY")):
+        return _folder_delete(root, target, born, between)
+    return None, "this system has no delete tied to the file or to a checked folder"
+
+
+def remove_made(notes_dir: Path, vault: str, made: list[tuple[str, str, str]], between=None) -> list[str]:
     """Remove the test's own files from the notes folder of the drill (`vault`: its fingerprint). A file goes only
-    when its receipt names THAT folder, and a note only while it holds the bytes that were written ("born"). Anything
-    else stays and is said: a file made in another folder (the galaxy moved during the drill) cannot be found from
-    its fingerprint, and a file of the same name here is not the test's. Returns the trouble; it never raises."""
+    when its receipt names THAT folder, it is the very entry at the receipt's path (no link or junction on the way and
+    none at its name: delete_made_file ties the delete to the entry it checked), and a note only while it holds the
+    bytes that were written ("born"), read from the very file that is removed. Anything else stays and is said: a file
+    made in another folder (the galaxy moved during the drill) cannot be found from its fingerprint, and a file of the
+    same name here is not the test's. A path that cannot be looked at is trouble for its receipt, and the others go
+    on; a notes folder that cannot be looked at removes nothing, and the clean-up is not confirmed. Returns the
+    trouble; it never raises. `between`: a test runs it right before each delete."""
+    if not made:
+        return []
+    try:
+        root = notes_dir.resolve(strict=True)
+        if not root.is_dir():
+            raise NotADirectoryError(errno.ENOTDIR, "not a folder")
+    except (OSError, RuntimeError, ValueError) as error:
+        return [f"the notes folder could not be looked at ({type(error).__name__}), so the clean-up is not confirmed: "
+                f"none of the {len(made)} files of the test was removed"]
     trouble: list[str] = []
-    root = notes_dir.resolve()
     for relative, made_in, born in made:
         if not vault or made_in != vault:
             trouble.append(f"{relative} was made in another notes folder (or its receipt names none), so it was left alone")
             continue
-        target = (notes_dir / relative).resolve()
+        note = relative.endswith(".md")
+        if note and not born:
+            trouble.append(f"{relative} is not the note the test wrote (its receipt names no bytes), so it was left alone")
+            continue
         try:
-            if not target.is_relative_to(root):
+            target = Path(os.path.normpath(root / relative))        # the place itself: a link there is not followed
+            if "\0" in relative or target == root or not target.is_relative_to(root):
                 trouble.append(f"{relative} is not inside the notes folder, so it was left alone")
                 continue
-            if relative.endswith(".md"):
-                try:
-                    data = target.read_bytes()
-                except FileNotFoundError:
-                    continue                            # already gone
-                if not born or hashlib.sha256(data).hexdigest() != born:
-                    trouble.append(f"{relative} is not the note the test wrote (its bytes differ), so it was left alone")
-                    continue
-            target.unlink(missing_ok=True)
-        except OSError as error:
-            trouble.append(f"{relative} could not be removed ({error.strerror or error})")
+            done, why = delete_made_file(root, target, born if note else None, between)
+        except FileNotFoundError:
+            continue                                    # already gone
+        except CleanupUnsure as error:                  # it says where things are now
+            trouble.append(f"{relative}: {error}")
+            continue
+        except (OSError, ValueError) as error:
+            if isinstance(error, OSError) and error.errno in (errno.ELOOP, errno.ENOTDIR):
+                trouble.append(f"{relative} {KEEPS['linked']}, so it was left alone")
+            else:
+                trouble.append(f"{relative} could not be removed ({getattr(error, 'strerror', None) or type(error).__name__})")
+            continue
+        if done is False:
+            trouble.append(f"{relative} {KEEPS.get(why, why)}, so it was left alone")
+        elif done is None:
+            trouble.append(f"{relative} was left alone: there is no safe delete here ({why}). Remove it by hand")
     return trouble
 
 

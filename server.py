@@ -123,6 +123,11 @@ LINES = {
     "empty": "Words fail me, sir. Ask me that once more.",
     "unknown_tag": "I am afraid that is beyond my present equipment, sir.",
     "not_asked": "I write a note only when you ask me to, sir. Say “remember that” and I shall.",
+    # A turn with Ali Memory in it: a tag may carry only the user's own words (tag_remember, tag_teardown).
+    "remember_own_words": "Ali Memory had a hand in that answer, sir, so I write down only your own words. Say "
+                          "“remember that” and the fact itself, and I shall.",
+    "teardown_own_words": "Ali Memory had a hand in that answer, sir, so I open only an address you give me yourself. "
+                          "Say “tear down” and the address, and I shall.",
     "teardown_started": (
         "Taking {host} apart now, sir.",
         "Very good, sir. {host} goes on the bench.",
@@ -586,10 +591,12 @@ class Galaxy:
         self.build_id = ""
         self.rev = 0
         self._stamp: int | None = None
-        # The sha256 of the bytes that birth_note wrote, for each note it made (key: the note's path). An entry says
-        # only "this run wrote these bytes at this path", so a new index (load) keeps it. unbirth deletes a file only
-        # when it still holds those bytes. It stays here: the receipt goes to the page. Only the two drops clear it.
-        self._born: dict[str, str] = {}
+        # The sha256 of the bytes that birth_note wrote, for each note it made (key: (the fingerprint of its notes
+        # folder, vault_of; its path in that folder)). An entry says only "this run wrote these bytes at this path in
+        # this folder", so a new index (load) keeps it, and a birth at the same path in another folder never writes
+        # over it. unbirth deletes a file only when it still holds those bytes. It stays here: the receipt goes to the
+        # page. Only the removals clear it (forget_last, unbirth, unbirth_left).
+        self._born: dict[tuple[str, str], str] = {}
 
     # -- loading
 
@@ -713,14 +720,15 @@ class Galaxy:
                 raise
             # The fingerprint names THIS creation of the note: a later capture with the same title, path and index but
             # other text has other bytes. Two captures with exactly the same bytes count as the same note.
-            born = self._born[note.path] = hashlib.sha256(data).hexdigest()
+            here = vault_of(self.notes_dir)
+            born = self._born[(here, note.path)] = hashlib.sha256(data).hexdigest()
             return {
                 "index": index,
                 "title": note.label,
                 "file": note.path,
                 "build": self.build_id,     # the galaxy this number belongs to, read under the same lock (/forget)
                 "born": born,               # the sha256 (hex, all 64 characters) of the bytes written (/forget)
-                "vault": vault_of(self.notes_dir),   # the notes folder it was written in, as a fingerprint (unbirth)
+                "vault": here,              # the notes folder it was written in, as a fingerprint (unbirth)
                 "related": self._nearest(note, [a for a, _ in new_links]),
                 "node": {"id": index, "label": note.label, "group": note.group, "excerpt": note.excerpt},
                 "links": [{"source": a, "target": b} for a, b in sorted(new_links)],
@@ -779,7 +787,8 @@ class Galaxy:
                 raise ValueError("only the newest note can be forgotten")
             if note.label != label or not note.path.startswith(CAPTURES_DIR + "/"):
                 raise ValueError("that note is not a capture")
-            if self._born.get(note.path) != born:
+            made = (vault_of(self.notes_dir), note.path)
+            if self._born.get(made) != born:
                 raise ValueError("that is not the note this receipt was made for")
             source = self._note_path(note.path)
             trash = self.notes_dir / CAPTURES_DIR / TRASH_DIR
@@ -791,7 +800,7 @@ class Galaxy:
                 destination = trash / f"{stamp}-{copy} {source.name}"
             os.replace(source, destination)
             self._drop_note(index, lambda: self._move_back(destination, source), destination)
-            self._born.pop(note.path, None)
+            self._born.pop(made, None)
             return {"index": index, "title": note.label, "trash": destination.relative_to(self.notes_dir).as_posix()}
 
     def unbirth(self, receipt: dict) -> None:
@@ -813,7 +822,8 @@ class Galaxy:
             if note is None or note.label != receipt.get("title"):
                 raise ValueError("the note on the receipt is not in the galaxy, so nothing is taken back")
             target = self._note_path(note.path)
-            written = self._born.get(note.path)
+            made = (receipt["vault"], note.path)    # the fingerprint of THIS folder's creation, never another's
+            written = self._born.get(made)
             if written is None:
                 raise ValueError("Jarviz did not make that note in this run, so it stays")
             if written != receipt.get("born"):     # Jarviz made a note here, but not the one on this receipt
@@ -835,7 +845,7 @@ class Galaxy:
                                                  f"back. Its file is now {self._place(aside)}") from trouble
                 raise ValueError("the note was changed after it was made, so it stays")
             self._drop_note(index, lambda: self._move_back(aside, target), aside)
-            self._born.pop(note.path, None)
+            self._born.pop(made, None)
             try:
                 aside.unlink()
             except OSError:
@@ -880,6 +890,9 @@ class Galaxy:
                     raise OSError(trouble.errno, "The note was changed after it was made, and it could not be put "
                                                  f"back. Its file is now {where}") from trouble
                 raise ValueError("the note was changed after it was made, so it stays")
+            made = (receipt["vault"], receipt["file"])
+            if self._born.get(made) == born:
+                del self._born[made]        # the creation is gone: its fingerprint goes too (as in unbirth)
             try:
                 aside.unlink()
             except OSError:
@@ -977,17 +990,20 @@ class Session:
         # be refused enters the history only once it started (publish), so a refusal has nothing to take back.
         self._drafts: dict[int, tuple[list, frozenset, list]] = {}
 
-    def snapshot(self, with_memory: bool = False) -> tuple[list[dict], frozenset, list[int]]:
-        """The history, the last keywords, and the last sources that still are the same notes: the note at that
-        index still has the same identity (note_id: the notes folder and the path in it). A title is no identity.
+    def snapshot(self, with_memory: bool = False) -> tuple[list[dict], frozenset, list[int], bool]:
+        """The history, the last keywords, the last sources that still are the same notes (the note at that index
+        still has the same identity, note_id: the notes folder and the path in it; a title is no identity), and
+        whether this history shows an answer that was given with Ali Memory.
         An answer that was given with Ali Memory can quote it: it is in the history only `with_memory` (for a brain
         that may see Ali Memory). Else MEMORY_LEFT_OUT stands in its place, so a brain switch carries no memory text.
-        The user's own words and the receipts stay."""
+        A brain that reads such an answer can repeat it: chat_route marks its new turn too (the last value). The
+        user's own words and the receipts stay."""
         with self.lock:
-            history = []
+            history, carried = [], False
             for said, replied, receipts, memory in self.turns:
                 history.append({"role": "user", "content": said})
                 shown = replied if with_memory or not memory else MEMORY_LEFT_OUT
+                carried = carried or bool(memory and with_memory)
                 history.append({"role": "assistant", "content": shown})
                 if receipts:                                # proof of the action, right after the turn that did it
                     lines = "\n".join(f"- {line}" for line in receipts)
@@ -995,7 +1011,7 @@ class Session:
             tokens, sources = self.last_tokens, list(self.last_sources)
         with GALAXY.lock:
             still = [index for index, identity in sources if still_there(index, {index: identity})]
-        return history, tokens, still
+        return history, tokens, still, carried
 
     def record(self, said: str, replied: str, tokens, nodes: list[int], receipt: str | None = None,
                ids: dict[int, tuple] | None = None, memory: bool = False) -> list:
@@ -1192,6 +1208,22 @@ def asks_for_teardown(sentence: str) -> bool:
 
 
 TAG_INTENT = {"REMEMBER": asks_to_remember, "TEARDOWN": asks_for_teardown}     # tag -> (the user's sentence) -> bool
+
+
+def words_of(text) -> str:
+    """A text as its words only (letters and digits), in lower case, one space between them."""
+    return " ".join(re.findall(r"[^\W_]+", str(text).casefold()))
+
+
+def said_by_user(text: str, sentence: str) -> bool:
+    """True when `text` (what the brain put in a tag) is the user's own words: its words stand in the user's sentence,
+    side by side and in that order. Case, marks and spaces do not count, other words do. A turn with Ali Memory in it
+    keeps memory text out of a note (tag_remember) and out of a teardown (tag_teardown) this way: the brain may move
+    the user's words into a tag, never add its own."""
+    wanted = words_of(text)
+    return bool(wanted) and f" {wanted} " in f" {words_of(sentence)} "
+
+
 NOTE_TAG_RE = re.compile(r"\[(?=\s*[A-Z][A-Z_]{2,}\s*:)")
 LONE_TAG_RE = re.compile(r"\s*\[[A-Z][A-Z_]{2,}(?:\s*:[^\[\]]*)?\]\s*")
 
@@ -1218,6 +1250,14 @@ def clean_text(value, limit: int) -> str:
     text = value.encode("utf-8", "replace").decode("utf-8")         # a lone surrogate becomes "?"
     text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
     return " ".join(text.split())[:limit].strip()
+
+
+def holds_key(config: dict, *texts) -> bool:
+    """True when one of `texts` holds a key of config.json (voices.configured_keys: every key line). Give it the text
+    as it came AND its one-line form (clean_text), both whole, before any cut: a cut can split a key in two, and the
+    piece that is left is no key any more, but still a part of one."""
+    keys = voices.configured_keys(config)
+    return any(key in text for text in texts if isinstance(text, str) for key in keys)
 
 
 def reason_of(error: Exception) -> str:
@@ -1302,7 +1342,7 @@ def note_id(note: build.Note) -> tuple[str, str, str | None]:
     creation in this run, or None for a note this run did not make). The path alone is not enough: another notes
     folder can hold the same shop/Foo.md, and a later capture with the same title can take the same path and number.
     Call it with GALAXY.lock held."""
-    return str(GALAXY.notes_dir), note.path, GALAXY._born.get(note.path)
+    return str(GALAXY.notes_dir), note.path, GALAXY._born.get((vault_of(GALAXY.notes_dir), note.path))
 
 
 def still_there(index: int, ids: dict[int, tuple]) -> bool:
@@ -1320,14 +1360,18 @@ def memory_allowed(config: dict) -> bool:
     return not config.get("_error") and brains.active_name(config) in ALI_MEMORY_BRAINS
 
 
-def recall_memory(config: dict, question: str) -> tuple[list[dict], str]:
+def recall_memory(config: dict, question: str, submitted=None) -> tuple[list[dict], str]:
     """The Ali Memory results for a chat question, and why there are none ("no_results" when the hub found none).
     The hub is asked only when the brain may see Ali Memory and the key line holds a key. It answers within its
-    budget (ali_memory.BUDGET_S), and every failure means: no memory, silently. Read-only."""
+    budget (ali_memory.BUDGET_S), and every failure means: no memory, silently. Read-only. `submitted`: the message
+    as it came, before the cut to `question`. A key in it is never sent, also when the cut split it in two
+    (ali_memory.recall sees only the cut question, so it would send the first part of the key)."""
     if not memory_allowed(config):
         return [], "off_brain"
     if not ali_memory.has_key(config):
         return [], "no_key"
+    if holds_key(config, submitted, clean_text(submitted, MAX_BODY_BYTES)):
+        return [], "query_has_key"
     memories, status = ali_memory.recall(config, question)
     return memories, ("no_results" if status == "ok" and not memories else status)
 
@@ -1351,12 +1395,12 @@ def chat_route(payload: dict) -> tuple[int, dict]:
     # between can never hand memory text to another brain. Chat only: no teardown, capture or /remember asks it.
     config = load_config()
     with_memory = memory_allowed(config)
-    memories, why = recall_memory(config, question)
+    memories, why = recall_memory(config, question, payload.get("message"))
     shown_memory = bool(memories)
 
     tokens = frozenset(build.tokenize(question))
     with GALAXY.lock:       # ONE snapshot: the notes that are scored are the notes the brain is sent
-        history, last_tokens, last_sources = session.snapshot(with_memory=with_memory)
+        history, last_tokens, last_sources, read_memory = session.snapshot(with_memory=with_memory)
         offered = [index for index, _, _ in GALAXY.search(tokens, last_tokens)]
         carried = [index for index in last_sources if index not in offered]
         offered += carried[: max(0, RETRIEVE_TOP - len(offered))]
@@ -1370,11 +1414,15 @@ def chat_route(payload: dict) -> tuple[int, dict]:
     except BrainTrouble as error:
         return 503, reply(error.line, ok=False, error=error.code, detail=error.detail)
 
+    # The turn is marked when the brain was shown Ali Memory: fresh results, or an answer in its history that was given
+    # with it (`read_memory`: the new answer can repeat it). MEMORY_RULES and the page's line go with fresh results
+    # only.
+    marked = shown_memory or read_memory
     answer, declared = split_sources(text)
     tag = find_tag(answer)
     intent = TAG_INTENT.get(tag[0]) if tag else None
     if tag and intent and intent(question):         # a memory never orders an action: the user's sentence does
-        return TAG_HANDLERS[tag[0]](tag[1], question, session, payload, memory=shown_memory)
+        return TAG_HANDLERS[tag[0]](tag[1], question, session, payload, memory=marked)
     own = True                                      # the answer is the brain's own words, not one of LINES
     if tag:
         answer, declared, own = LINES["not_asked"], [], False   # the user did not ask for this action
@@ -1388,9 +1436,9 @@ def chat_route(payload: dict) -> tuple[int, dict]:
         graph = GALAXY.meta()
     if not answer:
         answer, own = LINES["empty"], False
-    # The turn is marked whenever the brain was shown Ali Memory. The page names the memories only under the brain's
-    # own words, not under one of LINES.
-    session.record(question, answer, tokens, nodes, ids=ids, memory=shown_memory)
+    # The turn is marked whenever the brain was shown Ali Memory (`marked`). The page names the memories only under the
+    # brain's own words, not under one of LINES.
+    session.record(question, answer, tokens, nodes, ids=ids, memory=marked)
     view = memory_view(memories, why) if own else memory_view([], "not_in_answer" if shown_memory else why)
     return 200, reply(answer, nodes, graph=graph, sources_declared=declared is not None, memory=view)
 
@@ -1497,14 +1545,22 @@ def voice_speak_route(payload: dict) -> tuple:
     header X-Jarviz-Parts says how many there are, so the page can ask for the next one. A refusal is JSON with a
     line, and never holds the key. A bad request is refused before any provider is asked."""
     name = payload.get("voice")
-    text = clean_text(payload.get("text"), MAX_SPEAK_CHARS)        # one line: the sentence marks stay
+    submitted = payload.get("text")
+    whole = clean_text(submitted, MAX_BODY_BYTES)   # the whole text, one line: the sentence marks stay
+    text = whole[:MAX_SPEAK_CHARS].strip()          # a cost guard: only this much is split and sent
     part = payload.get("part", 0)
     pieces = voices.split_text(text)
     if (not isinstance(name, str) or name not in voices.SERVER_VOICES
             or isinstance(part, bool) or not isinstance(part, int) or not 0 <= part < len(pieces)):
         return 400, reply(LINES["speak_bad_request"], ok=False, error="bad_speak_request")
-    try:                                            # `whole`: a key that the cut split in two is seen there
-        audio, kind = voices.speak(load_config(), pieces[part], name, whole=text)
+    config = load_config()
+    # `whole`: the text the piece was cut from, BEFORE any cut (MAX_SPEAK_CHARS, split_text): a key that a cut split
+    # in two is seen there, and speak sends nothing. The text as it came counts too: a line break or a control
+    # character inside a key is gone from its one line.
+    if holds_key(config, submitted):
+        whole = submitted
+    try:
+        audio, kind = voices.speak(config, pieces[part], name, whole=whole)
     except voices.VoiceError as error:              # 503 like a brain that cannot answer (chat_route)
         return 503, reply(voice_line(error), ok=False, error=error.code, detail=error.detail)
     return 200, audio, kind, (("X-Jarviz-Parts", str(len(pieces))),)
@@ -1534,8 +1590,14 @@ def search_route(query: dict) -> tuple[int, dict]:
 def tag_remember(argument: str, question: str, session: Session, payload: dict,
                  memory: bool = False) -> tuple[int, dict]:
     """The brain asked to save a note. Its text is tidied and cut to size like any other input. `memory`: the brain
-    was shown Ali Memory for this answer."""
-    return do_remember(clean_text(argument, MAX_MESSAGE_CHARS), question, session, SOURCE_BRAIN, memory=memory)
+    was shown Ali Memory for this answer (fresh, or in an answer of its history). Then the note holds only the user's
+    own words (said_by_user): a note is ordinary text that every brain can read later, and Ali Memory reaches only
+    Claude. Other text is not saved, and the line tells the user to say the fact themselves ("remember that ...":
+    the page saves that directly, /remember)."""
+    fact = clean_text(argument, MAX_MESSAGE_CHARS)
+    if memory and not said_by_user(fact, question):
+        return 200, reply(LINES["remember_own_words"], error="own_words", memory=memory_view([], "not_in_answer"))
+    return do_remember(fact, question, session, SOURCE_BRAIN, memory=memory)
 
 
 # ------------------------------------------------------------------ teardowns
@@ -1787,16 +1849,35 @@ def tag_site_named(site_text: str, sentence: str) -> bool:
     return any(named_in(clause) for clause in kept)
 
 
+def address_said(site_text: str, sentence: str) -> bool:
+    """True when the user's sentence holds the WHOLE address of a [TEARDOWN:...] tag, as the job opens it: every label
+    of its host (not only the name that named_by_user looks for; "www." is no word of anyone), its port, its path and
+    its query (said_by_user). "stripe dot com slash pricing" says stripe.com/pricing. A text that is no address is
+    left to start_teardown, which refuses it."""
+    site = teardown.parse_site(site_text) if teardown is not None else None
+    if site is None:
+        return True
+    path = site.url.split("://", 1)[1].partition("/")[2]
+    return said_by_user(f"{site.host}/{path}", teardown.spoken_to_address(sentence))
+
+
 def tag_teardown(argument: str, question: str, session: Session, payload: dict,
                  memory: bool = False) -> tuple[int, dict]:
     """The brain asked for a teardown. It runs only for a site the user's own sentence asks for. `memory`: the brain
-    was shown Ali Memory for this answer."""
+    was shown Ali Memory for this answer (fresh, or in an answer of its history). Then the tag carries nothing of the
+    brain's own: the address must be the user's whole address (address_said: a label or a path of the brain's could
+    hold memory text, and it goes to the website and to DNS), and the question is the user's sentence (the brain's
+    goes to the teardown brain and into the note, an ordinary note that every brain can read)."""
     site_text, _, asked = argument.partition("|")
     site_text = clean_text(site_text, 300)
     if not tag_site_named(site_text, question):
         return 200, reply(LINES["teardown_not_named"], error="not_named")
     if not site_text or site_text.lower() in THIS_SITE:
         site_text = "this"
+    elif memory and not address_said(site_text, question):
+        return 200, reply(LINES["teardown_own_words"], error="own_words", memory=memory_view([], "not_in_answer"))
+    if memory:      # the question goes to the teardown brain and into the note: the user's own sentence only
+        asked = ""
     return start_teardown(site_text, clean_text(asked, 300) or question, session, question,
                           headless=payload.get("headless") is True, memory=memory)
 

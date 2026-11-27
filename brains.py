@@ -658,6 +658,11 @@ AGY_NOT_SENT_RE = re.compile(r"invalid tool call error", re.IGNORECASE)
 # EVERY agy call: the init event is the tool's own word that it took Jarviz's session settings (strict) and the
 # no-tools agent. Missing (on a run that started) or anything else: the lock is not confirmed, the answer is lost.
 AGY_INIT = {"permission_mode": "strict", "agent": "jarviz-brain"}
+# The revision of the rules by which _agy_answer judges a run. It is part of the agy recipe (lock_recipe), so a rule
+# that judges more strictly with the same flags and patterns makes an older agy proof count no more: the trap runs
+# again once. 2: a step that gave any other error is no refusal and no "never sent", also next to such a message.
+# Raise it with every stricter rule. The Codex recipe does not hold it.
+AGY_PROOF_REVISION = 2
 
 # A failure text of a tool, most specific first.
 LIMIT_RE = re.compile(r"usage.?limit|rate.?limit|quota|too many requests|resource.?exhausted|\b429\b", re.IGNORECASE)
@@ -1171,15 +1176,14 @@ def _cli_call(config: dict, name: str, route: str, system: str, messages: list[d
 
     The ONE place that tries again: only a run that did not START (cli_not_started: nothing reached a model, no tool
     ran) is tried again, at most CLI_START_TRIES in all, after the pauses of CLI_START_PAUSES, each try in a new room.
-    A run that started is never run twice. All tries together stay inside the route's timeout, the removal of their
-    rooms too (a room that is still held then goes to the background thread). The one clean-up with a budget of its
-    own: a tool that ran out of time is stopped with its whole tree (_stop_tree: taskkill up to 15 s, then up to 10 s
-    to collect it), because a tool is never left running."""
+    A run that started is never run twice. All tries together stay inside the route's timeout (ONE deadline: the
+    making of a room counts too), the removal of their rooms too (a room that is still held then goes to the
+    background thread). The one clean-up with a budget of its own: a tool that ran out of time is stopped with its
+    whole tree (_stop_tree: taskkill up to 15 s, then up to 10 s to collect it), because a tool is never left running."""
     deadline = _clock() + TIMEOUT_S.get(route, REQUEST_TIMEOUT_S)
     for attempt in range(CLI_START_TRIES):
         try:
-            return _cli_call_once(config, name, route, system, messages, run, tool, left, frame, tally,
-                                  max(1.0, deadline - _clock()))
+            return _cli_call_once(config, name, route, system, messages, run, tool, left, frame, tally, deadline)
         except BrainError as error:
             if error.code != "cli_not_started" or attempt + 1 >= CLI_START_TRIES:
                 raise
@@ -1191,9 +1195,10 @@ def _cli_call(config: dict, name: str, route: str, system: str, messages: list[d
 
 
 def _cli_call_once(config: dict, name: str, route: str, system: str, messages: list[dict], run: Runner | None,
-                   tool: list[str], left: dict | None, frame: str | None, tally: dict | None, timeout: float) -> str:
-    """One try of _cli_call, in a new empty room that is removed afterwards (with no wait past the try's time)."""
-    until = _clock() + timeout
+                   tool: list[str], left: dict | None, frame: str | None, tally: dict | None, deadline: float) -> str:
+    """One try of _cli_call, in a new empty room that is removed afterwards. `deadline` (a time of _clock) is the end
+    of the route's time for the whole call: the tool gets what is left of it right before its start, and with nothing
+    left it never starts (cli_timeout). The removal of the room waits no longer than that either."""
     spec, brain = PROVIDERS[name], _brain_of(config, name)
     run = run or _run_tool
     frame = CLI_FRAME if frame is None else frame
@@ -1215,6 +1220,9 @@ def _cli_call_once(config: dict, name: str, route: str, system: str, messages: l
             argv = _codex_argv(tool, route, model)
             stdin = frame + "\n\n" + system + "\n\n" + cli_conversation(messages)
             env, read = _codex_env(), _codex_answer
+        timeout = deadline - _clock()               # what is left NOW, after the room was made
+        if timeout <= 0:
+            raise BrainError("cli_timeout", "The time for this question ran out before the tool could start.", brain)
         started = True
         try:
             code, out, err = run(argv, stdin, room, env, timeout)
@@ -1224,7 +1232,7 @@ def _cli_call_once(config: dict, name: str, route: str, system: str, messages: l
     finally:
         if left is not None and started:
             left["room"] = _foreign(room, ours)
-        _remove_room(room, until)
+        _remove_room(room, deadline)
 
 
 def _ask_cli(config: dict, name: str, route: str, system: str, messages: list[dict], run: Runner | None = None,
@@ -1283,7 +1291,8 @@ def _program_stamp(argv_prefix: list[str]) -> tuple:
 
 def lock_recipe(name: str) -> str:
     """sha256 over everything that makes the lock of this brain: the flags, the settings, the agent file header, the
-    allow-list, TRAP_FRAME and the trap text. A changed flag gives another recipe, so an old proof no longer counts.
+    allow-list, TRAP_FRAME and the trap text, and for agy the revision of the rules that judge a run
+    (AGY_PROOF_REVISION). A changed flag or a stricter rule gives another recipe, so an old proof no longer counts.
     CLI_FRAME is not part of the lock: it is only the words of a normal question."""
     spec = PROVIDERS[name]
     parts: dict = {"brain": name, "tool": spec["tool"],
@@ -1292,7 +1301,7 @@ def lock_recipe(name: str) -> str:
     if spec["tool"] == "agy":
         parts.update(flags=list(AGY_LOCK), settings=AGY_SETTINGS, agent=[AGY_AGENT_FILE, AGY_AGENT_HEAD],
                      tool_steps=sorted(AGY_TOOL_STEPS), refused=AGY_REFUSED_RE.pattern,
-                     not_sent=AGY_NOT_SENT_RE.pattern, init=AGY_INIT)
+                     not_sent=AGY_NOT_SENT_RE.pattern, init=AGY_INIT, proof=AGY_PROOF_REVISION)
     else:
         parts.update(flags=list(CODEX_LOCK), talk=sorted(CODEX_TALK_ITEMS), env_off=sorted(CODEX_DROP_ENV),
                      evidence=[CODEX_REFUSED_RE.pattern, EVIDENCE_CODEX_WRITE])
@@ -2227,10 +2236,11 @@ def offline_checks() -> list[tuple[str, bool, str]]:
     try:
         with swapped(_call=fake_call):
             _responses_once(leak_key, keyed, PROVIDERS["openai"], "chat", "S", PROBE_MESSAGES, 32)
-        detail = "no error"
+        raised, detail = False, "no error: the failed generation came back as an answer"
     except BrainError as error:
-        detail = error.detail
-    check("Responses: the error text of a failed generation loses the key", leak_key not in detail and detail, detail)
+        raised, detail = True, error.detail
+    check("Responses: a failed generation raises, and its error text loses the key",
+          raised and bool(detail) and leak_key not in detail, detail)
     if anthropic is not None:
         from types import SimpleNamespace
         for label, message, wanted in (("no stop reason", SimpleNamespace(stop_reason=None, content=[]), "bad_reply"),
@@ -2421,6 +2431,26 @@ def offline_checks() -> list[tuple[str, bool, str]]:
     got, calls, pauses = tried([no_start, (0, _agy_says("late"), "")], route="probe", step=52.0)
     check("retry: no second try when the route's time left is too short for the pause and a try",
           got == "cli_not_started" and len(calls) == 1 and not pauses, f"{got} {len(calls)} {pauses}")
+    real_room = _agy_room
+    for setup, wanted in ((2.0, "ok:Four, sir."), (TIMEOUT_S["probe"] + 1.0, "cli_timeout")):
+        run, calls, pauses, now = sequence((0, _agy_says("Four, sir.\n"), ""))
+        made, look = [], {}
+
+        def slow_room(room, system, frame, setup=setup):
+            made.append(room)
+            now[0] += setup                     # making the room took this long
+            return real_room(room, system, frame)
+        with swapped(_clock=lambda: now[0], _sleep=lambda seconds: pauses.append(seconds), _agy_room=slow_room):
+            got = outcome(lambda: _cli_call(agy_cfg, "antigravity", "probe", "S", question, run, agy, look))
+        if wanted == "cli_timeout":
+            check("deadline: with the route's time spent before the start, the tool never starts (cli_timeout, the "
+                  "room removed, nothing 'left' to judge)",
+                  got == wanted and not calls and len(made) == 1 and not os.path.exists(made[0]) and "room" not in look,
+                  f"{got} {len(calls)} {look}")
+        else:
+            check("deadline: the time the room took is taken off the tool's time (ONE deadline for the call)",
+                  got == wanted and len(calls) == 1 and calls[0]["timeout"] == TIMEOUT_S["probe"] - setup,
+                  f"{got} {[call['timeout'] for call in calls]}")
     run, calls, pauses, now = sequence(no_start)
     with tempfile.TemporaryDirectory(prefix="jarviz-locks-") as folder:
         trap_locks = Path(folder) / "brain-locks.json"
@@ -2803,6 +2833,9 @@ def offline_checks() -> list[tuple[str, bool, str]]:
           recipes_with(CLI_START_TRIES=1, CLI_START_PAUSES=(9.0,), CLI_START_MIN_TRY_S=1.0) == before, "")
     check("lock_recipe: changing the agy 'never sent' rule changes it",
           recipes_with(AGY_NOT_SENT_RE=re.compile("invalid"))["antigravity"] != before["antigravity"], "")
+    stricter = recipes_with(AGY_PROOF_REVISION=AGY_PROOF_REVISION + 1)
+    check("lock_recipe: a new revision of the agy judging rules changes the agy recipe, and the Codex one not",
+          stricter["antigravity"] != before["antigravity"] and stricter["codex"] == before["codex"], "")
     check("lock_recipe: the values are back after the checks",
           {name: lock_recipe(name) for name in before} == before, "")
     result = probe(cfg, "codex", _FakeTool("", code=1, err="Not logged in"), codex)

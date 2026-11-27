@@ -26,6 +26,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import urllib.error
 from pathlib import Path
 from urllib.parse import quote
@@ -326,6 +327,33 @@ def short(text: str, limit: int = 90) -> str:
     return text if len(text) <= limit else text[: limit - 3] + "..."
 
 
+def key_texts(config: dict) -> list[str]:
+    """Every key of config.json (voices.configured_keys: each "..._api_key" line), as it is and as JSON and repr()
+    write it inside quotes (a '"', a "'" or a '\\' is escaped there): each of them is a key for the scrub."""
+    every = voices.configured_keys(config)
+    return list(dict.fromkeys(every + [json.dumps(key)[1:-1] for key in every] + [repr(key)[1:-1] for key in every]))
+
+
+def scrubbed(value: object, keys: list[str]) -> object:
+    """A value from an answer with every key out of each text in it (a name of a dict too), BEFORE it is cut or
+    written as JSON or repr()."""
+    if isinstance(value, str):
+        return voices.scrub_keys(value, keys)
+    if isinstance(value, dict):
+        return {scrubbed(name, keys): scrubbed(item, keys) for name, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [scrubbed(item, keys) for item in value]
+    return value
+
+
+def scrubbed_short(value: object, limit: int, keys: list[str]) -> str:
+    """A value from an answer (or a text made from one) as it may be printed: every key out BEFORE it is written as
+    JSON, once more in the text that JSON writes and after the spaces are joined (a line break cannot hide a key), and
+    only then the cut (a cut first could leave a piece of a key)."""
+    text = value if isinstance(value, str) else json.dumps(scrubbed(value, keys))
+    return short(voices.scrub_keys(" ".join(voices.scrub_keys(text, keys).split()), keys), limit)
+
+
 # -------------------------------------------------------------------- checks
 
 def check_server(report: Report) -> bool:
@@ -368,17 +396,35 @@ def check_graph(report: Report, ctx: dict) -> None:
         report.add(PASS, name, f"{len(nodes)} nodes, {len(graph.get('links', []))} links")
 
 
+# Why a /chat reply used no Ali Memory: a code of recall() (ali_memory.STATUS, but "ok", which has results), or one of
+# the server's own: "no_results" (the hub found none: server.recall_memory) and "not_in_answer" (the answer is one of
+# LINES: server.chat_route). No other text is a reason, and one that is not is never printed (it could be a key).
+MEMORY_WHY_SERVER = ("no_results", "not_in_answer")
+
+
+def memory_why_codes() -> set[str]:
+    return (set(ali_memory.STATUS) - {"ok"}) | set(MEMORY_WHY_SERVER)
+
+
+def clean_title(title) -> bool:
+    """True for a title as ali_memory._clean makes it: a text of 1 to TITLE_CHARS characters on one line (no line
+    break, control or other hidden character: ali_memory.HIDDEN)."""
+    return (isinstance(title, str) and 0 < len(title) <= ali_memory.TITLE_CHARS
+            and not any(unicodedata.category(char) in ali_memory.HIDDEN for char in title))
+
+
 def memory_told(memory) -> str | None:
     """What a /chat reply says about Ali Memory, for a check line (a count or a code, never a title), or None when its
-    "memory" field is not {"used": true, "titles": [at most 3 texts]} or {"used": false, "why": a code}."""
+    "memory" field is not {"used": true, "titles": [at most 3 clean titles]} or {"used": false, "why": a defined
+    code} (memory_why_codes)."""
     if not isinstance(memory, dict):            # exactly these keys below: a snippet has no place in it
         return None
     titles, why = memory.get("titles"), memory.get("why")
     if memory.get("used") is True and set(memory) == {"used", "titles"} and isinstance(titles, list) \
-            and 0 < len(titles) <= ali_memory.LIMIT and all(isinstance(title, str) for title in titles):
+            and 0 < len(titles) <= ali_memory.LIMIT and all(clean_title(title) for title in titles):
         return f"Ali Memory: {len(titles)} used"
     if memory.get("used") is False and set(memory) == {"used", "why"} and isinstance(why, str) \
-            and re.fullmatch(r"[a-z_]{1,40}", why):
+            and why in memory_why_codes():
         return f"Ali Memory: not used, {why}"
     return None
 
@@ -391,6 +437,7 @@ def check_chat(report: Report, ctx: dict) -> None:
         return
     subject = max(nodes, key=lambda node: len(node.get("excerpt", "")))["label"]
     question = f"What do my notes say about {subject}?"
+    keys = key_texts(ctx["config"])     # the answer, the error and the question (a note's title) lose every key
     status, body = call_json("POST", "/chat", {"message": question, "session": ctx["session"]})
     shaped = isinstance(body.get("answer"), str) and isinstance(body.get("nodes"), list)
     if status == 200 and body.get("ok") and shaped and body["answer"].strip():
@@ -398,21 +445,22 @@ def check_chat(report: Report, ctx: dict) -> None:
         memory = body.get("memory")             # {"used": true, "titles": [...]} or {"used": false, "why": code}
         told = memory_told(memory)
         if not valid:
-            report.add(FAIL, name, f"nodes holds an index that is not in the graph: {body['nodes']}")
+            report.add(FAIL, name, f"nodes holds an index that is not in the graph: {scrubbed_short(body['nodes'], 200, keys)}")
         elif told is None:
             report.add(FAIL, name, "The reply has no well-formed Ali Memory field (memory: used and titles, or used and "
                                    "why; never a snippet). Start the server again.")
         elif not body["nodes"]:
-            report.add(WARN, name, f"It answered but named no source note. Asked: {question!r}. Said: "
-                                   f"{short(body['answer'])} ({told})")
+            report.add(WARN, name, f"It answered but named no source note. Asked: \"{scrubbed_short(question, 200, keys)}\". "
+                                   f"Said: {scrubbed_short(body['answer'], 90, keys)} ({told})")
         else:
-            report.add(PASS, name, f"nodes {body['nodes']}: {short(body['answer'])} ({told})")
+            report.add(PASS, name, f"nodes {body['nodes']}: {scrubbed_short(body['answer'], 90, keys)} ({told})")
     elif (status == 503 and shaped and not ctx["key_set"]
           and body.get("error") == ("cli_missing" if ctx["brain"].get("sign_in") else "api_key_missing")):
         report.add(WARN, name, "The brain is not connected yet. /chat gave a clean " +
                    ("\"not installed\"" if ctx["brain"].get("sign_in") else "\"no key\"") + " reply, not a crash.")
     else:
-        report.add(FAIL, name, f"HTTP {status}, error {body.get('error')!r}: {short(body.get('detail') or body.get('answer') or 'no JSON body')}")
+        report.add(FAIL, name, f"HTTP {status}, error {scrubbed_short(body.get('error'), 60, keys)}: "
+                               f"{scrubbed_short(body.get('detail') or body.get('answer') or 'no JSON body', 90, keys)}")
 
 
 def check_key_and_model(report: Report, ctx: dict) -> None:
@@ -514,7 +562,7 @@ def check_brains_offline(report: Report) -> None:
     try:
         results = brains.offline_checks()
     except Exception as error:          # noqa: BLE001 - a check that stops says so, it never crashes preflight
-        report.add(FAIL, name, f"the checks stopped: {type(error).__name__}: {short(str(error), 200)}")
+        report.add(FAIL, name, f"NOT VERIFIED: the checks stopped ({type(error).__name__})")
         return
     failed = [f"{label} ({detail})" for label, passed, detail in results if not passed]
     report.add(FAIL if failed else PASS, name, short("; ".join(failed), 400) if failed else f"{len(results)} checks")
@@ -526,7 +574,7 @@ def check_voices_offline(report: Report) -> None:
     try:
         results = voices.offline_checks()
     except Exception as error:          # noqa: BLE001 - a check that stops says so, it never crashes preflight
-        report.add(FAIL, name, f"the checks stopped: {type(error).__name__}: {short(str(error), 200)}")
+        report.add(FAIL, name, f"NOT VERIFIED: the checks stopped ({type(error).__name__})")
         return
     failed = [f"{label} ({detail})" for label, passed, detail in results if not passed]
     report.add(FAIL if failed else PASS, name, short("; ".join(failed), 400) if failed else f"{len(results)} checks")
@@ -538,7 +586,7 @@ def check_ali_memory_offline(report: Report) -> None:
     try:
         results = ali_memory.offline_checks()
     except Exception as error:          # noqa: BLE001 - a check that stops says so, it never crashes preflight
-        report.add(FAIL, name, f"the checks stopped: {type(error).__name__}: {short(str(error), 200)}")
+        report.add(FAIL, name, f"NOT VERIFIED: the checks stopped ({type(error).__name__})")
         return
     failed = [f"{label} ({detail})" for label, passed, detail in results if not passed]
     if (set(server.ALI_MEMORY_BRAINS) != {"anthropic"}
@@ -625,24 +673,15 @@ def check_voice_routes(report: Report, ctx: dict) -> None:
     name = "The voice routes answer: /status, /voice and /voice/speak"
     config = ctx["config"]
     served = {voice: voices.describe(config, voice) for voice in voices.SERVER_VOICES}
-    keys, trouble, answers = voice_keys(config), [], []
-    every = voices.configured_keys(config)          # every key of config.json, of a brain or a voice
-    # The second net: a key as JSON or repr() writes it inside quotes (a '"' or a '\' is escaped), each a key too.
-    forms = every + [json.dumps(key)[1:-1] for key in every] + [repr(key)[1:-1] for key in every]
-
-    def scrubbed(value: object) -> object:
-        """A value from an answer with every key out of each text in it, BEFORE it is written as JSON or repr()."""
-        if isinstance(value, str):
-            return voices.scrub_keys(value, every)
-        if isinstance(value, dict):
-            return {scrubbed(name): scrubbed(item) for name, item in value.items()}
-        if isinstance(value, (list, tuple)):
-            return [scrubbed(item) for item in value]
-        return value
+    # The raw scan of every answer (the body of /status too, and the headers of each POST) looks for EVERY key of
+    # config.json, of a brain, a voice or Ali Memory, as it is and as JSON writes it (key_forms). The scrub is apart,
+    # so a key that the scan finds is never printed.
+    keys, trouble, answers = key_forms(config), [], []
+    forms = key_texts(config)
 
     def shown(text: object, limit: int) -> str:
-        """A text from an answer, as it may be printed: every key out BEFORE the cut (a cut can leave a piece)."""
-        return short(voices.scrub_keys(str(text), forms), limit)
+        """A value from an answer, as it may be printed: every key out BEFORE it is written and cut."""
+        return scrubbed_short(text, limit, forms)
 
     def post(path: str, body: dict, timeout: float = 60) -> tuple[int, dict, bytes, dict]:
         """(status, headers, raw body, the body as JSON or {})."""
@@ -651,7 +690,7 @@ def check_voice_routes(report: Report, ctx: dict) -> None:
             trouble.append(f"NOT VERIFIED (no answer, {got}): POST {path} {short(json.dumps(body), 60)}")
             return 0, {}, b"", {}
         status, headers, raw = got
-        answers.append(raw)
+        answers.extend((raw, " ".join(f"{name}: {value}" for name, value in headers.items()).encode("utf-8", "replace")))
         try:
             parsed = json.loads(raw.decode("utf-8"))
         except ValueError:
@@ -663,17 +702,22 @@ def check_voice_routes(report: Report, ctx: dict) -> None:
         if got and (got != status or parsed.get("ok") is not False or parsed.get("error") != error
                     or not isinstance(parsed.get("answer"), str) or not parsed["answer"].strip()):
             trouble.append(f"POST {path} {short(json.dumps(body), 60)} gave HTTP {got} "
-                           f"{scrubbed(parsed.get('error'))!r}, not {status} {error!r} with a line")
+                           f"{scrubbed(parsed.get('error'), forms)!r}, not {status} {error!r} with a line")
 
-    # /status: the voice block
-    _, status = call_json("GET", "/status")
-    block = status.get("voice")
+    # /status: the voice block. Its raw body goes through the key scan too.
+    _, raw = call("GET", "/status")
+    answers.append(raw)
+    try:
+        status = json.loads(raw.decode("utf-8"))
+    except ValueError:
+        status = {}
+    block = status.get("voice") if isinstance(status, dict) else None
     named = voices.describe(config)
     default = named["name"] if named["has_key"] else "browser"
     if (not isinstance(block, dict) or block.get("default") != default
             or block.get("voices") != voices.describe_all(config)):
         trouble.append(f"/status does not give the voice block {{'default': {default!r}, 'voices': [...]}}: "
-                       f"{shown(json.dumps(scrubbed(block)), 160)}")
+                       f"{shown(block, 160)}")
 
     # /voice: it judges the wish
     refused("/voice", {"name": "kazoo"}, 400, "unknown_voice")
@@ -685,7 +729,7 @@ def check_voice_routes(report: Report, ctx: dict) -> None:
         got, _, _, parsed = post("/voice", {"name": said})
         if got and (got != 200 or parsed.get("ok") is not True or parsed.get("voice") != voices.describe(config, wanted)
                     or not isinstance(parsed.get("answer"), str) or not parsed["answer"].strip()):
-            trouble.append(f"POST /voice {said!r} gave HTTP {got} {scrubbed(parsed.get('error'))!r}, "
+            trouble.append(f"POST /voice {said!r} gave HTTP {got} {scrubbed(parsed.get('error'), forms)!r}, "
                            f"not the {wanted} voice")
 
     # /voice/speak: a bad request is refused before any provider is asked (no key needed, no cost). The voice is
@@ -716,13 +760,13 @@ def check_voice_routes(report: Report, ctx: dict) -> None:
             if got and (got != 200 or headers.get("content-type") != "audio/mpeg" or not voices.looks_like_mp3(raw)
                         or headers.get("x-jarviz-parts") != parts or headers.get("cache-control") != "no-store"):
                 trouble.append(f"POST /voice/speak {short(json.dumps(body), 40)} gave HTTP {got} "
-                               f"{scrubbed(headers.get('content-type'))!r}, "
-                               f"parts {scrubbed(headers.get('x-jarviz-parts'))!r}"
+                               f"{scrubbed(headers.get('content-type'), forms)!r}, "
+                               f"parts {scrubbed(headers.get('x-jarviz-parts'), forms)!r}"
                                + (f": {shown(parsed.get('answer') or '', 160)}" if parsed else ""))
         refused("/voice/speak", {"text": two, "part": 5, "voice": voice}, 400, "bad_speak_request")
         said.append(f"{label}: mp3 ({seen['model']}), 1 and 2 pieces")
     if any(key in raw for key in keys for raw in answers):
-        trouble.append("AN ANSWER SHOWS A VOICE KEY")
+        trouble.append("AN ANSWER SHOWS A KEY OF config.json")
     if trouble:             # an answer that says a key back: the key is out of what is printed
         report.add(FAIL, name, shown("; ".join(trouble), 600))
         return
@@ -735,15 +779,20 @@ def check_voice_routes(report: Report, ctx: dict) -> None:
                   f'say "switch voice to {spec["label"]}".', flush=True)
 
 
+WIN_JUNCTION_TAG = 0xA0000003      # IO_REPARSE_TAG_MOUNT_POINT, a junction (the stat module names it on Windows only)
+
+
 def real_folders(root: Path, folder: Path) -> bool:
     """True when each folder from `root` (resolved) down to `folder` is a real folder: not a link, not a junction (to
     lstat a junction IS a folder on Windows), and the real place of `folder` is the place itself. One link on the way
-    can lead out of the notes folder. A folder that is not there raises FileNotFoundError."""
+    can lead out of the notes folder. A folder that is not there raises FileNotFoundError. A junction is read from the
+    same lstat (its reparse tag, as os.path.isjunction reads it), so this needs no Python 3.12."""
     step = root
     for part in folder.relative_to(root).parts:
         step = step / part
-        mode = step.lstat().st_mode
-        if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode) or os.path.isjunction(step):
+        seen = step.lstat()
+        if (stat.S_ISLNK(seen.st_mode) or not stat.S_ISDIR(seen.st_mode)
+                or getattr(seen, "st_reparse_tag", 0) == WIN_JUNCTION_TAG):     # only Windows has a reparse tag
             return False
     return os.path.normcase(folder.resolve(strict=True)) == os.path.normcase(folder)
 
@@ -843,17 +892,40 @@ class CleanupUnsure(Exception):
     """The delete stopped half way. The text says where things are now, by their paths in the notes folder."""
 
 
-def _put_back(folder: int, hidden: str, name: str) -> bool:
+def _put_back(folder: int, hidden: str, name: str) -> bool | None:
     """Move what sits at `hidden` back to `name` (both in the open `folder`), never over another file. Only a hard link
     does that in one step: it cannot replace a name. Where there is none (a folder, a file system without links), it
     stays at the hidden name: a check that the name is free, then a rename, could still write over a file made in
-    between (os.rename replaces, and Python has no rename that refuses). True when it is back."""
+    between (os.rename replaces, and Python has no rename that refuses). True when it is back, None when it is back
+    but the hidden name could not be removed (one file under both names), False when it stays at the hidden name."""
     try:
         os.link(hidden, name, src_dir_fd=folder, dst_dir_fd=folder, follow_symlinks=False)
     except (OSError, NotImplementedError):
         return False                                    # the name is taken, or no link here: it stays hidden
-    os.unlink(hidden, dir_fd=folder)
+    try:
+        os.unlink(hidden, dir_fd=folder)
+    except OSError:
+        return None
     return True
+
+
+def _write_back(folder: int, name: str, handle: int, mode: int) -> str:
+    """After the delete: what the open file `handle` holds NOW, written to a NEW file `name` in the open `folder`
+    (O_EXCL: never over a file), or when that name is taken, to a new random name beside it. Says where it went."""
+    for at in (name, f".{secrets.token_hex(16)}.preflight-kept"):
+        try:
+            out = os.open(at, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode, dir_fd=folder)
+        except FileExistsError:
+            continue
+        try:
+            os.lseek(handle, 0, os.SEEK_SET)
+            while piece := memoryview(os.read(handle, 65536)):
+                while piece:
+                    piece = piece[os.write(out, piece):]
+        finally:
+            os.close(out)
+        return at
+    raise FileExistsError(errno.EEXIST, "both names are taken")
 
 
 def _folder_delete(root: Path, target: Path, born: str, between=None) -> tuple[bool | None, str]:
@@ -863,13 +935,18 @@ def _folder_delete(root: Path, target: Path, born: str, between=None) -> tuple[b
     2. Every folder from "/" down is opened with O_NOFOLLOW: no link ANYWHERE on the way is followed (a parent of the
        vault swapped for a link raises ELOOP). The vault and each folder below must be the very one that was checked.
     3. The file is opened in the last folder; its bytes must be `born`. That fd stays open to the end.
-    4. It is moved to a new random hidden name in the same folder, 5. what sits there now must be the file of that fd
-       (a name replaced before the move is put back and raises CleanupUnsure), 6. that hidden name is unlinked.
+    4. It is moved to a new random hidden name in the same folder, 5. what sits there now must be the file of that fd,
+       and its bytes, read again through that fd, must still be `born` (an edit in place keeps the inode). Else it is
+       put back and raises CleanupUnsure. 6. That hidden name is unlinked. 7. The bytes are read once more through
+       the fd: POSIX cannot refuse a write of a process that holds the file open, but a write that came in the
+       instant before the unlink shows there. Then what the file holds is written back (never over a file) and
+       CleanupUnsure is raised: the delete is confirmed only for bytes that were `born` when the name went.
     What remains: a process that watches the folder sees the hidden name after the move and could swap it in the
     instant before the unlink. Nobody can guess the name before. And it is harmless: unlink(hidden, dir_fd=folder)
     removes only that one name in the folder that was bound by its identity, never what a link points at, so it can
-    only remove what that process put there itself, never a file outside the notes folder. The same answers as
-    _handle_delete, and "moved"."""
+    only remove what that process put there itself, never a file outside the notes folder. A process that held the
+    file open can still write into it after the unlink: into a file that has no name any more, as after any delete.
+    The same answers as _handle_delete, and "moved"."""
     parts = target.relative_to(root).parts
     inner, name = parts[:-1], parts[-1]
     checked, step = [], root
@@ -896,6 +973,15 @@ def _folder_delete(root: Path, target: Path, born: str, between=None) -> tuple[b
         fds.append(os.open(name, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0), dir_fd=folder))
         handle = fds[-1]
         opened = os.fstat(handle)
+
+        def bytes_now() -> bool | None:
+            """The bytes of the held file, read again from its start, are still `born`; None: they could not be read."""
+            try:
+                os.lseek(handle, 0, os.SEEK_SET)
+                return _fixture_bytes_ok(lambda: os.read(handle, 65536), born)
+            except OSError:
+                return None
+
         if ((opened.st_dev, opened.st_ino) != (seen.st_dev, seen.st_ino) or not stat.S_ISREG(opened.st_mode)
                 or not _fixture_bytes_ok(lambda: os.read(handle, 65536), born)):
             return False, "changed"
@@ -915,14 +1001,30 @@ def _folder_delete(root: Path, target: Path, born: str, between=None) -> tuple[b
             now = None          # WSL's /mnt drives show a moved file again only once it is closed: no check, no delete
         mine = (now is not None and stat.S_ISREG(now.st_mode)
                 and (now.st_dev, now.st_ino) == (opened.st_dev, opened.st_ino))
-        if mine:
+        again = bytes_now() if mine else None           # an edit in place keeps the inode: the bytes are read again
+        if again:
             try:
                 os.unlink(hidden, dir_fd=folder)
-                return True, ""
             except OSError as error:
                 trouble = (f"the test note at {where} could not be removed after it was moved for the delete "
                            f"({error.strerror or type(error).__name__})")
-        elif now is None:
+            else:
+                after = bytes_now()                     # a write before the unlink shows in the file that is held
+                if after:
+                    return True, ""
+                if after is None:
+                    raise CleanupUnsure(f"the test note at {where} was removed, but its bytes could not be read again "
+                                        "after the delete, so whether a write came in that instant is not known")
+                try:                                    # a write came in the instant before the delete: it goes back
+                    kept = "/".join((*inner, _write_back(folder, name, handle, stat.S_IMODE(opened.st_mode))))
+                except OSError as error:
+                    raise CleanupUnsure(f"the test note at {where} was changed in the instant it was removed, and what "
+                                        f"it held then could not be written back ({error.strerror or type(error).__name__})")
+                raise CleanupUnsure(f"the test note at {where} was changed in the instant it was removed, and what it "
+                                    f"held then was written back to {kept}: look at it, and remove it by hand")
+        elif again is False:
+            trouble = f"the test note at {where} was changed while it was being removed"
+        elif now is None or mine:                       # mine, but its bytes could not be read again
             trouble = f"the test note at {where} could not be checked again after it was moved for the delete"
         else:
             trouble = f"another file took the place of the test note at {where} right before the delete"
@@ -931,7 +1033,9 @@ def _folder_delete(root: Path, target: Path, born: str, between=None) -> tuple[b
             back = _put_back(folder, hidden, name)
         except OSError:
             back = False
-        raise CleanupUnsure(f"{trouble}, and " + ("it was put back there" if back else f"it was left at {hidden_at}")
+        raise CleanupUnsure(f"{trouble}, and " + ("it was put back there" if back else
+                                                  f"it was put back there, and it is at {hidden_at} too (one file "
+                                                  "under both names)" if back is None else f"it was left at {hidden_at}")
                             + ("; where the test note went is not known" if now is not None and not mine
                                else ": remove it by hand"))
     finally:
@@ -1431,8 +1535,12 @@ def _take_back_steps(notes_dir: Path, trouble: list[str]) -> None:
         os.replace(file, path)
 
     # (f) A clean take-back: the note is gone, no .taken file is left, the links are a full rebuild's.
+    made = (receipt["vault"], receipt["file"])          # Galaxy._born is keyed by the vault and the path
+    if made not in galaxy._born:
+        trouble.append("(f) the note has no fingerprint under its vault and path before the take-back, so the check "
+                       "of its fingerprint proves nothing")
     galaxy.unbirth(receipt)
-    if path.exists() or waiting() or receipt["file"] in galaxy._born:
+    if path.exists() or waiting() or made in galaxy._born:
         trouble.append("(f) after a clean take-back, the file, a .taken file or its fingerprint is left")
     if receipt["title"] in [note.label for note in galaxy.notes]:
         trouble.append("(f) after a clean take-back, the note is still in the index")
@@ -1477,7 +1585,7 @@ def _take_back_steps(notes_dir: Path, trouble: list[str]) -> None:
     expect("(e) a take-back of a changed file", ValueError, lambda: galaxy.unbirth(receipt))
     if state() != before or not path.is_file() or path.read_bytes() != edited or waiting():
         trouble.append("(e) a changed file or its note did not stay as it was")
-    galaxy._born.pop(receipt["file"], None)
+    galaxy._born.pop((receipt["vault"], receipt["file"]), None)
     path.write_bytes(b"# Teardown edited\n\nJarviz wrote this.\n")
     expect("(e) a take-back of a note with no fingerprint", ValueError, lambda: galaxy.unbirth(receipt))
     if state() != before or not path.is_file() or waiting():
@@ -1654,9 +1762,9 @@ def check_brain_choice_saved(report: Report) -> None:
 
 def _mode_steps(trouble: list[str]) -> str:
     """config.json holds the keys. Run inside check_brain_choice_saved, with server.CONFIG_PATH in a temporary folder:
-    (d) on a Mac or Linux, with the usual umask 022: a config.json of mode 0600 stays 0600 after a change of brain, and
-    its staging copy is never wider than 0600, from the moment it is made to the replace; one of mode 0644 stays 0644;
-    a new starter config.json is made 0600. Returns the words for the check's detail. Windows keeps no owner-only bits:
+    (d) on a Mac or Linux, with the usual umask 022: after a change of brain a config.json keeps only the OWNER's bits
+    of its mode (0600 stays 0600, 0644 becomes 0600), and its staging copy is owner-only from the moment it is made to
+    the replace; a new starter config.json is made 0600. Returns the words for the check's detail. Windows keeps no owner-only bits:
     then the words say that this part was not checked (a check that cannot look says so)."""
     if os.name == "nt" or not hasattr(os, "fchmod") or not hasattr(os, "umask"):
         return "the file modes (0600) were NOT checked: Windows keeps no owner-only bits"
@@ -1682,13 +1790,14 @@ def _mode_steps(trouble: list[str]) -> str:
             os.chmod(config, start)
             seen.clear()
             server.save_brain_choice("deepseek")
-            after = stat.S_IMODE(os.stat(config).st_mode)
-            if after != start:
-                trouble.append(f"(d) a config.json of mode {start:o} became {after:o} after a change of brain")
-            if len(seen) != 2 or seen[0] & ~0o600 or seen[1] & ~start:
+            after, wanted = stat.S_IMODE(os.stat(config).st_mode), start & 0o700     # only the owner's bits stay
+            if after != wanted:
+                trouble.append(f"(d) a config.json of mode {start:o} became {after:o} after a change of brain, "
+                               f"not {wanted:o}")
+            if len(seen) != 2 or seen[0] & ~0o600 or seen[1] != wanted:
                 trouble.append(f"(d) the staging copy of a {start:o} config.json had the modes "
                                f"{[format(mode, 'o') for mode in seen]} (made, before the replace): "
-                               f"it must be made 600 and never be wider than {start:o}")
+                               f"it must be made 600 at most and be {wanted:o} (owner only) before the replace")
         config.unlink()
         server.write_starter_config()
         made = stat.S_IMODE(os.stat(config).st_mode)
@@ -1697,7 +1806,8 @@ def _mode_steps(trouble: list[str]) -> str:
     finally:
         os.open, os.replace = real_open, real_replace
         os.umask(umask)
-    return "a 0600 config.json stays 0600, its staging copy is never wider, and a new one is made 0600"
+    return ("a 0600 config.json stays 0600 and a 0644 one becomes 0600, its staging copy is owner-only from the "
+            "moment it is made to the replace, and a new one is made 0600")
 
 
 def _staging_steps(folder: Path, trouble: list[str]) -> None:
@@ -2094,6 +2204,14 @@ def check_signature_once(report: Report) -> None:
                "the time is read inside the lock")
 
 
+RELOAD_JOIN_S = 2.0                # how long a step of check_sources_stay_true waits for each of its reload workers
+
+
+class ReloadStillRunning(Exception):
+    """A reload worker of check_sources_stay_true was still alive after its join: it could still write the shared
+    test galaxy (its notes and build_id) into a later step, so what comes after proves nothing."""
+
+
 def check_sources_stay_true(report: Report) -> None:
     """The sources of a reply are the notes the brain was SHOWN, by their identity (note_id: the notes folder, the
     path, the creation), also when a new index comes in: (1) two notes with the same title in two folders that swap
@@ -2166,6 +2284,15 @@ def check_sources_stay_true(report: Report) -> None:
             def ask_chat() -> dict:
                 return server.chat_route({"message": "What is Foo?", "session": session_id})[1]
 
+            def settle(step: str, workers: list) -> None:
+                """Every reload worker of a step has ended before the shared galaxy is set for the next step. One that
+                is still alive after its join could write galaxy.notes and galaxy.build_id into it: then the check
+                stops here (NOT VERIFIED), before any new seed."""
+                for worker in workers:
+                    worker.join(RELOAD_JOIN_S)
+                if any(worker.is_alive() for worker in workers):
+                    raise ReloadStillRunning(step)
+
             # (1) Foo.md of shop a and of shop b swap places while the brain thinks: index 0 is another note now.
             galaxy.notes[:], galaxy.build_id = [foo_a, foo_b], "one"
             server.ask_model = brain(during=galaxy.notes.reverse)
@@ -2191,8 +2318,7 @@ def check_sources_stay_true(report: Report) -> None:
             server.ask_model = brain()
             ask_chat()
             del galaxy.search
-            for worker in workers:
-                worker.join(2.0)
+            settle("(2)", workers)
             if not sent or "roaster" not in sent[-1] or "grinder" in sent[-1]:
                 trouble.append("(2) a reload between the search and the render changed the note the brain was sent")
             # (3) A reload comes between the check of the sources and the read of the graph numbers.
@@ -2207,8 +2333,7 @@ def check_sources_stay_true(report: Report) -> None:
             galaxy.meta = meta_after_reload
             body = ask_chat()
             del galaxy.meta
-            for worker in workers:
-                worker.join(2.0)
+            settle("(3)", workers)
             if body.get("nodes") != [0] or (body.get("graph") or {}).get("build_id") != "three":
                 trouble.append(f"(3) the sources and the graph numbers come from two states: nodes {body.get('nodes')}, "
                                f"build {(body.get('graph') or {}).get('build_id')}")
@@ -2217,8 +2342,7 @@ def check_sources_stay_true(report: Report) -> None:
             galaxy.meta = meta_after_reload
             found = server.search_route({"q": ["foo"]})[1]
             del galaxy.meta
-            for worker in workers:
-                worker.join(2.0)
+            settle("(4)", workers)
             labels = [hit.get("label") for hit in found.get("results", [])]
             if labels != ["Foo"] or (found.get("graph") or {}).get("build_id") != "four":
                 trouble.append(f"(4) /search mixed two states: {labels}, build {(found.get('graph') or {}).get('build_id')}")
@@ -2274,6 +2398,9 @@ def check_sources_stay_true(report: Report) -> None:
             if free:
                 trouble.append(f"NOT VERIFIED: the reload of {', '.join(dict.fromkeys(free))} found the lock free, so the "
                                "snapshot did not hold it and those steps prove nothing")
+    except ReloadStillRunning as error:
+        trouble.append(f"NOT VERIFIED: a reload of step {error} was still running {RELOAD_JOIN_S:g} s after its step, "
+                       "so the check stopped before the shared galaxy was used again")
     except Exception as error:                          # noqa: BLE001 - a check that stops says so, it never crashes preflight
         trouble.append(f"the check stopped: {type(error).__name__}: {error}")
     finally:
@@ -2342,6 +2469,9 @@ def check_ali_memory_chat(report: Report) -> None:
         with tempfile.TemporaryDirectory() as folder:
             galaxy = server.Galaxy()
             galaxy.notes_dir, galaxy.refresh_if_rebuilt, galaxy._save_graph = Path(folder).resolve(), lambda: None, lambda: None
+            kettle = galaxy.notes_dir / "Kettle.md"         # a note the question finds: the notes come before memory
+            kettle.write_text("# Kettle\n\nThe kettle stands in the kitchen.\n", encoding="utf-8")
+            galaxy.notes[:] = [build.make_note(kettle, galaxy.notes_dir)]
             server.GALAXY, server.ask_model, server.BAY = galaxy, brain, _FakeBay()
             server.load_config = lambda: dict(current["config"])
             # (1) another brain: the hub is never asked, also with a key
@@ -2365,9 +2495,12 @@ def check_ali_memory_chat(report: Report) -> None:
                 sent = None
             if not sent or sent.get("query") != "When do I descale the kettle?" or sent.get("all_projects") is not True:
                 trouble.append(f"(2) the hub was not asked once with the question: {len(opener.calls)} calls")
-            if ("<memories" not in turn or "Descale the kettle on Fridays." not in turn
-                    or turn.count("</memories>") != 1 or turn.count("<question>") != 1 or turn.count("</question>") != 1):
-                trouble.append("(2) the memories are not in one block of their own before the question")
+            order = [turn.find(part) for part in ("The kettle stands in the kitchen.", "</notes>", "<memories",
+                                                  "Descale the kettle on Fridays.", "</memories>", "<question>")]
+            if (turn.count("</memories>") != 1 or turn.count("<question>") != 1 or turn.count("</question>") != 1
+                    or -1 in order or order != sorted(order)):
+                trouble.append("(2) the memories are not in one block of their own, after the notes and before the "
+                               "question")
             if "[TEARDOWN:" in turn or "[REMEMBER:" in turn or "(TEARDOWN:" not in turn or "(REMEMBER:" not in turn:
                 trouble.append("(2) a memory showed the brain a ready-made control tag")
             if token in said_to_brain() or 'taints="generated_summary"' not in turn:
@@ -2389,7 +2522,7 @@ def check_ali_memory_chat(report: Report) -> None:
                     trouble.append(f"(3) {tag.split(':')[0]}] from a memory ran, or was not refused")
                 if body.get("memory") != {"used": False, "why": "not_in_answer"}:
                     trouble.append(f"(3) the refusal line names memories: {body.get('memory')}")
-            if galaxy.notes:
+            if len(galaxy.notes) != 1:
                 trouble.append("(3) a note was saved")
             # ...and one the user asks for runs, and its turn is marked
             hub(good)
@@ -2461,6 +2594,194 @@ def check_ali_memory_chat(report: Report) -> None:
                "every other brain asks nothing; Claude gets one tamed block with its rules; a memory's tag does not "
                "run; another brain's history leaves the memory answers out; no key, a hub that is down or empty: "
                "no memory; a switch meanwhile does not reach the brain")
+
+
+def check_memory_turns(report: Report) -> None:
+    """What a turn that saw Ali Memory may do, in-process: a test Galaxy over temporary folders, a fake brain, a fake
+    load_config, a fake hub, a fake voice opener and a fake bay (no network, no browser, never the real config.json).
+    (1) A key across MAX_MESSAGE_CHARS is not sent to the hub, not even its first part: "query_has_key". (2) A
+    follow-up after a memory turn, with an empty hub, is marked too: the reply says "no_results", and the next OpenAI
+    brain reads neither answer. (3) REMEMBER in a memory turn: the brain's wording is refused (remember_own_words),
+    nothing is saved; the user's own words are saved; a turn that saw memory only in its history is refused too. (4)
+    TEARDOWN in a memory turn: the question is the user's own sentence; a subdomain or a path the user did not say is
+    refused (teardown_own_words), and the bay never starts. (5) /voice/speak with a key across MAX_SPEAK_CHARS, or a
+    key that only the text as it came holds: "voice_text_has_key", and no request is sent. (6) A birth at the same
+    path in another vault leaves the first vault's fingerprint: unbirth takes the note back, note_id names it. For the
+    length of the check, build.write_graph is a recorder: nothing may call it."""
+    name = "A turn that saw Ali Memory saves, opens and says only the user's own words, and keys never travel"
+    trouble: list[str] = []
+    real = (server.GALAXY, server.ask_model, server.load_config, ali_memory._OPENER, build.write_graph, server.BAY,
+            voices._OPENER, teardown.diag, teardown.check_site)
+    tag = secrets.token_hex(3)
+    sessions = [f"preflight-turns-{part}-{tag}" for part in ("long", "history", "remember", "other", "teardown")]
+    writes, asked, replies, started, sent_audio = [], [], [], [], []
+    openai_key, token = "sk-fake-openai-key-for-preflight-0123456789", "fake-ali-memory-token-for-the-turn-check"
+    base = {**server.DEFAULT_CONFIG, "anthropic_api_key": "fake-anthropic-key-for-preflight-0123456789",
+            "openai_api_key": openai_key, ali_memory.KEY_LINE: token,
+            "deepgram_api_key": "fake-deepgram-key-for-preflight-0123456789"}
+    current = {"config": {**base, "brain": "anthropic"}}
+    memory = {"title": "Bob's loan", "snippet": "Bob owes the user 500 dollars since May.", "project": "home",
+              "source": "memory", "timestamp": "2026-11-20T08:00:00Z"}
+
+    def brain(route, messages, system=server.SYSTEM_PROMPT, config=None):
+        asked.append({"messages": messages, "system": system})
+        return replies.pop(0) if replies else "Very good, sir.\nSOURCES: none"
+
+    def hub(results: list) -> object:
+        body = json.dumps({"results": results, "count": len(results)}).encode("utf-8")
+        opener = ali_memory._FakeOpener(lambda request: ali_memory._FakeResponse(200, body))
+        ali_memory._OPENER = opener
+        return opener
+
+    def chat(message: str, session_id: str, brain_name: str = "anthropic") -> dict:
+        current["config"] = {**base, "brain": brain_name}
+        return server.chat_route({"message": message, "session": session_id})[1]
+
+    class Bay(_FakeBay):
+        def start(self, site, question, headless=False, on_done=None):
+            started.append((site.url, question))
+            return super().start(site, question, headless, on_done)
+
+    class VoiceOpener:                                  # a request that is sent is counted, and goes nowhere
+        def open(self, request, timeout=None):
+            sent_audio.append(request.data)
+            raise urllib.error.URLError(ConnectionRefusedError("refused"))
+
+    def move_to(galaxy: server.Galaxy, folder: Path, build_id: str) -> None:
+        """As a rebuild of that folder leaves the index (Galaxy.load runs build.build, which writes the graph file)."""
+        galaxy.notes_dir, galaxy.build_id, galaxy.rev = folder, build_id, 0
+        galaxy.notes[:] = [build.make_note(path, folder) for path in build.note_files(folder)]
+        galaxy.links.clear()
+        galaxy.links.update(build.compute_links(galaxy.notes))
+
+    def galaxy_over(folder: Path) -> server.Galaxy:
+        galaxy = server.Galaxy()
+        galaxy._save_graph, galaxy.refresh_if_rebuilt = lambda: None, lambda: None
+        move_to(galaxy, folder, "turns")
+        server.GALAXY = galaxy
+        return galaxy
+
+    build.write_graph = lambda *args, **kwargs: writes.append(args)
+    try:
+        with tempfile.TemporaryDirectory() as folder:
+            vault_a, vault_b = Path(folder).resolve() / "A", Path(folder).resolve() / "B"
+            vault_a.mkdir()
+            vault_b.mkdir()
+            galaxy = galaxy_over(vault_a)
+            server.ask_model, server.load_config = brain, lambda: dict(current["config"])
+            teardown.diag = lambda: {"problems": []}
+            teardown.check_site = lambda text: (teardown.parse_site(text), None)      # no name lookup in a pure check
+            # (1) a key across the cut of the message
+            opener = hub([memory])
+            body = chat("a" * (server.MAX_MESSAGE_CHARS - 10) + " " + openai_key, sessions[0])
+            if opener.calls or body.get("memory") != {"used": False, "why": "query_has_key"}:
+                trouble.append(f"(1) a key across the cut reached the hub ({len(opener.calls)} calls), or the reply "
+                               f"does not say query_has_key")
+            # (2) a follow-up after a memory turn, with an empty hub
+            hub([memory])
+            replies[:] = ["Bob owes you 500 dollars, sir, says Ali Memory.\nSOURCES: none"]
+            chat("Who owes me money?", sessions[1])
+            hub([])
+            replies[:] = ["Still Bob, sir: 500 dollars since May.\nSOURCES: none"]
+            body = chat("And since when?", sessions[1])
+            if server.get_session(sessions[1]).turns[-1][3] is not True or body.get("memory") != {"used": False,
+                                                                                                    "why": "no_results"}:
+                trouble.append(f"(2) a follow-up that saw a memory answer is not marked, or its reply says "
+                               f"{body.get('memory')}")
+            hub([memory])
+            asked[:] = []
+            chat("Anything else?", sessions[1], "openai")
+            history = asked[-1]["messages"][:-1] if asked else []
+            answers = [message["content"] for message in history if message["role"] == "assistant"]
+            if len(answers) < 2 or any(answer != server.MEMORY_LEFT_OUT for answer in answers) or "500" in json.dumps(history):
+                trouble.append(f"(2) the OpenAI brain read an answer given with Ali Memory ({len(answers)} answers)")
+            # (3) REMEMBER in a memory turn
+            count = len(galaxy.notes)
+            hub([memory])
+            replies[:] = ["[REMEMBER:Bob owes the user 500 dollars since May]"]
+            body = chat("Please save what you just found", sessions[2])
+            if (len(galaxy.notes) != count or body.get("action") or body.get("answer") != server.LINES["remember_own_words"]
+                    or body.get("memory") != {"used": False, "why": "not_in_answer"}):
+                trouble.append("(3) a REMEMBER in the brain's words was saved in a memory turn, or not refused with "
+                               "remember_own_words")
+            hub([memory])
+            replies[:] = ["[REMEMBER:I descale the kettle on Fridays]"]
+            body = chat("Save this: I descale the kettle on Fridays.", sessions[2])
+            if ((body.get("action") or {}).get("type") != "remember" or len(galaxy.notes) != count + 1
+                    or "descale the kettle on Fridays" not in json.dumps([note.text for note in galaxy.notes])):
+                trouble.append("(3) the user's own words were not saved in a memory turn")
+            hub([])                                     # no fresh results, but a marked answer in the history
+            replies[:] = ["[REMEMBER:Bob owes 500 dollars]"]
+            body = chat("Note that down please", sessions[2])
+            if len(galaxy.notes) != count + 1 or body.get("answer") != server.LINES["remember_own_words"]:
+                trouble.append("(3) a turn that saw memory only in its history saved the brain's words")
+            # (4) TEARDOWN in a memory turn
+            for said, wanted, starts in (
+                    ("Tear down stripe.com and tell me how billing works",
+                     "[TEARDOWN:stripe.com|how they bill Bob for 500 dollars]", True),
+                    ("Tear down stripe and tell me how it is built", "[TEARDOWN:bob-owes-500.stripe.com|how it is built]",
+                     False),
+                    ("Tear down stripe dot com and tell me how it is built",
+                     "[TEARDOWN:stripe.com/pricing?who=bob|how it is built]", False)):
+                server.BAY, started[:] = Bay(), []
+                hub([memory])
+                replies[:] = [wanted]
+                body = chat(said, sessions[4])
+                if starts and (len(started) != 1 or started[0][1] != said):
+                    trouble.append(f"(4) a teardown in a memory turn did not take the user's own sentence: {started}")
+                if not starts and (started or body.get("answer") != server.LINES["teardown_own_words"]):
+                    trouble.append(f"(4) a teardown in a memory turn opened an address the user did not say: {started}")
+            # (5) /voice/speak: a key in the text as it came
+            voices._OPENER = VoiceOpener()
+            current["config"] = {**base, "brain": "anthropic"}
+            text = ("Word " * ((server.MAX_SPEAK_CHARS - 10) // 5)).strip() + " " + openai_key + " end."
+            pieces = voices.split_text(server.clean_text(text, server.MAX_SPEAK_CHARS))
+            sent_audio[:] = []
+            answer = server.voice_speak_route({"text": text, "voice": "deepgram", "part": len(pieces) - 1})
+            if sent_audio or answer[0] != 503 or answer[1].get("error") != "voice_text_has_key":
+                trouble.append(f"(5) a key across MAX_SPEAK_CHARS was not refused: {len(sent_audio)} requests")
+            odd = "fake-brain-key\twith-a-tab-0123456789"
+            current["config"] = {**base, "brain": "anthropic", "venice_api_key": odd}
+            sent_audio[:] = []
+            answer = server.voice_speak_route({"text": f"Hello {odd} there.", "voice": "deepgram", "part": 0})
+            if sent_audio or answer[1].get("error") != "voice_text_has_key":
+                trouble.append(f"(5) a key that only the text as it came holds was not refused: {len(sent_audio)} requests")
+            current["config"] = {**base, "brain": "anthropic"}
+            sent_audio[:] = []
+            server.voice_speak_route({"text": "Good evening, sir.", "voice": "deepgram", "part": 0})
+            if len(sent_audio) != 1:
+                trouble.append(f"(5) a plain line was not sent once: {len(sent_audio)} requests")
+            # (6) the same path in two vaults: each keeps its own fingerprint
+            galaxy = galaxy_over(vault_a)
+            receipt_a = galaxy.birth_note("teardowns/Same.md", "# Same\n\nWritten in vault A.\n")
+            move_to(galaxy, vault_b, "turns, vault B")
+            galaxy.birth_note("teardowns/Same.md", "# Same\n\nWritten in vault B, other bytes.\n")
+            move_to(galaxy, vault_a, "turns, vault A again")
+            with galaxy.lock:
+                seen = [server.note_id(note)[2] for note in galaxy.notes if note.path == "teardowns/Same.md"]
+            if seen != [receipt_a["born"]]:
+                trouble.append("(6) after a birth at the same path in another vault, note_id does not name the first "
+                               "vault's creation")
+            try:
+                galaxy.unbirth(receipt_a)
+            except (ValueError, OSError) as error:
+                trouble.append(f"(6) the first vault's note could not be taken back ({type(error).__name__})")
+            if (vault_a / "teardowns" / "Same.md").exists() or not (vault_b / "teardowns" / "Same.md").exists():
+                trouble.append("(6) the take-back did not remove the first vault's note, or touched the other vault")
+    except Exception as error:                          # noqa: BLE001 - a check that stops says so, it never crashes preflight
+        trouble.append(f"the check stopped: {type(error).__name__}")
+    finally:
+        (server.GALAXY, server.ask_model, server.load_config, ali_memory._OPENER, build.write_graph, server.BAY,
+         voices._OPENER, teardown.diag, teardown.check_site) = real
+        with server.SESSIONS_LOCK:
+            for session_id in sessions:
+                server.SESSIONS.pop(session_id, None)
+    if writes:
+        trouble.append(f"build.write_graph was called {len(writes)} times: nothing may write here")
+    report.add(FAIL if trouble else PASS, name, "; ".join(trouble) or
+               "a key across the cut never reaches the hub; a follow-up of a memory turn is marked and hidden from "
+               "another brain; a memory turn saves and opens only what the user said; a key in the text as it came is "
+               "never spoken; each vault keeps its own fingerprints")
 
 
 def check_ali_memory_key_scans(report: Report) -> None:
@@ -3310,7 +3631,8 @@ def main() -> int:
                 (check_ali_memory_key, ctx), (check_voice_routes, ctx), (check_remember, ctx), (check_links_stay_true,), (check_take_back_safe,),
                 (check_notes_dir_follows_config,), (check_brain_choice_saved,), (check_build_survives,),
                 (check_teardown_one_folder,), (check_teardown_receipt_turn,), (check_teardown_cancel,),
-                (check_signature_once,), (check_sources_stay_true,), (check_ali_memory_chat,), (check_served_files,),
+                (check_signature_once,), (check_sources_stay_true,), (check_ali_memory_chat,), (check_memory_turns,),
+                (check_served_files,),
                 (check_config_hidden, ctx), (check_ali_memory_key_scans,),
                 (check_other_sites,), (check_lock,), (check_persona_home,), (check_pinned_libraries,),
                 (check_voice_rules, ctx), (check_page_rules, ctx), (check_tag_intent,), (check_teardown_kit,),

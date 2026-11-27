@@ -65,7 +65,8 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
   left, and never reads it. A file that holds keys is made for its owner only (mode 0600, `_new_private_file`),
   and a brain switch never makes `config.json` readable for more people than before: the staging file takes only the
   OWNER's permission bits of config.json (`_same_mode_as`), so it is owner-only until the replace (0644 becomes
-  0600, 0600 stays 0600).
+  0600, 0600 stays 0600). Preflight (`_mode_steps`) expects exactly the owner's bits after a switch, and the staging
+  file owner-only both when it is made and before the replace.
 - Preflight proves a brain with one very small real question on the same path as `ask()` (route `"probe"` in
   `EFFORT` and `TIMEOUT_S`). A model list does not prove that a key may ask the model. The answer must have the
   shape of a completion: an empty text is fine for the tiny budget, a missing envelope is a fail. For the Responses
@@ -96,12 +97,16 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
 - The trap looks twice: a run with no evidence is run once more (`_prove_twice`). A weak run never replaces a
   strong proof of the same version and recipe (`_record_proof`). The check and the write are one step under
   `_record_held` (a system lock on `brain-locks.json.lock`), so a strong proof that another process writes in between
-  is never lost. A False verdict always replaces the record.
+  is never lost. A False verdict always replaces the record. A stricter rule for judging an agy run raises
+  `AGY_PROOF_REVISION`, which is part of the agy recipe, so an older agy proof is proved again. The Codex recipe does
+  not hold it.
   `check_brain_locks` tries once more when the trap could not look. Two times "could not look" is a FAIL.
 - An agy run that never started (`cli_not_started`: the backend gave no conversation) is tried again, at most
   `CLI_START_TRIES` times, in `_cli_call` only. A run that started is never asked twice. All tries of a sign-in call
-  stay inside the route's timeout, the removal of their rooms too (`_remove_room(room, until)`; a held room goes to
-  the background thread). Only the stop of a tool that ran out of time (`_stop_tree`) has its own bounded budget: a
+  stay inside the route's timeout: ONE deadline for the whole call (`_cli_call` gives it to `_cli_call_once`). The
+  making of a room counts too: the tool gets only what is left right before its start, and with nothing left it never
+  starts (`cli_timeout`). The removal of their rooms stays inside it too (`_remove_room(room, deadline)`; a held room
+  goes to the background thread). Only the stop of a tool that ran out of time (`_stop_tree`) has its own bounded budget: a
   tool is never left running.
 - agy must say at the start of EVERY run that it took the lock (`AGY_INIT`: permission mode `strict`, agent
   `jarviz-brain`). A run that started without those words is `cli_not_locked`, and its answer is thrown away.
@@ -151,23 +156,42 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
   `http://localhost:<port>` (`ali_memory.parse_url`). The request always connects to 127.0.0.1
   (`_LoopbackConnection`), never through a proxy (`ProxyHandler({})`), and never after a redirect (`_NoRedirect`).
   The question goes in the JSON body only (`all_projects: true`, `limit: 3`), never in the address. A question that
-  holds a key of `config.json` is not sent.
+  holds a key of `config.json` is not sent. `recall_memory` checks the WHOLE message as it came and in its one-line
+  form (`holds_key`) before the hub is asked. The cut to `MAX_MESSAGE_CHARS` can split a key, and
+  `ali_memory.recall` sees only the cut question.
 - A recall has ONE budget (`BUDGET_S`) for the connect, the request and the read, and a short connect
-  (`CONNECT_TIMEOUT_S`). `recall()` never raises: every outcome is a code of `ali_memory.STATUS`. On any failure the
-  chat answers without Ali Memory, and says nothing about it.
+  (`CONNECT_TIMEOUT_S`). It is ONE deadline from the start of `recall()`: the request carries it to
+  `_LoopbackConnection`, and its `_BudgetSocket` gives the connect and every send and read only the time left, so a
+  hub that sends a byte at a time cannot hold a recall. `_within` uses an answer only when it was done by the
+  deadline, also when it is there before the waiting side looks, and waits `UNWIND_S` more for the helper thread to
+  end: no helper thread and no socket of a recall outlives it. `recall()` never raises: every outcome is a code of
+  `ali_memory.STATUS`. On any failure the chat answers without Ali Memory, and says nothing about it.
 - What Ali Memory sends back is data from a stranger. Types and lengths are checked: at most 3 results; title 120,
   snippet 1,200, project 60, source 40 characters. Every text becomes one clean line (`_clean`), and every key of
-  `config.json` is taken out before and after the cut.
+  `config.json` is taken out of the text as it is, and again after it became one line (a key said back with other
+  whitespace; each key also as one line: `voices.one_line_keys`), both before the cut, and once more after it.
 - Memory text reaches the brain only in its own `<memories>` block (`memory_block`), after the notes and before the
   question, with `MEMORY_RULES` added to the system prompt. Every text goes through `tame`, as note text does: no
   ready-made control tag, no forged block. A memory has a label (`M1`), never a number: the SOURCES line names notes
   only. A memory never orders an action: a tag runs only when the user's own sentence asks for it (`TAG_INTENT`).
-- A turn is marked when the brain was shown Ali Memory: the fourth element of a turn, set with `memory=` in
-  `Session.record` and `Session.draft`, also for the turn of a tag it led to. `Session.snapshot(with_memory=False)`
+  Preflight proves the order with a note fixture: the notes, then `<memories>`, then the question.
+- A turn is marked when the brain was shown Ali Memory: fresh results, or an answer in its history that was given
+  with it (the last value of `Session.snapshot`, only `with_memory`). The new answer can repeat it, so a tag it leads
+  to is marked too. `MEMORY_RULES` and the reply's `memory` field go with fresh results only. The mark is the fourth
+  element of a turn, set with `memory=` in `Session.record` and `Session.draft`. `Session.snapshot(with_memory=False)`
   puts `MEMORY_LEFT_OUT` in place of the answer of each marked turn. Only a brain in `ALI_MEMORY_BRAINS` gets
   `with_memory=True`. The user's own words and the receipts stay. Chat history stays plain text.
+- In a turn with Ali Memory (fresh, or in the history), a tag carries only the user's own words. A REMEMBER fact must
+  stand in the user's sentence (`said_by_user`), else `remember_own_words` and nothing is saved. A TEARDOWN address
+  must be the user's whole address (`address_said`: every host label, the port, the path and the query), else
+  `teardown_own_words` and nothing opens. The teardown question is the user's sentence, never the brain's. The page's
+  own routes (`/remember`, `/teardown/start`) take the user's words directly. This is a word match, not an
+  understanding.
 - The `/chat` reply carries `memory`: `{"used": true, "titles": [...]}` (cleaned titles, at most 3) or
-  `{"used": false, "why": code}`. Never a snippet, never the key. The page shows one plain line under the answer
+  `{"used": false, "why": code}`. Never a snippet, never the key. Preflight accepts only a defined reason
+  (`memory_why_codes`: `ali_memory.STATUS` but ok, and the server's own no_results and not_in_answer) and only clean
+  titles (1 to 120 characters, no hidden character). A reason that is not defined is never printed. The page shows one
+  plain line under the answer
   ("From Ali Memory: ..."), made with `textContent` only (`showMemory` in `viewer/app.js`). It is never spoken, it is
   shown only for the answer the page owns, and never under one of `LINES`.
 - Preflight proves Ali Memory like a voice: one real recall with the fixed question `ali_memory.PROBE_QUERY`, only
@@ -177,7 +201,10 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
   gives the bytes back. A voice call never follows a redirect, and an error text loses the key before it is cut
   (`voices.scrub_key`). What can travel on (`describe`, a `VoiceError`, a probe text) loses EVERY key of
   `config.json` (`voices.configured_keys`, every `..._api_key` line), not only the voice's own. `scrub_keys`
-  removes every key in one pass, the longest first at each place. If a marker would still join the text beside it
+  finds every place of every key in the text as it is, also where keys overlap ("ab" and "bcd" in "abcd"), merges
+  the places that overlap, and puts ONE marker for each: no piece of any key is left. A `VoiceError` takes the keys
+  out of the raw text and again out of the one line, before the cut (`_scrubbed_line` with `one_line_keys`). If a
+  marker would still join the text beside it
   into a key, nothing of the text is kept. Every finished text of `voices.probe` goes through it too.
 - A voice key is sent only when it is a header-safe text (`KEY_TEXT_RE`: printable ASCII, no space) and when it
   equals, holds or is held by no key of another line (`voice_key_copied`): never a key of another provider. Else
@@ -186,7 +213,9 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
   `true` in a key line is no key and is never sent.
 - A voice never sends a text that holds a key of ANY line of config.json (`voice_text_has_key`). The piece and the
   whole text it was cut from (`speak(..., whole=)`: a hard cut can split a key) are checked, no request is sent,
-  and the refusal never quotes the text or names a key.
+  and the refusal never quotes the text or names a key. `/voice/speak` gives `speak` the whole text from BEFORE the
+  cut to `MAX_SPEAK_CHARS` as `whole=`, and the text as it came when that form holds a key (`holds_key`). Only the
+  bounded text is split and sent.
 - A new server voice is one entry in `VOICES` (`voices.py`), its key line and voice line(s) in `config.json`, and
   its own call (`_CALLS`).
 - ElevenLabs: the key is `elevenlabs_api_key`, and it travels in the `xi-api-key` header only. An ElevenLabs request
@@ -270,19 +299,28 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
   followed, real path = the place in the vault, no reparse point, bytes = `born` read through that handle, then
   delete through it); on POSIX every folder is opened from "/" with O_NOFOLLOW and `dir_fd`, the vault and each
   folder below must keep the st_dev/st_ino that was checked, and the file is moved to a random hidden name and
-  unlinked there only when it is still the file whose bytes were read (`_folder_delete`). Anything else is put back
-  only by a hard link, which never replaces a name (`_put_back`); without one it stays at the hidden name, and that
-  name is told. Both are "cleanup not confirmed". Where neither is possible, nothing is deleted and preflight says "cleanup not
-  confirmed" with the note's path in the notes folder (`delete_fixture_file`).
+  unlinked there only when it is still the file whose bytes were read (`_folder_delete`), and whose bytes, read again
+  through the held fd after the move, are still `born`. After the unlink they are read once more, and a write that
+  came in that instant is written back (`_write_back`: O_EXCL, never over a file) as "cleanup not confirmed".
+  Anything else is put back only by a hard link, which never replaces a name (`_put_back`); without one it stays at
+  the hidden name, and that name is told. A put-back that restores the name but cannot remove the hidden name names
+  both. All of these are "cleanup not confirmed". On Windows no write reaches the file between the read and the
+  delete: the handle is shared-read only, so any other write handle or mapped view makes the open fail (a sharing
+  violation), and while it is held no open for writing, rename or replace works. A junction is read from the lstat
+  reparse tag (`WIN_JUNCTION_TAG`): no Python 3.12 is needed. Where neither way is possible, nothing is deleted and
+  preflight says "cleanup not confirmed" with the note's path in the notes folder (`delete_fixture_file`).
 - Every check in `main` runs through `run_check`: a check that stops is a FAIL that names only the type of its error,
   never its text, and preflight always ends with its summary. A request that gets no answer is "could not look"
-  (`try_probe`), never a crash.
+  (`try_probe`), never a crash. The offline checks too: a check that stops names only the type of its error.
 - What preflight prints from an answer loses EVERY key of config.json (`voices.configured_keys`,
   `voices.scrub_keys`) BEFORE it is cut, and BEFORE it is written as JSON or repr() (`scrubbed`). Every key is also
-  removed in its JSON- and repr-escaped form. A leak scan of raw answer bytes looks for each key as it is AND as JSON
-  writes it.
+  removed in its JSON- and repr-escaped form (`key_texts`, `scrubbed`, `scrubbed_short`), also in the /chat check: the
+  answer, the error, the detail and the question made from a note title. A leak scan of raw answer bytes looks for
+  each key as it is AND as JSON writes it. The voice-route scan uses `key_forms` over every body (/status too) and the
+  headers of every POST.
 - A test that proves a lock holds must see the other thread TRY the lock while the owner holds it, before the owner
-  goes on. A lock that is free at that try is NOT VERIFIED.
+  goes on. A lock that is free at that try is NOT VERIFIED. A worker thread of a test is joined (bounded) before the
+  shared state is used again. One still alive is NOT VERIFIED and stops the scenario.
 - Part Two (REA): it observes only. No clicks, no logins, websites the user may look at.
 - REA lives outside the project in `~/.jarvis-tools/rea` and is pinned by `REA_PIN` in `teardown.py`. Never install
   "latest". After a version change, run `python drill.py`.
@@ -348,7 +386,9 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
   takes a note back only in the same vault and with the same `born`. A note of another folder is never touched. It
   finds the note by that identity and its `file`, never by the receipt's number (a rebuild sorts the notes by path).
   A note that is not the newest is dropped at its place (`_drop_note`), and the galaxy gets a new build id, so no
-  receipt or reply of the old numbers is used for another note.
+  receipt or reply of the old numbers is used for another note. `Galaxy._born` is keyed by `(vault, file)`. A birth at
+  the same path in another notes folder never writes over a fingerprint, and `note_id`, `forget_last`, `unbirth` and
+  `unbirth_left` read the key of their own folder. A removal drops its key.
 - Node numbers belong to one state of the galaxy. The page uses the node numbers of a reply only when the galaxy
   on screen is exactly the reply's snapshot (the same `build_id` and the same `rev`), a receipt only when its
   `build` is the build on screen, and never on a galaxy that it could not read again.
@@ -362,7 +402,8 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
   that was ours. `put_back` trusts only a good `/status` answer with whole graph numbers (`served_graph`).
 - In `page_checks.js` a story that throws (any value, also `null`), runs out of time or leaves a promise rejection
   behind is a failure. Stories count "speaking ended" by the speaker's own `onEnd` calls (`p.ends`), not by the
-  status chip.
+  status chip. A thrown value is formatted by `told`, which never throws (an object with no prototype, a throwing
+  message getter).
 - `main()` takes the port first and loads the galaxy after it. A second start that finds the port busy changes
   nothing. `Galaxy.refresh_if_rebuilt` follows the `notes_dir` that `config.json` names now. A `notes_dir` that
   cannot be resolved (`~nouser/x`) stops the start: one line, the listener closed, exit 1. A folder that is not
@@ -376,7 +417,13 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
   window is `python drill.py --visible`. It still records and puts back.
 - The drill compares the galaxy by its shape (`drill.shape`: note names and link pairs), not by node numbers. A
   galaxy that is built again can number the same notes in another order.
-- `put_back` removes a file only when its receipt names the drill's own notes folder (`record()["vault"]`) and, for a
-  note, while it still holds the receipt's `born` bytes (`remove_made`). Anything else stays, and the clean-up FAILs.
-- When the silence budget and the job's time run out together, `follow_job` still sends the named cancel before it
-  gives up.
+- `put_back` removes a file only when its receipt names the drill's own notes folder (`record()["vault"]`) and it is
+  the very entry at the receipt's path: no link or junction on the way, none at its name (`delete_made_file` deletes
+  through a handle on the entry on Windows, or in folders opened with no link followed on POSIX). A note goes only
+  while it holds the receipt's `born` bytes, read through that same handle or fd: on POSIX once more after the move to
+  a hidden name, and put back if it changed. Anything else stays, and the clean-up FAILs. A path that cannot be looked
+  at is trouble for its receipt only. A notes folder that cannot be looked at removes nothing and is not confirmed.
+  `made_by` reads the notes from the births in every job state; the picture only from a done job's `result`.
+- When the silence budget and the job's time run out together, `follow_job` sends the named cancel, then looks for
+  the end as after any cancel (a new silence budget, until the wait after the cancel ends). Another job or no job ends
+  the look at once, not confirmed.

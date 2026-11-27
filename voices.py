@@ -110,23 +110,38 @@ class VoiceError(Exception):
     (ElevenLabs only, else "").
 
     `keys` are every key of config.json (configured_keys), or one key as a text. Each of them is taken out of the
-    detail, the voice id and the model id BEFORE they are cut to one line: a cut first can leave a piece of a key at
-    its end (a review finding in brains.py). The exception text is the code only."""
+    detail, the voice id and the model id BEFORE they are cut (a cut first can leave a piece of a key at its end: a
+    review finding in brains.py), from the raw text and again from the one line (_scrubbed_line). The exception text
+    is the code only."""
 
     def __init__(self, code: str, detail: str = "", voice: dict | None = None, keys: str | Iterable[str] = ()):
         super().__init__(code)
         voice = voice or {}
-        keys = (keys,) if isinstance(keys, str) else tuple(keys)
+        keys = one_line_keys((keys,) if isinstance(keys, str) else keys)
         self.code = code
-        self.detail = _one_line(scrub_keys(str(detail), keys))[:DETAIL_CHARS]
+        self.detail = _scrubbed_line(detail, keys, DETAIL_CHARS)
         self.name = str(voice.get("name", ""))
         self.label = voice.get("label", "the")
-        self.model = _one_line(scrub_keys(str(voice.get("model", "")), keys))[:80]
-        self.engine = _one_line(scrub_keys(str(voice.get("engine", "")), keys))[:80]
+        self.model = _scrubbed_line(voice.get("model", ""), keys, 80)
+        self.engine = _scrubbed_line(voice.get("engine", ""), keys, 80)
 
 
 def _one_line(text: str) -> str:
     return " ".join(text.split())
+
+
+def one_line_keys(keys: Iterable[str]) -> list[str]:
+    """`keys`, and each key as one line (_one_line: its whitespace made one space). A text that was made one line
+    holds a key with a tab or two spaces of its own only in that form, so a scrub after _one_line needs both."""
+    keys = [str(key or "") for key in keys]
+    return keys + [_one_line(key) for key in keys]
+
+
+def _scrubbed_line(text: object, keys: list[str], limit: int) -> str:
+    """`text` as one line of at most `limit` characters with every key taken out BEFORE the cut: from the raw text (a
+    key with whitespace of its own, as it is) and again from the one line (a key said back with other whitespace,
+    "demo   value", is whole again only there). `keys` come from one_line_keys."""
+    return scrub_keys(_one_line(scrub_keys(str(text), keys)), keys)[:limit]
 
 
 def scrub_key(text: str, key: str) -> str:
@@ -140,15 +155,27 @@ def scrub_key(text: str, key: str) -> str:
 
 
 def scrub_keys(text: str, keys: Iterable[str]) -> str:
-    """Every copy of each of `keys` becomes "[key removed]", in ONE pass over the text: at each place the longest key
-    that is there goes whole, so no piece of it is left, and a marker is never searched again. A marker can still
-    join the text beside it into a key (a key that starts with "]"): then nothing of the text is kept. Call it on
-    the whole text, BEFORE any cut. Empty keys and the placeholder are no keys (as in scrub_key)."""
+    """Every copy of each of `keys` becomes "[key removed]". Every place of every key is found in the text as it is,
+    also where keys overlap ("ab" and "bcd" in "abcd", "aa" twice in "aaa"). Places that overlap are merged, and each
+    merged place becomes ONE marker: so no piece of any key is left, and a marker is never searched again. A marker
+    can still join the text beside it into a key (a key that starts with "]"): then nothing of the text is kept. Call
+    it on the whole text, BEFORE any cut. Empty keys and the placeholder are no keys (as in scrub_key)."""
     text = str(text)
-    keys = sorted({str(key or "").strip() for key in keys} - {"", KEY_PLACEHOLDER}, key=len, reverse=True)
-    if not keys:
-        return text
-    text = re.sub("|".join(map(re.escape, keys)), KEY_REMOVED, text)
+    keys = {str(key or "").strip() for key in keys} - {"", KEY_PLACEHOLDER}
+    places = []
+    for key in keys:
+        at = text.find(key)
+        while at != -1:
+            places.append((at, at + len(key)))
+            at = text.find(key, at + 1)
+    kept, end = [], 0           # end: where the text after the last marker starts
+    for start, stop in sorted(places):
+        if start < end:         # it overlaps the place before it: the same marker
+            end = max(end, stop)
+            continue
+        kept += [text[end:start], KEY_REMOVED]
+        end = stop
+    text = "".join(kept) + text[end:]
     return "" if any(key in text for key in keys) else text
 
 
@@ -1560,6 +1587,40 @@ def offline_checks() -> list[tuple[str, bool, str]]:
         if any(known in scrubbed for known in live):
             leaks.append(f"trial {trial}: {keys_!r} in {text!r} -> {scrubbed!r}")
     check("scrub_keys: 400 random texts and keys: no key is ever left", not leaks, "; ".join(leaks[:2]))
+    for text, keys_, wanted in (("abcd", ["ab", "bcd"], KEY_REMOVED), ("abcd", ["bcd", "ab"], KEY_REMOVED),
+                                ("aaa", ["aa"], KEY_REMOVED), ("xabcdy", ["abc", "cd"], f"x{KEY_REMOVED}y"),
+                                ("1 abcd 2", ["abc", "bc", "bcd"], f"1 {KEY_REMOVED} 2"),
+                                ("abcd", ["ab", "cd"], KEY_REMOVED * 2)):
+        check(f"scrub_keys: keys that overlap go whole as ONE marker, keys side by side as two ({text!r} with {keys_})",
+              scrub_keys(text, keys_) == wanted, repr(scrub_keys(text, keys_)))
+    rng, wrong = random.Random(5), []
+    for trial in range(400):                        # every letter of every place of a key goes, and no other letter
+        keys_ = ["".join(rng.choice("abc") for _ in range(rng.randint(1, 4))) for _ in range(rng.randint(1, 3))]
+        text = "".join(rng.choice("abc d") for _ in range(rng.randint(0, 30)))
+        covered = [False] * len(text)
+        for known in keys_:
+            for at in range(len(text) - len(known) + 1):
+                if text.startswith(known, at):
+                    covered[at:at + len(known)] = [True] * len(known)
+        kept = "".join(scrub_keys(text, keys_).split(KEY_REMOVED))
+        if kept != "".join(char for char, gone in zip(text, covered) if not gone):
+            wrong.append(f"trial {trial}: {keys_!r} in {text!r} -> {scrub_keys(text, keys_)!r}")
+    check("scrub_keys: 400 random texts: exactly the letters of the keys' places go, also where keys overlap",
+          not wrong, "; ".join(wrong[:2]))
+    check("one_line_keys: each key, and each key as one line",
+          one_line_keys(["a\tb", "c  d", "e f"]) == ["a\tb", "c  d", "e f", "a b", "c d", "e f"], "")
+    for what, keys_ in (("a list", ["demo value"]), ("one text", "demo value")):
+        error = VoiceError("x", "a demo   value b", {"model": "m demo \t value", "engine": "demo\n value"}, keys_)
+        check(f"VoiceError: a key said back with other whitespace is taken out ({what})",
+              (error.detail, error.model, error.engine) == (f"a {KEY_REMOVED} b", f"m {KEY_REMOVED}", KEY_REMOVED),
+              f"{error.detail!r} {error.model!r} {error.engine!r}")
+    error = VoiceError("x", "y" * 290 + " demo   value tail", None, ["demo value"])
+    check("VoiceError: a key said back with other whitespace across the cut leaves no piece of itself",
+          len(error.detail) <= DETAIL_CHARS and "demo" not in error.detail, error.detail[-20:])
+    for spaced in ("demo  value", "demo\tvalue"):
+        error = VoiceError("x", f"a {spaced} b", {"model": spaced}, [spaced])
+        check(f"VoiceError: a key with whitespace of its own ({spaced!r}) said back as it is is taken out",
+              error.detail == f"a {KEY_REMOVED} b" and error.model == KEY_REMOVED, f"{error.detail!r} {error.model!r}")
     check("VoiceError: one key as a text is one key, not its letters", VoiceError("x", "a b ab", None, "ab").detail
           == f"a b {KEY_REMOVED}", VoiceError("x", "a b ab", None, "ab").detail)
     other = {**el_cfg, "deepseek_api_key": ds_key}

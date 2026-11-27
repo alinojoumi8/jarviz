@@ -2084,6 +2084,9 @@ story('an answer given with Ali Memory', {
 story('the harness reports trouble', {
   thrown: 'a story that made all its checks and then threw is reported as a failure',
   falsy: 'a story that made all its checks and then threw null is reported as a failure too',
+  bare: 'a story that threw an object with no prototype (it has no String()) is reported as a failure',
+  getter: 'a story that threw a value whose message getter throws is reported as a failure',
+  droppedBare: 'a dropped promise that failed with an object with no prototype is a failure of its story',
   late:'a story that made all its checks and then never ended is reported as a failure',
   dropped: 'a promise that the page lets fall is a failure of its story',
   handled: 'a rejection that gets its handler later is no failure',
@@ -2096,6 +2099,16 @@ story('the harness reports trouble', {
   t.check('thrown', got.length === 1 && /ran to its end/.test(got[0]), JSON.stringify(got));
   got = failed(await inner(async t2 => { t2.check('one', true); throw null; }));
   t.check('falsy', got.length === 1 && /ran to its end/.test(got[0]), JSON.stringify(got));
+  got = failed(await inner(async t2 => { t2.check('one', true); throw Object.create(null); }));
+  t.check('bare', got.length === 1 && /ran to its end/.test(got[0]), JSON.stringify(got));
+  got = failed(await inner(async t2 => { t2.check('one', true); throw { get message() { throw new Error('no message'); } }; }));
+  t.check('getter', got.length === 1 && /ran to its end/.test(got[0]), JSON.stringify(got));
+  got = failed(await inner(async t2 => {
+    Promise.reject(Object.create(null));                // dropped: nothing ever handles it
+    await drain();
+    t2.check('one', true);
+  }));
+  t.check('droppedBare', got.length === 1 && /no promise of the page failed/.test(got[0]), JSON.stringify(got));
   got = failed(await inner(async t2 => { t2.check('one', true); await new Promise(() => {}); }, 30));
   t.check('late', got.length === 1 && /ran to its end/.test(got[0]), JSON.stringify(got));
   got = failed(await inner(async (t2, open2) => {
@@ -2121,6 +2134,12 @@ story('the harness reports trouble', {
 // ------------------------------------------------------------------ the run
 
 const short = text => String(text).replace(/\s+/g, ' ').trim().slice(0, 160);
+// What a thrown or rejected value says (its `message`, or its `stack`), for a line. It never throws itself: a story can
+// throw anything (an object with no prototype has no String(), a `message` getter can throw), and its failure must
+// still be reported. Whether it threw is told apart (`threw`): a value like null or 0 is a failure too.
+const told = (value, part = 'message') => {
+  try { return short(value && value[part] || value); } catch (error) { return 'a thrown value that cannot be shown'; }
+};
 const drain = async () => { for (let i = 0; i < 5; i++) await new Promise(done => setImmediate(done)); };
 
 // A promise that fails with no handler at the end of its turn ("dropped") is a failure of the story that runs then.
@@ -2129,7 +2148,7 @@ const drain = async () => { for (let i = 0; i < 5; i++) await new Promise(done =
 const dropped = new Map();          // promise -> { story, text }
 let running = null;                 // the story that runs now (null: none)
 process.on('unhandledRejection', (error, promise) => {
-  dropped.set(promise, { story: running, text: short(error && error.message || error), stack: short(error && error.stack || error) });
+  dropped.set(promise, { story: running, text: told(error), stack: told(error, 'stack') });
 });
 process.on('rejectionHandled', promise => { dropped.delete(promise); });
 
@@ -2177,7 +2196,7 @@ async function runStory(entry, sources, limitMs = STORY_MS) {
   }
   await drain();                                      // a promise dropped in the story's last step is reported now
   running = outer;
-  const why = () => short(trouble && trouble.message || trouble);
+  const why = () => told(trouble);
   for (const key of Object.keys(entry.checks)) {
     if (!done.has(key)) results.push({ name: entry.checks[key], ok: false, detail: threw ? 'not reached: ' + why() : 'not reached' });
   }
@@ -2225,6 +2244,6 @@ async function main() {
 }
 
 main().then(code => { process.exitCode = code; }, error => {
-  process.stderr.write('page_checks: could not run: ' + short(error && error.message || error) + '\n');
+  process.stderr.write('page_checks: could not run: ' + told(error) + '\n');
   process.exitCode = 2;
 });

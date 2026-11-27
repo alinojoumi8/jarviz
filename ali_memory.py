@@ -45,11 +45,15 @@ RECALL_PATH = "/api/recall"
 LIMIT = 3                      # results asked for, and the most that are ever used
 MAX_QUERY_CHARS = 2000         # the hub cuts a longer query here too
 # ONE budget for the connect, the request and the read (the hub: p50 0.4 s, p95 0.6 s, its worst a few seconds). A
-# recall that is not back by then is "timeout", and the chat answers without it.
+# recall that is not back by then is "timeout", and the chat answers without it. It is ONE deadline (time.monotonic()):
+# the connect, every send and every read end by it (_BudgetSocket), and an answer done after it is dropped (_within).
 BUDGET_S = 3.0
 # A hub that listens completes a loopback handshake at once. Windows takes about 2 s to report a refused one: without
 # this, every question would wait that long while the hub is down.
 CONNECT_TIMEOUT_S = 0.5
+# After the deadline the waiting side waits at most this long more for the helper thread to end. Its socket ends by
+# the deadline by itself, so the helper is gone in a moment: no helper thread and no socket outlives a recall.
+UNWIND_S = 0.2
 MAX_REPLY_BYTES = 256 * 1024   # three compact results are far smaller: a bigger answer is no recall answer
 MAX_ERROR_BYTES = 16 * 1024    # an error body is read only this far
 TITLE_CHARS, SNIPPET_CHARS, PROJECT_CHARS, SOURCE_CHARS = 120, 1200, 60, 40
@@ -160,28 +164,77 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None                      # the token must never follow a redirect to another address
 
 
+class _BudgetSocket(socket.socket):
+    """A socket that waits at most until `deadline` (time.monotonic()) in EVERY send and read. A plain timeout counts
+    each read anew, so a hub that sends its answer a byte at a time could hold a recall (its thread and its socket)
+    for as long as it likes, also after the chat gave up on it. A send or a read after the deadline is TimeoutError."""
+
+    deadline = 0.0
+
+    def _wait_left(self) -> None:
+        left = self.deadline - time.monotonic()
+        if left <= 0:
+            raise TimeoutError("the budget is spent")
+        self.settimeout(left)
+
+    def recv_into(self, *args, **kwargs):
+        self._wait_left()
+        return super().recv_into(*args, **kwargs)
+
+    def recv(self, *args, **kwargs):
+        self._wait_left()
+        return super().recv(*args, **kwargs)
+
+    def send(self, *args, **kwargs):
+        self._wait_left()
+        return super().send(*args, **kwargs)
+
+    def sendall(self, *args, **kwargs):
+        self._wait_left()
+        return super().sendall(*args, **kwargs)
+
+
 class _LoopbackConnection(http.client.HTTPConnection):
-    """A connection to 127.0.0.1 only, with a short connect (CONNECT_TIMEOUT_S). After the connect the socket gets the
-    timeout of the request. A connect that times out is "nothing listens", as a refused one is."""
+    """A connection to 127.0.0.1 only, with a short connect (CONNECT_TIMEOUT_S), that ends by `deadline`: the deadline
+    of its recall (the request carries it), else the timeout of the request from the connect on. The connect, every
+    send and every read end by it (_BudgetSocket). A connect that times out is "nothing listens", as a refused one
+    is."""
+
+    def __init__(self, host, *, deadline: float | None = None, **kwargs):
+        super().__init__(host, **kwargs)
+        self.deadline = deadline
 
     def connect(self) -> None:
         if self.host != "127.0.0.1":                # recall() builds only such addresses: the second net
             raise ConnectionRefusedError("Jarviz asks Ali Memory on 127.0.0.1 only")
-        wait = self.timeout if isinstance(self.timeout, (int, float)) and self.timeout > 0 else CONNECT_TIMEOUT_S
+        deadline = self.deadline
+        if not isinstance(deadline, float):
+            wait = self.timeout if isinstance(self.timeout, (int, float)) and self.timeout > 0 else CONNECT_TIMEOUT_S
+            deadline = time.monotonic() + wait
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise TimeoutError("the budget is spent")
+        sock = _BudgetSocket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.deadline = deadline
         try:
-            self.sock = socket.create_connection((self.host, self.port), min(wait, CONNECT_TIMEOUT_S))
+            sock.settimeout(min(left, CONNECT_TIMEOUT_S))
+            sock.connect((self.host, self.port))
         except TimeoutError:
+            sock.close()
             raise ConnectionRefusedError("no hub answered the connect") from None
-        self.sock.settimeout(wait)
+        except BaseException:
+            sock.close()
+            raise
+        self.sock = sock
         try:
-            self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         except OSError:
             pass                        # a slower answer, nothing worse
 
 
 class _LoopbackHandler(urllib.request.HTTPHandler):
     def http_open(self, req):
-        return self.do_open(_LoopbackConnection, req)
+        return self.do_open(_LoopbackConnection, req, deadline=getattr(req, "deadline", None))
 
 
 # No proxy (ProxyHandler({})): an HTTP_PROXY of the system would get the token. No redirect. Loopback only.
@@ -192,8 +245,9 @@ def recall(config: dict, query: str, opener: Opener | None = None, *, budget: fl
     """The best results of Ali Memory for `query`, and a code of STATUS. Results only with "ok" (there may be none):
     at most LIMIT, each {"title", "snippet", "project", "source", "date", "taints"}, every text one clean line with
     every key of config.json taken out. It never raises, and it sends nothing when trouble() names a reason, when the
-    query is empty, or when the query holds a key of config.json. ONE budget (seconds) holds for the whole call.
-    `opener` serves the offline checks only."""
+    query is empty, or when the query holds a key of config.json. ONE budget (seconds) holds for the whole call: one
+    deadline, from the start. `opener` serves the offline checks only."""
+    deadline = time.monotonic() + max(0.0, budget)
     why = trouble(config)
     if why:
         return [], why
@@ -205,42 +259,53 @@ def recall(config: dict, query: str, opener: Opener | None = None, *, budget: fl
         return [], "query_has_key"
     host, port = parse_url(config.get(URL_LINE, DEFAULT_URL))
     token = token_of(config)
-    return _within(lambda: _ask(token, host, port, text[:MAX_QUERY_CHARS], opener or _OPENER, keys, budget), budget)
+    return _within(lambda: _ask(token, host, port, text[:MAX_QUERY_CHARS], opener or _OPENER, keys, deadline), deadline)
 
 
-def _within(work: Callable[[], tuple[list[dict], str]], budget: float) -> tuple[list[dict], str]:
-    """work() in a helper thread, and its answer when it is back within `budget` seconds, else "timeout". A late
-    helper ends by itself (its socket has the same timeout) and its answer is dropped. No exception leaves: its text
-    could hold a header value, the token."""
+def _within(work: Callable[[], tuple[list[dict], str]], deadline: float) -> tuple[list[dict], str]:
+    """work() in a helper thread, and its answer only when it was done by `deadline` (time.monotonic()), else
+    "timeout": an answer done later is dropped, also when it is there before the waiting side looks. The helper's
+    I/O ends by the deadline by itself (_BudgetSocket), and the waiting side waits UNWIND_S more for it to end, so no
+    helper thread and no socket of a recall outlives it. No exception leaves: its text could hold a header value,
+    the token."""
     box: list = []
 
     def run() -> None:
         try:
-            box.append(work())
+            answer = work()
         except Exception:       # noqa: BLE001 - never its text: only that it stopped
-            box.append(([], "failed"))
+            answer = ([], "failed")
+        box.append((time.monotonic(), answer))      # when it was done: only an answer in time is used
 
     helper = threading.Thread(target=run, name="jarviz-ali-memory", daemon=True)
     try:
         helper.start()
     except RuntimeError:        # no thread could be started: no recall, as for any other failure
         return [], "failed"
-    helper.join(max(0.0, budget))
-    return box[0] if box else ([], "timeout")
+    helper.join(max(0.0, deadline - time.monotonic()))
+    if helper.is_alive():
+        helper.join(UNWIND_S)   # its socket ends by the deadline: it closes it and ends in a moment
+    if box and box[0][0] <= deadline:
+        return box[0][1]
+    return [], "timeout"
 
 
 def _ask(token: str, host: str, port: int, query: str, opener: Opener, keys: Iterable[str],
-         budget: float) -> tuple[list[dict], str]:
-    """One POST /api/recall to 127.0.0.1:<port>, its answer checked. The query goes in the JSON body, never in the
-    address. Host names what config.json says (127.0.0.1 or localhost): the hub checks it."""
-    deadline = time.monotonic() + budget
+         deadline: float) -> tuple[list[dict], str]:
+    """One POST /api/recall to 127.0.0.1:<port>, its answer checked, all of it by `deadline` (time.monotonic()). The
+    query goes in the JSON body, never in the address. Host names what config.json says (127.0.0.1 or localhost):
+    the hub checks it."""
+    left = deadline - time.monotonic()
+    if left <= 0:
+        return [], "timeout"
     body = json.dumps({"query": query, "limit": LIMIT, "all_projects": True}).encode("ascii")
     request = urllib.request.Request(
         f"http://127.0.0.1:{port}{RECALL_PATH}", data=body, method="POST",
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json", "Accept": "application/json",
                  "Host": f"{host}:{port}", "User-Agent": USER_AGENT})
+    request.deadline = deadline     # the connection ends its connect, every send and every read by it
     try:
-        with opener.open(request, timeout=budget) as response:
+        with opener.open(request, timeout=left) as response:
             status = getattr(response, "status", None)
             headers = getattr(response, "headers", None)
             ctype = headers.get("Content-Type", "") if headers is not None else ""
@@ -362,12 +427,15 @@ def _results(payload: Any, keys: Iterable[str]) -> list[dict] | None:
 
 def _clean(value: Any, limit: int, keys: Iterable[str]) -> str:
     """One clean line of at most `limit` characters, with every key taken out, or "" for anything that is no text.
-    Hidden characters become spaces FIRST (so no two pieces of a key are joined), the keys go BEFORE the cut (a cut
-    first could leave a piece of a key), and once more after it."""
+    Hidden characters become spaces FIRST (so no two pieces of a key are joined). The keys go BEFORE the cut (a cut
+    first could leave a piece of a key): from the text as it is (a key with whitespace of its own), and again from the
+    one line (a key said back with other whitespace, "demo   value", is whole again only there; each key also as one
+    line: voices.one_line_keys). And once more after the cut."""
     if not isinstance(value, str):
         return ""
+    keys = voices.one_line_keys(keys)
     text = "".join(" " if unicodedata.category(char) in HIDDEN else char for char in value)
-    text = " ".join(voices.scrub_keys(text, keys).split())
+    text = voices.scrub_keys(" ".join(voices.scrub_keys(text, keys).split()), keys)
     if len(text) > limit:
         text = text[: limit - 1].rstrip() + "\u2026"
     return voices.scrub_keys(text, keys)
@@ -396,20 +464,23 @@ def _taints(value: Any, keys: Iterable[str]) -> list[str]:
 
 class _FakeResponse:
     """A stand-in for an HTTP answer. `broken` breaks the read in the middle, `length` is what http.client would
-    still count as missing."""
+    still count as missing. `end_delay`: the read that finds the end takes that many seconds."""
 
     def __init__(self, status: int, body: bytes, ctype: str | None = "application/json", broken: bool = False,
-                 length: int | None = None):
+                 length: int | None = None, end_delay: float = 0.0):
         self.status, self.length = status, length
         self.headers = http.client.HTTPMessage()
         if ctype is not None:
             self.headers["Content-Type"] = ctype
-        self._body, self._broken = io.BytesIO(body), broken
+        self._body, self._broken, self._end_delay = io.BytesIO(body), broken, end_delay
 
     def read(self, size: int = -1) -> bytes:
         if self._broken:
             raise http.client.IncompleteRead(b"", 1000)
-        return self._body.read(size)
+        chunk = self._body.read(size)
+        if not chunk and self._end_delay:
+            time.sleep(self._end_delay)
+        return chunk
 
     def __enter__(self):
         return self
@@ -428,7 +499,8 @@ class _FakeOpener:
     def open(self, request: urllib.request.Request, timeout: float | None = None):
         self.calls.append({"url": request.full_url, "method": request.get_method(), "body": request.data,
                            "headers": {name.lower(): value for name, value in request.header_items()},
-                           "timeout": timeout})
+                           "timeout": timeout, "deadline": getattr(request, "deadline", None),
+                           "opened": time.monotonic()})
         if self.delay:
             time.sleep(self.delay)
         return self.make(request)
@@ -455,14 +527,19 @@ class _FakeHTTP(urllib.request.HTTPHandler):
 
 class _Stub:
     """A socket of the checks themselves on 127.0.0.1 (no network). `answer` None: it listens and never answers.
-    Else it takes each connection, keeps the bytes of the request (`seen`) and sends `answer`."""
+    Else it takes each connection, keeps the bytes of the request (`seen`) and sends `answer`. A slow hub: `drip`
+    seconds between the bytes of the answer (after its head at once with `head_at_once`). `cut_at` is when a send
+    failed (time.monotonic()): the other side closed its socket."""
 
-    def __init__(self, answer: bytes | None):
+    def __init__(self, answer: bytes | None, drip: float = 0.0, head_at_once: bool = False):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.bind(("127.0.0.1", 0))
         self.sock.listen(4)
         self.port = self.sock.getsockname()[1]
         self.answer, self.seen = answer, []
+        self.drip, self.head_at_once = drip, head_at_once
+        self.cut_at: float | None = None
+        self.cut = threading.Event()
         if answer is not None:
             threading.Thread(target=self._serve, name="ali-memory-check-stub", daemon=True).start()
 
@@ -487,9 +564,26 @@ class _Stub:
                             break
                         rest += chunk
                     self.seen.append((head, rest))
-                    conn.sendall(self.answer)
+                    self._send(conn, self.answer)
         except OSError:
             pass                        # the stub was closed, or nobody came: the check reads `seen`
+
+    def _send(self, conn: socket.socket, answer: bytes) -> None:
+        if not self.drip:
+            conn.sendall(answer)
+            return
+        if self.head_at_once:
+            at = answer.find(b"\r\n\r\n") + 4
+            conn.sendall(answer[:at])
+            answer = answer[at:]
+        try:
+            for at in range(len(answer)):
+                conn.sendall(answer[at:at + 1])
+                time.sleep(self.drip)
+        except OSError:
+            self.cut_at = time.monotonic()
+            self.cut.set()
+            raise
 
     def close(self) -> None:
         try:
@@ -532,8 +626,8 @@ def offline_checks() -> list[tuple[str, bool, str]]:
     good = hub([item(), item("Boiler", "The boiler code is in the blue folder.", taints=["generated_summary"])])
 
     def answer(status: int = 200, body: bytes = good, ctype: str | None = "application/json", broken: bool = False,
-               length: int | None = None):
-        return lambda request: _FakeResponse(status, body, ctype, broken, length)
+               length: int | None = None, end_delay: float = 0.0):
+        return lambda request: _FakeResponse(status, body, ctype, broken, length, end_delay)
 
     def refuse(status: int, payload: dict | None = None, raw: bytes | None = None):
         body = raw if raw is not None else json.dumps(payload or {}).encode("utf-8")
@@ -589,7 +683,10 @@ def offline_checks() -> list[tuple[str, bool, str]]:
     check("recall: the token is in no other header, the address or the body",
           sum(token in str(value) for value in headers.values()) == 1 and token not in call.get("url", "")
           and token.encode() not in (call.get("body") or b""), "")
-    check("recall: the budget is the timeout of the request", call.get("timeout") == BUDGET_S, str(call.get("timeout")))
+    timeout, deadline, opened = call.get("timeout"), call.get("deadline"), call.get("opened")
+    check("recall: the request carries ONE deadline, and its timeout is what is left of the budget",
+          isinstance(deadline, float) and isinstance(timeout, float) and 0 < timeout <= BUDGET_S
+          and isinstance(opened, float) and 0 <= deadline - opened <= timeout, f"{timeout} {deadline} {opened}")
     check("recall: ok, two results", status == "ok" and [r["title"] for r in found] == ["Kettle descaling", "Boiler"],
           shown(found, status))
     check("recall: a result has exactly its six fields",
@@ -681,8 +778,16 @@ def offline_checks() -> list[tuple[str, bool, str]]:
     started = time.monotonic()
     status, found, _ = run(answer(), opener=_FakeOpener(answer(), delay=1.0), budget=0.2)
     took = time.monotonic() - started
-    check("a hub that is slower than the budget is a timeout, within the budget", status == "timeout" and not found
-          and took < 0.8, f"{status} after {took:.2f} s")
+    check("a hub that is slower than the budget is a timeout, within the budget (and UNWIND_S)", status == "timeout"
+          and not found and took < 0.8, f"{status} after {took:.2f} s")
+    # The answer is read by 0.15 s, the read that finds its end takes 0.1 s more: done at about 0.25 s. The waiting side
+    # waits UNWIND_S for the helper after the deadline, so that answer IS there when it looks: only its time decides.
+    late = _FakeOpener(answer(end_delay=0.1), delay=0.15)
+    status, found, _ = run(None, opener=late, budget=0.2)
+    check("an answer done after the deadline is dropped, also when it is there before the waiting side looks",
+          status == "timeout" and not found and len(late.calls) == 1, shown(found, status))
+    status, found, _ = run(None, opener=_FakeOpener(answer(end_delay=0.1), delay=0.15), budget=1.0)
+    check("the same answer done within the budget is kept", status == "ok" and len(found) == 2, shown(found, status))
 
     # -- answers that are no recall answer
     nested = b'{"results": ' + b"[" * 50000 + b"]" * 50000 + b"}"
@@ -750,6 +855,20 @@ def offline_checks() -> list[tuple[str, bool, str]]:
     status, found, _ = run(answer(body=split_key), every)
     check("a hidden character inside a key becomes a space: the key is not joined", status == "ok"
           and other_key not in shown(found, status), shown(found, status))
+    # A key of another line may hold whitespace of its own ("demo value"). Said back with other whitespace, it is whole
+    # again only after the text became one line: it goes from there too, BEFORE the cut (the title cut falls inside it).
+    spaced = {**every, "zebra_api_key": "demo value"}
+    echoes = hub([item("t" * 112 + " demo   value tail", "a demo \t value b", project="demo value")])
+    status, found, _ = run(answer(body=echoes), spaced)
+    first = found[0] if found else {}
+    check("a key said back with other whitespace is taken out before the cut: no piece is left",
+          status == "ok" and "demo" not in shown(found, status) and "value" not in shown(found, status)
+          and first.get("snippet") == f"a {voices.KEY_REMOVED} b" and len(first.get("title", "")) <= TITLE_CHARS,
+          shown(found, status))
+    for key, said in (("demo  value", "a demo  value b"), ("demo\tvalue", "a demo\tvalue b")):
+        status, found, _ = run(answer(body=hub([item(snippet=said)])), {**every, "zebra_api_key": key})
+        check(f"a key with whitespace of its own ({key!r}) said back as it is is taken out", status == "ok"
+              and found and found[0]["snippet"] == f"a {voices.KEY_REMOVED} b", shown(found, status))
     word_key = "zebraword4242"                      # a key that has the shape of a taint word
     status, found, _ = run(answer(body=hub([item(taints=[word_key, "fine"])])), {**every, "zebra_api_key": word_key})
     check("a taint that is a key is left out", found and found[0]["taints"] == ["fine"], shown(found, status))
@@ -824,6 +943,26 @@ def offline_checks() -> list[tuple[str, bool, str]]:
     silent.close()
     check("on the wire: a hub that never answers is a timeout, within the budget", status == "timeout"
           and took < 1.0, f"{status} after {took:.2f} s")
+    # A slow hub: a byte every 10 ms never lets one read wait long, so only the ONE deadline can end it. When the recall
+    # returns, its helper thread is gone and its socket is closed (the stub's next send fails: `cut_at`).
+    slow_body = good + b" " * 400
+    for part, head_at_once in (("its head", False), ("its body", True)):
+        slow = _Stub(_http_answer(200, "OK", slow_body), drip=0.01, head_at_once=head_at_once)
+        before = {each for each in threading.enumerate() if each.name == "jarviz-ali-memory"}
+        started = time.monotonic()
+        found, status = recall({**cfg, URL_LINE: f"http://127.0.0.1:{slow.port}"}, "kettle", budget=0.4)
+        returned = time.monotonic()
+        alive = [each for each in threading.enumerate() if each.name == "jarviz-ali-memory" and each not in before]
+        slow.cut.wait(1.0)
+        slow.close()
+        gap = slow.cut_at - returned if slow.cut_at is not None else None
+        check(f"on the wire: a hub that sends {part} a byte at a time is a timeout, within the budget",
+              status == "timeout" and not found and returned - started < 0.4 + UNWIND_S + 0.2,
+              f"{status} after {returned - started:.2f} s")
+        check(f"on the wire: a hub that sends {part} a byte at a time: no helper thread outlives the recall",
+              not alive, f"{len(alive)} still running")
+        check(f"on the wire: a hub that sends {part} a byte at a time: the socket is closed when the recall returns",
+              gap is not None and gap < 0.25, "never" if gap is None else f"{gap:.2f} s after the return")
     return results
 
 
