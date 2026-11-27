@@ -21,6 +21,8 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
   Claude uses the `anthropic` package, the others plain HTTPS from the standard library. Two use a sign-in
   (Codex, Antigravity): Jarviz starts the user's own tool (`codex`, `agy`), and the tool uses its own sign-in.
   `python brains.py` runs the offline checks of the sign-in brains.
+- `voices.py` the voices behind one `speak()`: the browser's own voice (the server does nothing for it) and
+  Deepgram (text to speech over plain HTTPS, standard library only). `python voices.py` runs its offline checks.
 - `preflight.py` live end-to-end checks.
 - `teardown.py` the teardown bay (Part Two), standard library only. The server soft-imports it and starts without it.
 - `drill.py` the live teardown drill. `record()` and `put_back()` make a test leave no trace.
@@ -28,7 +30,8 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
 - `page_checks.js` the rules of the page, proved in Node with a fake page (no browser). Preflight runs it.
   A change in `viewer/app.js` gets a story there. It is in the project root: the server serves only `viewer/`.
 - `config.json` the active brain, a key and a model for each brain, the notes folder. Git ignores it.
-  A sign-in brain has a model line only (empty: the tool's own default model).
+  A sign-in brain has a model line only (empty: the tool's own default model). The voice lines are `voice` (the
+  default voice), `deepgram_api_key` and `deepgram_voice`.
 - `~/.jarvis-tools/brain-locks.json` the lock proofs of the sign-in brains: the tool version and the lock recipe
   that a real trap proved. It is outside the project. Jarviz writes it.
 - `~/.jarvis-tools/page-key` the page key (the lock). It is outside the project. The server makes it at the first start.
@@ -47,7 +50,8 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
 - `save_brain_choice` puts the new text in place in one step, so a crash never leaves half a config. For that moment
   the text is in a staging file beside it (`config.json.<pid>.tmp`: made new, never over a file, git ignores it).
   That is the ONE other file that may hold a key. `sweep_config_staging` (from `main()`) removes one that a crash
-  left, and never reads it.
+  left, and never reads it. A file that holds keys is made for its owner only (mode 0600, `_new_private_file`),
+  and a brain switch never makes `config.json` readable for more people than before (`_same_mode_as`).
 - Preflight proves a brain with one very small real question on the same path as `ask()` (route `"probe"` in
   `EFFORT` and `TIMEOUT_S`). A model list does not prove that a key may ask the model. The answer must have the
   shape of a completion: an empty text is fine for the tiny budget, a missing envelope is a fail. An error text
@@ -73,6 +77,11 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
   the sandbox refused a write, `CODEX_REFUSED_RE`; agy: a permission refusal of a tool step, `AGY_REFUSED_RE`).
   Weak: no word came back, no file was made and no tool ran, but no refused attempt was seen. Both let the brain
   answer. Preflight says PASS for strong and WARN for weak. Never call a weak proof strong.
+- The trap looks twice: a run with no evidence is run once more (`_prove_twice`). A weak run never replaces a
+  strong proof of the same version and recipe (`_record_proof`). A False verdict always replaces the record.
+  `check_brain_locks` tries once more when the trap could not look. Two times "could not look" is a FAIL.
+- An agy run that never started (`cli_not_started`: the backend gave no conversation) is tried again, at most
+  `CLI_START_TRIES` times, in `_cli_call` only. A run that started is never asked twice.
 - agy must say at the start of EVERY run that it took the lock (`AGY_INIT`: permission mode `strict`, agent
   `jarviz-brain`). A run that started without those words is `cli_not_locked`, and its answer is thrown away.
 - A tool that ran throws the answer away (`cli_tool_ran`). Codex: any item that is not talk (`CODEX_TALK_ITEMS`).
@@ -107,6 +116,18 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
 - Tests call the server through `preflight.call` (it signs the call). A call with `key=False` is an outsider.
 - One function speaks: `createSpeaker().speak` in `viewer/core.js`. `?mute=1` makes a tab silent. Open
   test tabs with `?mute=1`.
+- The Deepgram key is a key like the others: only in `config.json`, never in the page. The page asks the server
+  for audio (`POST /voice/speak`), the server asks Deepgram (`voices.speak`) and gives the bytes back. A voice call
+  never follows a redirect, and an error text loses the key before it is cut (`voices.scrub_key`).
+- The voice choice lives in the browser (`localStorage`, `jarviz_voice`). `POST /voice` only judges a wish and
+  answers with a line. The server never writes the choice into `config.json`: it writes that file in two places
+  only. The `"voice"` line there is the default voice, and only the user types it.
+- `createSpeaker().speak` plays the Deepgram audio part by part, or uses the browser voice. A muted tab asks for NO
+  audio: every request to Deepgram costs money. When a part fails, the browser voice says the rest, so no line is
+  lost. `/voice/speak` takes at most `MAX_SPEAK_CHARS`, and `voices.split_text` cuts the text (one Deepgram
+  request takes at most 2000 characters).
+- Preflight proves the Deepgram voice like a brain: one very small real request on the same path as `speak()`
+  (`voices.probe`), and only when there is a key. Without a key the route must refuse cleanly.
 - One owner for focus: only `Focus` in `viewer/app.js` moves the camera or changes which stars are lit.
 - One door for new notes: `Galaxy.birth_note` in `server.py` and `addNote` in `viewer/app.js`.
 - Every node id equals its index in `GRAPH.nodes`.
@@ -177,9 +198,11 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
   publishes nothing, so it leaves no turn behind.
 - A teardown binds ONE notes folder (`Galaxy.current_folder`). Its picture and every one of its notes go there.
   `birth_note` refuses when the galaxy shows another folder by then (`NotesMoved`), and the job takes back what it
-  made.
-- The REA version is read again when the installed files change (`rea_reading`), so a new install is seen without
-  a restart. A profile path is compared as it is on a Mac or Linux. Only Windows folds case.
+  made. A note that it made in the folder the galaxy has left is removed by its identity only
+  (`Galaxy.unbirth_left`: a plain file in the bound folder whose bytes still have the `born` fingerprint).
+  `Galaxy.unbirth` itself never takes a receipt of another folder.
+- The REA version is read from the installed files on EVERY call (`rea_reading`): there is no cache, so a new
+  install is seen at once. A profile path is compared as it is on a Mac or Linux. Only Windows folds case.
 - `run_rea` runs only the pinned REA version. On a Mac or Linux a process is "our Chrome" only when the system
   says that its program is the browser that `find_chrome()` gives, the `chrome` file beside it, one of its Mac
   helpers, or Chrome's crash helper (`ps -o comm=`, joined by pid in `posix_table`; `is_chrome_program`), and it

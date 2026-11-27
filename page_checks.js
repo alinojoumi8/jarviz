@@ -6,7 +6,7 @@
    page did. Nothing goes to the network, and no file is read except the two that are named.
 
    preflight runs it:   node page_checks.js viewer/core.js viewer/app.js
-   It prints ONE line on stdout, JSON: {"pass": 108, "fail": 0, "failures": []}. The exit code is 0 when it
+   It prints ONE line on stdout, JSON: {"pass": 143, "fail": 0, "failures": []}. The exit code is 0 when it
    ran to its end, also when a rule failed. Any other exit code means it could not run (a file is
    missing, or the page code threw while it loaded); the reason is on stderr.
    For people:          node page_checks.js viewer/core.js viewer/app.js --list   (the name of every check)
@@ -51,13 +51,31 @@ function makeElement(id, tag = 'div') {
 
 // Elements that index.html starts hidden.
 const HIDDEN_AT_START = ['panel', 'teardown', 'reader', 'answer', 'heard', 'reader-obsidian', 'td-line', 'td-done',
-                         'td-shot', 'brain', 'muted'];
+                         'td-shot', 'brain', 'voice', 'muted'];
 
-// One fresh page. options: graph (the GRAPH on the page), handlers (path -> answer), reduced (reduced motion).
+// A handler may answer with a whole response instead of a JSON body: the audio of /voice/speak, or a refusal with
+// its HTTP status.
+const RESPONSE = Symbol('response');
+const audioResponse = (parts, bytes = 'mp3') => ({ [RESPONSE]: true, status: 200, type: 'audio/mpeg',
+  headers: { 'x-jarviz-parts': String(parts) }, blob: { bytes } });
+const refusal = (status, body) => ({ [RESPONSE]: true, status, type: 'application/json', headers: {}, body });
+
+// One fresh page. options: graph (the GRAPH on the page), handlers (path -> answer), reduced (reduced motion),
+// search (the address, default "?mute=1"), synth (a fake speechSynthesis), storage (localStorage items, or
+// "blocked"), audio (play -> "ok" | "reject", for each new audio element in turn).
 function page(sources, options = {}) {
   let now = 0, nextId = 1, timers = [];
   const setTimer = (fn, ms = 0) => { const id = nextId++; timers.push({ id, at: now + (ms || 0), fn }); return id; };
   const clearTimer = id => { timers = timers.filter(timer => timer.id !== id); };
+  const repeating = new Set();
+  const setRepeat = (fn, ms = 0) => {
+    const id = nextId++;
+    const run = () => { if (!repeating.has(id)) return; fn(); if (repeating.has(id)) timers.push({ id, at: now + ms, fn: run }); };
+    repeating.add(id);
+    timers.push({ id, at: now + ms, fn: run });
+    return id;
+  };
+  const clearRepeat = id => { repeating.delete(id); clearTimer(id); };
   async function tick(ms) {             // let fake time pass, running every timer that falls due
     const end = now + ms;
     await settle();
@@ -75,11 +93,15 @@ function page(sources, options = {}) {
   }
 
   const elements = new Map();
+  const statusLog = [];                 // every state the status chip showed: idle, thinking, speaking ...
   const document = {
     getElementById(id) {
       if (!elements.has(id)) {
         const node = makeElement(id);
         node.hidden = HIDDEN_AT_START.includes(id);
+        if (id === 'status') {
+          node.dataset = new Proxy({}, { set(target, key, value) { if (key === 'state') statusLog.push(value); target[key] = value; return true; } });
+        }
         elements.set(id, node);
       }
       return elements.get(id);
@@ -128,22 +150,87 @@ function page(sources, options = {}) {
         init.signal.addEventListener('abort', () => reject(aborted()));
       }
       if (!handler) return reject(new Error('no answer for ' + url));
-      Promise.resolve().then(() => handler(String(url), init)).then(body => resolve({
-        ok: true, status: 200,
-        json: async () => (typeof body === 'string' ? JSON.parse(body) : body),
-        text: async () => (typeof body === 'string' ? body : JSON.stringify(body)),
-      }), reject);
+      Promise.resolve().then(() => handler(String(url), init)).then(answer => {
+        const whole = answer && answer[RESPONSE] ? answer : { status: 200, type: 'application/json', headers: {}, body: answer };
+        const body = whole.body;
+        const headers = Object.assign({ 'content-type': whole.type }, whole.headers);
+        resolve({
+          ok: whole.status < 400, status: whole.status,
+          headers: { get: name => (headers[String(name).toLowerCase()] === undefined ? null : headers[String(name).toLowerCase()]) },
+          json: async () => (typeof body === 'string' ? JSON.parse(body) : body),
+          text: async () => (typeof body === 'string' ? body : JSON.stringify(body)),
+          blob: async () => whole.blob || { bytes: '' },
+        });
+      }, reject);
     });
   }
+
+  // The browser's voice, when the story asks for it: every utterance is kept; finish() ends the one being said.
+  const synth = options.synth ? {
+    speaking: false, pending: false, said: [], cancels: 0, now: null,
+    speak(utterance) {
+      this.said.push(utterance.text);
+      this.now = utterance;
+      this.speaking = true;
+      Promise.resolve().then(() => { if (this.now === utterance && utterance.onstart) utterance.onstart(); });
+    },
+    cancel() {
+      this.cancels += 1;
+      const was = this.now;
+      this.now = null;
+      this.speaking = false;
+      if (was && was.onerror) Promise.resolve().then(() => was.onerror({ error: 'canceled' }));
+    },
+    finish() {
+      const was = this.now;
+      this.now = null;
+      this.speaking = false;
+      if (was && was.onend) was.onend();
+    },
+    getVoices: () => [],
+  } : undefined;
+  function FakeUtterance(text) { this.text = text; }
+
+  // Audio elements and object URLs. play() resolves, or rejects when options.audio says so for that element.
+  const audios = [];
+  const liveUrls = new Set();
+  let urlCount = 0;
+  const playPlan = (options.audio || []).slice();
+  class FakeAudio {
+    constructor(src) { this.src = src; this.played = false; this.paused = true; audios.push(this); }
+    play() {
+      this.played = true;
+      this.paused = false;
+      return playPlan.shift() === 'reject' ? Promise.reject(new Error('NotAllowedError')) : Promise.resolve();
+    }
+    pause() { this.paused = true; }
+    end() { this.paused = true; if (this.onended) this.onended(); }        // the part played to its end
+    fail() { if (this.onerror) this.onerror(new Error('decode')); }        // an error event on the element
+  }
+  class PageURL extends URL {
+    static createObjectURL(blob) { const url = 'blob:part-' + (++urlCount) + ':' + (blob && blob.bytes); liveUrls.add(url); return url; }
+    static revokeObjectURL(url) { liveUrls.delete(url); }
+  }
+
+  const stored = options.storage === 'blocked' ? null : Object.assign({}, options.storage || {});
+  const refuse = () => { throw new Error('SecurityError: the storage is blocked'); };
+  const localStorage = stored === null ? { getItem: refuse, setItem: refuse, removeItem: refuse } : {
+    getItem: key => (key in stored ? stored[key] : null),
+    setItem: (key, value) => { stored[key] = String(value); },
+    removeItem: key => { delete stored[key]; },
+  };
 
   const consoleLines = [];             // the page's console goes here, never to stdout
   const keep = (...parts) => consoleLines.push(parts.map(String).join(' '));
   const sandbox = {
     console: { log: keep, warn: keep, error: keep, info: keep, debug: keep },
-    document, setTimeout: setTimer, clearTimeout: clearTimer, requestAnimationFrame: () => 0,
-    performance: { now: () => now }, fetch: fakeFetch, AbortController, URLSearchParams, URL, crypto: globalThis.crypto,
+    document, setTimeout: setTimer, clearTimeout: clearTimer, setInterval: setRepeat, clearInterval: clearRepeat,
+    requestAnimationFrame: () => 0,
+    performance: { now: () => now }, fetch: fakeFetch, AbortController, URLSearchParams, URL: PageURL, crypto: globalThis.crypto,
     sessionStorage: { items: {}, getItem(k) { return this.items[k] || null; }, setItem(k, v) { this.items[k] = String(v); } },
-    navigator: { language: 'en-GB' }, location: { search: '?mute=1' },       // a muted tab: the page never speaks
+    localStorage, Audio: FakeAudio, speechSynthesis: synth, SpeechSynthesisUtterance: synth ? FakeUtterance : undefined,
+    // a muted tab by default: the page never speaks
+    navigator: { language: 'en-GB' }, location: { search: options.search === undefined ? '?mute=1' : options.search },
     matchMedia: () => ({ matches: Boolean(options.reduced) }), addEventListener() {}, innerWidth: 1400, innerHeight: 900,
     SpeechRecognition: FakeRecognition, ForceGraph3D,
     GRAPH: options.graph || galaxy(5, ['A', 'B', 'C']),
@@ -154,7 +241,7 @@ function page(sources, options = {}) {
   vm.runInContext(sources.core, sandbox, { filename: 'core.js' });
   vm.runInContext(sources.app, sandbox, { filename: 'app.js' });
   return { $: id => document.getElementById(id), J: () => sandbox.Jarviz, tick, fetchLog, handlers, recognizers,
-           controls, graphLog, consoleLines };
+           controls, graphLog, consoleLines, synth, audios, liveUrls, stored, statusLog };
 }
 
 // ------------------------------------------------------------------ small makers
@@ -1125,6 +1212,322 @@ story('a cancel answer names its job', {
   await T.cancel();                                   // a late answer about D, while E is followed
   await p.tick(800);
   t.check('lateFail', p.$('answer').textContent === 'E failed', p.$('answer').textContent);
+});
+
+// ------------------------------------------------------------------ the voices
+
+const voiceOffer = (fallback = 'browser', hasKey = true) => ({ default: fallback, voices: [
+  { name: 'browser', label: 'browser', model: '', has_key: true },
+  { name: 'deepgram', label: 'Deepgram', model: 'aura-2-draco-en', has_key: hasKey },
+] });
+const statusWith = voice => () => ({ ok: true, active: { label: 'Claude', model: 'm', has_key: true }, lines: {}, graph: meta(5), voice });
+const speakAsks = p => p.fetchLog.filter(entry => entry.key === '/voice/speak').map(entry => entry.body);
+const voiceNotes = p => p.$('answer').children.filter(child => child.className === 'voice-note').map(child => child.textContent);
+// How often the page said "speaking ended": the status chip left "speaking".
+const speakingEnds = p => p.statusLog.filter((state, index) => index > 0 && p.statusLog[index - 1] === 'speaking' && state !== 'speaking').length;
+const partOf = init => JSON.parse(init.body).part;
+// A tab that speaks (not muted), with a fake browser voice. The greeting that waits for the first click is dropped,
+// so a story counts only its own lines.
+async function speakingPage(open, options = {}) {
+  const p = await open(Object.assign({ search: '', synth: true }, options));
+  p.J().speaker.stop();
+  p.J().speaker.unlock();
+  return p;
+}
+
+story('a voice switch by voice', {
+  voice: 'with the word "voice" any name is taken; without it only the fixed names, at the end of the sentence',
+  notVoice: 'a sentence that only talks about a voice is no voice switch ("what is your voice like", "use your voice to read this")',
+  apart: 'a sentence that matchBrainSwitch takes is never taken by matchVoiceSwitch, and the other way round',
+}, async (t, open) => {
+  const p = await open();
+  const { matchVoiceSwitch, matchBrainSwitch } = p.J().Core;
+  const voiceCases = [
+    ['switch voice to deepgram', 'deepgram'], ['change your voice to Deepgram', 'Deepgram'], ['switch to the deepgram voice', 'deepgram'],
+    ['use the browser voice', 'browser'], ['Jarvis, use the Deepgram voice please', 'Deepgram'], ['speak with deepgram', 'deepgram'],
+    ['talk with the browser voice', 'browser'], ['speak in the normal voice', 'normal'], ['Switch voice to Deep Gram.', 'Deep Gram'],
+  ];
+  const wrong = voiceCases.filter(([sentence, name]) => matchVoiceSwitch(sentence) !== name)
+    .map(([sentence, name]) => `"${sentence}" gave ${JSON.stringify(matchVoiceSwitch(sentence))}, not ${JSON.stringify(name)}`);
+  t.check('voice', !wrong.length, wrong.join('; '));
+  const notVoice = ['switch brain to deepseek', 'switch to codex', 'what is your voice like', 'use your voice to read this',
+    'my voice is tired', 'speak with the manager', 'use your voice'].filter(sentence => matchVoiceSwitch(sentence) !== null);
+  t.check('notVoice', !notVoice.length, notVoice.join(' / '));
+  const brainSentences = ['Switch brain to Deep Seek.', 'Jarvis, use the OpenAI brain', 'switch to claude', 'switch to codex',
+    'switch brain to the deepgram voice', 'use the deepgram voice brain', 'switch to the browser brain', 'change brain to voice'];
+  const voiceSentences = voiceCases.map(([sentence]) => sentence).concat(['switch voice to the claude brain', 'use the brain voice']);
+  const both = brainSentences.concat(voiceSentences).filter(sentence => matchBrainSwitch(sentence) && matchVoiceSwitch(sentence));
+  const brainTaken = brainSentences.filter(sentence => !matchBrainSwitch(sentence) || matchVoiceSwitch(sentence));
+  const voiceTaken = voiceSentences.filter(sentence => !matchVoiceSwitch(sentence) || matchBrainSwitch(sentence));
+  t.check('apart', !both.length && !brainTaken.length && !voiceTaken.length,
+    `both: ${both.join(' / ')}; brain lost: ${brainTaken.join(' / ')}; voice lost: ${voiceTaken.join(' / ')}`);
+});
+
+story('the voice switch', {
+  route: '"switch voice to deepgram" posts /voice once, with the name that was said, and nothing goes to the brain',
+  taken: 'an ok answer makes its voice the page\'s voice: kept in localStorage under jarviz_voice, shown on the chip',
+  newVoice: 'the answer line is shown and said with the NEW voice (it asks /voice/speak for that line)',
+  refused: 'a refused switch keeps the old voice: its line is shown and said with the browser voice, nothing is kept',
+  offline: 'no answer from the server shows the plain line for it',
+}, async (t, open) => {
+  const deepgram = { name: 'deepgram', label: 'Deepgram', model: 'aura-2-draco-en', has_key: true };
+  const p = await speakingPage(open, { handlers: {
+    '/status': statusWith(voiceOffer('browser')),
+    '/voice': () => ({ ok: true, answer: 'Deepgram it is.', nodes: [], graph: meta(5), voice: deepgram }),
+    '/voice/speak': () => audioResponse(1),
+  } });
+  await p.J().handleInput('switch voice to deepgram');
+  await p.tick(0);
+  const posts = p.fetchLog.filter(entry => entry.key === '/voice');
+  t.check('route', posts.length === 1 && posts[0].body.name === 'deepgram' && count(p.fetchLog, '/chat') === 0, JSON.stringify(posts));
+  t.check('taken', p.stored.jarviz_voice === 'deepgram' && p.$('voice').hidden === false
+    && p.$('voice').textContent === 'voice: Deepgram · aura-2-draco-en', `${JSON.stringify(p.stored)} / ${p.$('voice').textContent}`);
+  const asked = speakAsks(p);
+  t.check('newVoice', asked.length === 1 && asked[0].text === 'Deepgram it is.' && asked[0].part === 0
+    && p.$('answer').textContent === 'Deepgram it is.' && !p.synth.said.includes('Deepgram it is.'),
+    `${JSON.stringify(asked)} / browser said ${JSON.stringify(p.synth.said)}`);
+
+  const q = await speakingPage(open, { handlers: {
+    '/status': statusWith(voiceOffer('browser', false)),
+    '/voice': () => refusal(409, { ok: false, error: 'voice_no_key', answer: 'No key for that voice.', nodes: [], graph: meta(5) }),
+    '/voice/speak': () => audioResponse(1),
+  } });
+  await q.J().handleInput('switch voice to deepgram');
+  await q.tick(0);
+  t.check('refused', q.$('voice').textContent === 'voice: browser' && speakAsks(q).length === 0 && q.synth.said.includes('No key for that voice.')
+    && q.$('answer').textContent === 'No key for that voice.' && !('jarviz_voice' in q.stored),
+    `${q.$('voice').textContent} / ${JSON.stringify(q.synth.said)} / ${JSON.stringify(q.stored)}`);
+
+  const r = await speakingPage(open, { handlers: { '/status': statusWith(voiceOffer('browser')) } });     // /voice does not answer
+  await r.J().handleInput('switch voice to deepgram');
+  await r.tick(0);
+  t.check('offline', r.$('answer').textContent === 'I could not switch voices. I could not reach the server.'
+    && r.$('voice').textContent === 'voice: browser', `${r.$('answer').textContent} / ${r.$('voice').textContent}`);
+});
+
+story('the server voice says a line in its parts', {
+  first: 'with the server voice a line asks /voice/speak for part 0, with the whole text',
+  ahead: 'part 1 is asked for while part 0 plays, with the same whole text (the header said 2 parts)',
+  order: 'the parts play in order: part 1 starts only after part 0 ended, and no part 2 is asked for',
+  ended: 'the "speaking ended" signal comes once, after the last part',
+  urls: 'every object URL is given back at the end',
+}, async (t, open) => {
+  const p = await speakingPage(open, { handlers: {
+    '/status': statusWith(voiceOffer('deepgram')),
+    '/voice/speak': (url, init) => audioResponse(2, 'part' + partOf(init)),
+  } });
+  p.J().speaker.speak('One sentence. Another sentence.');
+  await p.tick(0);
+  const asked = speakAsks(p);
+  t.check('first', asked.length >= 1 && asked[0].part === 0 && asked[0].text === 'One sentence. Another sentence.', JSON.stringify(asked));
+  const first = p.audios[0];
+  t.check('ahead', asked.length === 2 && asked[1].part === 1 && asked[1].text === asked[0].text && p.audios.length === 1
+    && first.played && !first.paused && p.J().status() === 'speaking', `${JSON.stringify(asked)} / ${p.audios.length} audios`);
+  first.end();
+  await p.tick(0);
+  const second = p.audios[1];
+  const between = speakingEnds(p);
+  t.check('order', p.audios.length === 2 && /part0$/.test(first.src) && Boolean(second) && /part1$/.test(second.src) && second.played
+    && speakAsks(p).length === 2, `${p.audios.map(audio => audio.src)} / ${speakAsks(p).length} asks`);
+  second.end();
+  await p.tick(0);
+  t.check('ended', between === 0 && speakingEnds(p) === 1 && p.J().status() !== 'speaking', `${between} then ${speakingEnds(p)} ends`);
+  t.check('urls', p.liveUrls.size === 0, [...p.liveUrls].join(', '));
+});
+
+story('a server voice part that fails', {
+  rest: 'a part that cannot be fetched hands the line to the browser voice at once',
+  ended: 'that line ends once: one "speaking ended" signal, after the browser voice finished',
+  once: 'the server\'s line is shown once, and again only after a part played well',
+  play: 'a part whose play() is refused, or whose audio has an error event, hands the line to the browser voice too',
+}, async (t, open) => {
+  const refused = () => refusal(503, { ok: false, error: 'voice_key_invalid', answer: 'The Deepgram key was refused.' });
+  let plan = (part) => (part === 0 ? audioResponse(2) : refused());           // part 0 plays, part 1 fails
+  const p = await speakingPage(open, { handlers: {
+    '/status': statusWith(voiceOffer('deepgram')),
+    '/voice/speak': (url, init) => plan(partOf(init)),
+  } });
+  p.J().speaker.speak('Line one. Its end.');
+  await p.tick(0);
+  p.audios[0].end();                                  // part 0 played well; part 1 cannot be had
+  await p.tick(0);
+  t.check('rest', p.synth.said.length === 1 && p.synth.said[0] === 'Line one. Its end.' && p.audios.length === 1,
+    `${JSON.stringify(p.synth.said)} / ${p.audios.length} audios`);
+  p.synth.finish();
+  await p.tick(0);
+  t.check('ended', speakingEnds(p) === 1, `${speakingEnds(p)} ends`);
+  plan = () => refused();
+  p.J().speaker.speak('Line two.');                   // fails too: no second note
+  await p.tick(0);
+  p.synth.finish();
+  await p.tick(0);
+  const afterTwo = voiceNotes(p).length;
+  plan = () => audioResponse(1);
+  p.J().speaker.speak('Line three.');                 // plays well
+  await p.tick(0);
+  p.audios[p.audios.length - 1].end();
+  await p.tick(0);
+  plan = () => refused();
+  p.J().speaker.speak('Line four.');                  // fails after a good part: the note comes again
+  await p.tick(0);
+  t.check('once', afterTwo === 1 && voiceNotes(p).length === 2 && voiceNotes(p)[0] === 'The Deepgram key was refused.',
+    `${afterTwo} then ${JSON.stringify(voiceNotes(p))}`);
+
+  const q = await speakingPage(open, { audio: ['reject'], handlers: {
+    '/status': statusWith(voiceOffer('deepgram')), '/voice/speak': () => audioResponse(1),
+  } });
+  q.J().speaker.speak('Refused play.');
+  await q.tick(0);
+  q.J().speaker.speak('Broken audio.');
+  await q.tick(0);
+  const broken = q.audios[1];
+  if (broken) broken.fail();
+  await q.tick(0);
+  t.check('play', q.synth.said.join('|') === 'Refused play.|Broken audio.' && q.liveUrls.size === 0 && voiceNotes(q).length === 1
+    && voiceNotes(q)[0] === 'The server voice did not play. The browser voice speaks instead.',
+    `${JSON.stringify(q.synth.said)} / ${q.liveUrls.size} urls / ${JSON.stringify(voiceNotes(q))}`);
+});
+
+story('three server voice failures in a row', {
+  stop: 'after three failing lines in a row the page asks the server voice no more: the browser voice speaks',
+  chip: 'the chip shows that the server voice is off',
+  again: '"switch voice to deepgram" asks the server voice again',
+}, async (t, open) => {
+  let plan = () => refusal(503, { ok: false, error: 'voice_unreachable', answer: 'Deepgram cannot be reached.' });
+  const p = await speakingPage(open, { handlers: {
+    '/status': statusWith(voiceOffer('deepgram')),
+    '/voice/speak': () => plan(),
+    '/voice': () => ({ ok: true, answer: 'Back to Deepgram.', nodes: [], graph: meta(5),
+                       voice: { name: 'deepgram', label: 'Deepgram', model: 'aura-2-draco-en', has_key: true } }),
+  } });
+  for (const line of ['One.', 'Two.', 'Three.', 'Four.']) {
+    p.J().speaker.speak(line);
+    await p.tick(0);
+    p.synth.finish();
+    await p.tick(0);
+  }
+  t.check('stop', speakAsks(p).length === 3 && p.synth.said.join('|') === 'One.|Two.|Three.|Four.',
+    `${speakAsks(p).length} asks / ${JSON.stringify(p.synth.said)}`);
+  t.check('chip', p.$('voice').textContent === 'voice: browser · Deepgram off' && p.$('voice').classList.contains('warn'), p.$('voice').textContent);
+  plan = () => audioResponse(1);
+  await p.J().handleInput('switch voice to deepgram');
+  await p.tick(0);
+  const asks = speakAsks(p);
+  t.check('again', asks.length === 4 && asks[3].text === 'Back to Deepgram.' && p.$('voice').textContent === 'voice: Deepgram · aura-2-draco-en',
+    `${asks.length} asks / ${p.$('voice').textContent}`);
+});
+
+story('a muted tab asks for no audio', {
+  muted: 'a ?mute=1 tab with the server voice sends no request to /voice/speak, for any line',
+  control: 'the same page without ?mute=1 asks for the audio of its line',
+}, async (t, open) => {
+  const handlers = { '/status': statusWith(voiceOffer('deepgram')), '/voice/speak': () => audioResponse(1), '/chat': () => chatReply('An answer', 5) };
+  const p = await open({ search: '?mute=1', synth: true, handlers });
+  p.J().speaker.unlock();
+  p.J().speaker.speak('A line.');
+  await p.J().handleInput('a question');
+  await p.tick(1000);
+  t.check('muted', speakAsks(p).length === 0 && p.$('voice').textContent === 'voice: Deepgram · aura-2-draco-en',
+    `${speakAsks(p).length} asks / ${p.$('voice').textContent}`);
+  const q = await speakingPage(open, { handlers });
+  q.J().speaker.speak('A line.');
+  await q.tick(0);
+  t.check('control', speakAsks(q).length === 1 && speakAsks(q)[0].text === 'A line.', JSON.stringify(speakAsks(q)));
+});
+
+story('a stop while a server voice part plays', {
+  stopped: '"stop" during a part stops its audio at once and gives its URL back',
+  dropped: 'the part that was still on its way never plays, and no later part is asked for',
+  ended: 'the "speaking ended" signal comes once',
+}, async (t, open) => {
+  const late = deferred();
+  const p = await speakingPage(open, { handlers: {
+    '/status': statusWith(voiceOffer('deepgram')),
+    '/voice/speak': (url, init) => (partOf(init) === 0 ? audioResponse(3, 'part0') : late.promise),
+  } });
+  p.J().speaker.speak('A long line. In three parts. The end.');
+  await p.tick(0);
+  const playing = p.audios[0];
+  await p.J().handleInput('stop');
+  await p.tick(0);
+  t.check('stopped', Boolean(playing) && playing.paused && p.liveUrls.size === 0, `${playing && playing.paused} / ${p.liveUrls.size} urls`);
+  late.resolve(audioResponse(3, 'part1'));
+  await p.tick(2000);
+  t.check('dropped', p.audios.length === 1 && speakAsks(p).length === 2 && p.liveUrls.size === 0,
+    `${p.audios.length} audios / ${speakAsks(p).map(ask => ask.part)} / ${p.liveUrls.size} urls`);
+  t.check('ended', speakingEnds(p) === 1 && p.J().status() !== 'speaking', `${speakingEnds(p)} ends`);
+});
+
+story('the server voice keeps the queue rule of speak', {
+  click: 'a line before the first click asks for no audio; after the click only the last such line is asked for',
+  newest: 'a new line while a part plays stops that part at once, gives its URL back, drops its next part, and asks for the new line',
+  signals: 'the cut line sends no "speaking ended" of its own; the new line ends once',
+}, async (t, open) => {
+  const p = await open({ search: '', synth: true, handlers: {
+    '/status': statusWith(voiceOffer('deepgram')),
+    '/voice/speak': (url, init) => audioResponse(2, JSON.parse(init.body).text + '#' + partOf(init)),
+  } });
+  p.J().speaker.speak('Early one.');                  // the greeting and these wait for the first click
+  p.J().speaker.speak('Early two.');
+  await p.tick(0);
+  const before = speakAsks(p).length;
+  p.J().speaker.unlock();
+  await p.tick(0);
+  const asked = speakAsks(p);
+  t.check('click', before === 0 && asked.length === 2 && asked[0].text === 'Early two.' && asked[0].part === 0 && asked[1].part === 1,
+    `${before} before / ${JSON.stringify(asked)}`);
+  const old = p.audios[0];
+  p.J().speaker.speak('The new line.');
+  await p.tick(0);
+  const fresh = p.audios[1];
+  t.check('newest', Boolean(old) && old.paused && Boolean(fresh) && /The new line\.#0$/.test(fresh.src) && fresh.played
+    && p.audios.length === 2 && p.liveUrls.size === 1, `${p.audios.map(audio => audio.src)} / ${p.liveUrls.size} urls`);
+  fresh.end();
+  await p.tick(0);
+  p.audios[p.audios.length - 1].end();
+  await p.tick(0);
+  t.check('signals', speakingEnds(p) === 1 && p.liveUrls.size === 0 && p.audios.length === 3 && /The new line\.#1$/.test(p.audios[2].src),
+    `${speakingEnds(p)} ends / ${p.audios.map(audio => audio.src)} / ${p.liveUrls.size} urls`);
+});
+
+story('the voice at start', {
+  kept: 'the kept choice is used at start when the status says that voice is there with a key',
+  noKey: 'a kept choice without a key any more falls back to the browser voice, without a word',
+  blocked: 'with localStorage blocked the page starts with the server\'s default',
+  keptBrowser: 'a kept "browser" wins over a server default',
+}, async (t, open) => {
+  const start = async (storage, offer) => {
+    const p = await speakingPage(open, { storage, handlers: { '/status': statusWith(offer), '/voice/speak': () => audioResponse(1) } });
+    p.J().speaker.speak('Hi.');
+    await p.tick(0);
+    return p;
+  };
+  let p = await start({ jarviz_voice: 'deepgram' }, voiceOffer('browser', true));
+  t.check('kept', p.$('voice').textContent === 'voice: Deepgram · aura-2-draco-en' && speakAsks(p).length === 1, p.$('voice').textContent);
+  p = await start({ jarviz_voice: 'deepgram' }, voiceOffer('browser', false));
+  t.check('noKey', p.$('voice').textContent === 'voice: browser' && speakAsks(p).length === 0 && p.synth.said.includes('Hi.')
+    && voiceNotes(p).length === 0 && p.$('answer').textContent === 'Hello.',          // the greeting only
+    `${p.$('voice').textContent} / ${speakAsks(p).length} asks / ${p.$('answer').textContent} / ${JSON.stringify(voiceNotes(p))}`);
+  p = await start('blocked', voiceOffer('deepgram', true));
+  t.check('blocked', p.$('voice').textContent === 'voice: Deepgram · aura-2-draco-en' && speakAsks(p).length === 1, p.$('voice').textContent);
+  p = await start({ jarviz_voice: 'browser' }, voiceOffer('deepgram', true));
+  t.check('keptBrowser', p.$('voice').textContent === 'voice: browser' && speakAsks(p).length === 0, p.$('voice').textContent);
+});
+
+story('an old server without voices', {
+  chip: 'with no "voice" in /status the voice chip stays hidden',
+  browser: 'lines are said with the browser voice, and no audio is asked for',
+  route: '"switch voice to deepgram" goes to the brain, as before',
+}, async (t, open) => {
+  const p = await speakingPage(open, { handlers: { '/chat': () => chatReply('As before', 5), '/voice/speak': () => audioResponse(1) } });
+  t.check('chip', p.$('voice').hidden === true);
+  p.J().speaker.speak('A line.');
+  await p.tick(0);
+  t.check('browser', speakAsks(p).length === 0 && p.synth.said.includes('A line.'), JSON.stringify(p.synth.said));
+  await p.J().handleInput('switch voice to deepgram');
+  await p.tick(0);
+  t.check('route', count(p.fetchLog, '/chat') === 1 && count(p.fetchLog, '/voice') === 0 && p.$('answer').textContent === 'As before',
+    `${count(p.fetchLog, '/chat')} chats / ${count(p.fetchLog, '/voice')} voice posts`);
 });
 
 story('the harness reports trouble', {

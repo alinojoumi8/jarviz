@@ -32,6 +32,7 @@ from urllib.parse import parse_qs, parse_qsl, quote, unquote, urlencode
 
 import brains
 import build
+import voices
 
 try:
     import teardown         # the teardown bay (Part Two). Jarviz starts fine without it.
@@ -140,6 +141,17 @@ LINES = {
     "teardown_last": "The last one on file, sir: {label}.",
     "server_error": "Something went wrong on my side, sir. The server window has the details.",
     "locked": "This page has lost its key, sir. Close it and start me again with start-jarviz.bat.",
+    # The voice Jarviz speaks with (voices.py). The page keeps the choice; the server only judges it.
+    "voice_switched": "Very good, sir. I shall speak with the {voice} voice.",
+    "no_such_voice": "I know no voice by that name, sir. I have the browser voice and the Deepgram voice.",
+    "voice_no_key": "The {voice} voice has no key yet, sir. Type it into config.json, on the line \"{key_line}\".",
+    "voice_bad_key": "The {voice} key in config.json was refused, sir. Please check it.",
+    "voice_no_credit": "The {voice} account has no credit left, sir.",
+    "voice_no_model": "The voice named in config.json, {model}, is not one {voice} knows, sir.",
+    "voice_busy": "The {voice} voice is busy, sir. Give it a moment.",
+    "voice_offline": "I cannot reach the {voice} voice, sir. The internet connection may be down.",
+    "voice_error": "The {voice} voice returned an error, sir. {reason}",
+    "speak_bad_request": "There was nothing there for me to say aloud, sir.",
 }
 
 # Lines the PAGE says by itself: the greeting, and what to say when the server does not answer. The
@@ -155,6 +167,8 @@ PAGE_LINES = {
     "teardown_unreachable": "I could not start the teardown, sir. I could not reach the server.",
     "cancel_unreachable": "I could not cancel it, sir. I could not reach the server.",
     "teardown_missing": "I cannot find that teardown on file, sir.",
+    "voice_unreachable": "I could not switch voices, sir. I could not reach the server.",
+    "voice_failed": "My server voice did not play, sir. The browser voice speaks instead.",
 }
 # ============================ END OF PERSONA BLOCK ============================
 
@@ -191,8 +205,9 @@ VIEWER_ROOT = build.VIEWER_DIR.resolve()
 CONFIG_PATH = build.CONFIG_PATH
 KEY_PLACEHOLDER = brains.KEY_PLACEHOLDER
 # config.json: the active brain, a key and a model for every brain (see brains.py; a sign-in brain has a model line
-# only, empty for the tool's own default), the notes folder.
-DEFAULT_CONFIG = {**brains.default_config(), "notes_dir": build.DEFAULT_NOTES_DIR}
+# only, empty for the tool's own default), the voice with a key and a voice id for Deepgram (see voices.py), the notes
+# folder. An old config.json without the voice lines gets their defaults.
+DEFAULT_CONFIG = {**brains.default_config(), **voices.default_config(), "notes_dir": build.DEFAULT_NOTES_DIR}
 CONFIG_LOCK = threading.Lock()
 # Which spoken line goes with which brain problem (the codes come from brains.BrainError).
 BRAIN_LINES = {
@@ -202,8 +217,16 @@ BRAIN_LINES = {
     "refused": "declined", "empty_reply": "empty",
     # the sign-in brains (Codex, Antigravity). cli_failed falls to brain_error.
     "cli_missing": "no_cli", "cli_signed_out": "signed_out", "cli_tool_ran": "tool_ran",
-    "cli_not_locked": "not_locked", "cli_limit": "limit", "cli_timeout": "busy",
+    "cli_not_locked": "not_locked", "cli_limit": "limit", "cli_timeout": "busy", "cli_not_started": "busy",
 }
+# Which spoken line goes with which voice problem (the codes come from voices.VoiceError). The rest is voice_error.
+VOICE_LINES = {
+    "voice_key_missing": "voice_no_key", "voice_key_invalid": "voice_bad_key", "voice_no_access": "voice_bad_key",
+    "voice_no_credit": "voice_no_credit", "voice_not_found": "voice_no_model", "voice_busy": "voice_busy",
+    "voice_unreachable": "voice_offline",
+}
+SERVER_VOICE = "deepgram"       # the one voice the server speaks with (/voice/speak). The browser voice is the page's.
+MAX_SPEAK_CHARS = 6000          # a cost guard: /voice/speak cuts a longer text here, before it splits it into requests
 
 RETRIEVE_TOP = 6                # notes handed to the brain with each question
 NOTE_CHARS_FOR_BRAIN = 12000    # a longer note is cut, and the brain is told so
@@ -255,11 +278,30 @@ SECURITY_HEADERS = (
 
 # -------------------------------------------------------------------- config
 
+PRIVATE_MODE = 0o600            # config.json holds the keys: only its owner may read it (on a Mac or Linux)
+
+
+def _new_private_file(path: Path) -> int:
+    """A NEW file (never over one that is there: FileExistsError) that only its owner may read and write, from the
+    first moment: the mode is given when it is made, not afterwards. Returns its descriptor, open for writing. On
+    Windows the mode only says "not read-only"."""
+    return os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), PRIVATE_MODE)
+
+
+def _same_mode_as(descriptor: int, original: Path) -> None:
+    """Give a staging file the permission bits of the config.json it will replace, so a replace never makes the keys
+    readable for more people than before (0600 stays 0600, 0644 stays 0644). Windows keeps no such bits (its mode is a
+    read-only flag only), so there nothing is changed."""
+    if os.name == "nt" or not hasattr(os, "fchmod"):
+        return
+    os.fchmod(descriptor, stat.S_IMODE(os.stat(original).st_mode) & 0o777)
+
+
 def write_starter_config() -> None:
     """At start-up only (main): when there is no config.json yet, write one with the defaults, for the user to fill
     in. It never writes over a file. When it cannot be written, Jarviz says so and runs on the defaults."""
     try:
-        with open(CONFIG_PATH, "x", encoding="utf-8", newline="\n") as handle:
+        with os.fdopen(_new_private_file(CONFIG_PATH), "w", encoding="utf-8", newline="\n") as handle:
             handle.write(json.dumps(DEFAULT_CONFIG, indent=2) + "\n")
     except FileExistsError:
         pass
@@ -366,14 +408,18 @@ def save_brain_choice(name: str) -> None:
                 != {key: value for key, value in old.items() if key != "brain"}):
             raise ValueError("config.json could not be changed safely, so it was left as it is")
         # The new text is staged in a file of its own and then put in place in one step: a half-written config.json
-        # would lose the keys. The staging file holds the keys too, so it is made new ("x": never over a file that is
-        # there, it is not ours) and always removed. A crash between the two steps leaves it: main() sweeps it.
+        # would lose the keys. The staging file holds the keys too, so it is made new (never over a file that is
+        # there, it is not ours), readable by its owner only from the first moment, and always removed. Before the
+        # replace it gets the permission bits of config.json: never wider. A crash between the steps leaves it: main()
+        # sweeps it.
         temp = CONFIG_PATH.with_name(f"{CONFIG_PATH.name}.{os.getpid()}.tmp")
         made = False
         try:
-            with open(temp, "xb") as handle:
-                made = True
+            descriptor = _new_private_file(temp)
+            made = True
+            with os.fdopen(descriptor, "wb") as handle:
                 handle.write(bom + changed.encode("utf-8"))
+                _same_mode_as(handle.fileno(), CONFIG_PATH)
             os.replace(temp, CONFIG_PATH)
         finally:
             if made:
@@ -459,6 +505,29 @@ def vault_of(notes_dir: Path) -> str:
 
 class NotesMoved(ValueError):
     """The galaxy now shows another notes folder than the one a writer bound itself to (birth_note's `vault`)."""
+
+
+def _own_file(folder: Path, rel_path) -> Path:
+    """The note file at `rel_path` (a receipt's "file": "captures/Jarviz.md") inside `folder`, found without following
+    a link: every step of the way is a real folder and the note is a plain file (no link, no junction). Raises
+    ValueError for anything else: then nothing is touched."""
+    if not isinstance(rel_path, str) or not rel_path.endswith(".md"):
+        raise ValueError("the receipt names no note file")
+    parts = rel_path.split("/")
+    if any(part in ("", ".", "..") or "\\" in part or ":" in part for part in parts):
+        raise ValueError("the receipt names no place inside the notes folder")
+    place = Path(folder)
+    for number, part in enumerate(parts):
+        place = place / part
+        try:
+            info = place.lstat()
+        except OSError:
+            raise ValueError("the note is not there any more") from None
+        last = number == len(parts) - 1
+        plain = stat.S_ISREG(info.st_mode) if last else stat.S_ISDIR(info.st_mode)
+        if not plain or getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+            raise ValueError("the note is not a plain file in the notes folder, so it stays")
+    return place
 
 
 def render_capture(title: str, fact: str, related_title: str | None, source: str) -> str:
@@ -737,6 +806,50 @@ class Galaxy:
             try:
                 if folder != self.notes_dir and folder.is_relative_to(self.notes_dir) and not any(folder.iterdir()):
                     folder.rmdir()
+            except OSError:
+                pass
+
+    def unbirth_left(self, receipt: dict, folder: Path) -> None:
+        """The take-back of a note that a teardown made in the folder it bound itself to (`folder`), when the galaxy
+        shows ANOTHER folder now: the galaxy has no entry for it, so only its file goes. unbirth stays the one path for
+        a note of the galaxy's own folder, and it still refuses this receipt. Under the galaxy's lock, so the galaxy
+        cannot move back to `folder` while the file goes. The file is found by its identity: the folder (its
+        fingerprint is the receipt's "vault"), the path inside it, and the bytes ("born"). Raises ValueError when the
+        note stays (a changed note stays, as in unbirth)."""
+        with self.lock:
+            self.refresh_if_rebuilt()
+            if not isinstance(receipt, dict) or receipt.get("vault") != vault_of(folder):
+                raise ValueError("that note was not made in this notes folder, so nothing there is touched")
+            if receipt["vault"] == vault_of(self.notes_dir):
+                raise ValueError("the galaxy shows that folder: only unbirth may take the note back")
+            target = _own_file(folder, receipt.get("file"))
+            born = receipt.get("born")
+            aside, number = target.with_name(f"{target.name}.taken"), 1
+            while aside.exists():
+                number += 1
+                aside = target.with_name(f"{target.name}.taken{number}")
+            os.replace(target, aside)       # the bytes checked are the bytes of the file that will be deleted
+            try:
+                same = (isinstance(born, str) and stat.S_ISREG(aside.lstat().st_mode)
+                        and hashlib.sha256(aside.read_bytes()).hexdigest() == born)
+            except OSError:
+                same = False                # bytes that cannot be read are not proven to be Jarviz's
+            if not same:
+                try:
+                    self._move_back(aside, target)
+                except OSError as trouble:
+                    where = aside.relative_to(folder).as_posix()
+                    raise OSError(trouble.errno, "The note was changed after it was made, and it could not be put "
+                                                 f"back. Its file is now {where}") from trouble
+                raise ValueError("the note was changed after it was made, so it stays")
+            try:
+                aside.unlink()
+            except OSError:
+                pass        # the file left behind does not end in .md: it is no note (as in unbirth)
+            parent = target.parent
+            try:
+                if parent != folder and parent.is_relative_to(folder) and not any(parent.iterdir()):
+                    parent.rmdir()          # the folder birth_note made for it (captures/), when it is empty now
             except OSError:
                 pass
 
@@ -1206,7 +1319,14 @@ def status_route(query: dict) -> tuple[int, dict]:
     return 200, {"ok": True, "name": "Jarviz", "brain": brain_state(config), "active": active,
                  "brains": brains.describe_all(config), "model": active["model"],
                  "say": LINES["which_brain"].format(brain=active["label"], model=active["model"]),
-                 "lines": PAGE_LINES, "graph": GALAXY.meta()}
+                 "lines": PAGE_LINES, "voice": voice_status(config), "graph": GALAXY.meta()}
+
+
+def voice_status(config: dict) -> dict:
+    """The voice block of /status: the voice the page starts with, and what the page may know about each voice (never
+    a key). A voice that config.json names but that has no key yet starts as the browser voice."""
+    named = voices.describe(config)
+    return {"default": named["name"] if named["has_key"] else "browser", "voices": voices.describe_all(config)}
 
 
 def brain_route(payload: dict) -> tuple[int, dict]:
@@ -1229,6 +1349,42 @@ def brain_route(payload: dict) -> tuple[int, dict]:
     except (OSError, ValueError) as error:
         return 500, reply(LINES["switch_failed"].format(reason=reason_of(error)), ok=False, error="switch_failed")
     return 200, reply(LINES["switched"].format(brain=target["label"], model=target["model"]), brain=target)
+
+
+def voice_route(payload: dict) -> tuple[int, dict]:
+    """Judge a wish for another voice: {"name": "deepgram"}. The page keeps the choice in the browser. The server
+    saves nothing: it writes config.json in two places only (write_starter_config, save_brain_choice)."""
+    wanted = voices.resolve_name(clean_text(payload.get("name"), 60))
+    if wanted is None:
+        return 400, reply(LINES["no_such_voice"], ok=False, error="unknown_voice")
+    target = voices.describe(load_config(), wanted)
+    if not target["has_key"]:
+        line = LINES["voice_no_key"].format(voice=target["label"], key_line=voices.VOICES[wanted].get("key", ""))
+        return 409, reply(line, ok=False, error="voice_no_key")
+    return 200, reply(LINES["voice_switched"].format(voice=target["label"]), voice=target)
+
+
+def voice_speak_route(payload: dict) -> tuple:
+    """{"text": ..., "part": 0}: the mp3 of piece number `part` of the text, in the Deepgram voice of config.json. The
+    text is cut into pieces that each fit one request (voices.split_text). The header X-Jarviz-Parts says how many
+    there are, so the page can ask for the next one. A refusal is JSON with a line, and never holds the key."""
+    text = clean_text(payload.get("text"), MAX_SPEAK_CHARS)        # one line: the sentence marks stay
+    part = payload.get("part", 0)
+    pieces = voices.split_text(text)
+    if isinstance(part, bool) or not isinstance(part, int) or not 0 <= part < len(pieces):
+        return 400, reply(LINES["speak_bad_request"], ok=False, error="bad_speak_request")
+    try:
+        audio, kind = voices.speak(load_config(), pieces[part], SERVER_VOICE)
+    except voices.VoiceError as error:              # 503 like a brain that cannot answer (chat_route)
+        return 503, reply(voice_line(error), ok=False, error=error.code, detail=error.detail)
+    return 200, audio, kind, (("X-Jarviz-Parts", str(len(pieces))),)
+
+
+def voice_line(error: voices.VoiceError) -> str:
+    """What Jarviz says about a voice problem. The detail lost the key in voices.VoiceError already."""
+    reason = (error.detail or "No details were given").rstrip(".") + "."
+    return LINES[VOICE_LINES.get(error.code, "voice_error")].format(
+        voice=error.label, model=error.model, reason=reason, key_line=voices.VOICES[SERVER_VOICE]["key"])
 
 
 def search_route(query: dict) -> tuple[int, dict]:
@@ -1276,6 +1432,7 @@ def _teardown_birth(path: str, content: str, vault: str | None = None) -> dict:
 BAY = teardown.Bay(notes_dir=lambda: GALAXY.notes_dir, notes_folder=lambda: GALAXY.current_folder(),
                    ask=_teardown_ask, birth=_teardown_birth,
                    unbirth=lambda receipt: GALAXY.unbirth(receipt),
+                   unbirth_left=lambda receipt, folder: GALAXY.unbirth_left(receipt, folder),
                    note_titles=lambda: GALAXY.titles(), writer_name=_writer_name, voice=VOICE,
                    plain_line=LINES["teardown_plain"]) if teardown else None
 THIS_SITE = frozenset({"this", "this site", "this page", "this website", "this one"})
@@ -1693,6 +1850,7 @@ GET_ROUTES = {"/status": status_route, "/search": search_route, "/teardown/diag"
               "/teardown/status": teardown_status_route, "/teardown/last": teardown_last_route,
               "/teardown/note": teardown_note_route, "/teardown/image": teardown_image_route}
 POST_ROUTES = {"/chat": chat_route, "/remember": remember_route, "/forget": forget_route, "/brain": brain_route,
+               "/voice": voice_route, "/voice/speak": voice_speak_route,
                "/teardown/start": teardown_start_route, "/teardown/cancel": teardown_cancel_route}
 
 
@@ -1774,8 +1932,8 @@ class Handler(BaseHTTPRequestHandler):
             print(f"[{time.strftime('%H:%M:%S')}] {route.__name__} failed: {type(error).__name__} at {spot}",
                   file=sys.stderr, flush=True)
             status, body, kind = 500, reply(LINES["server_error"], ok=False, error="server_error"), []
-        if kind:                        # a route that returns bytes also returns their type (a picture)
-            return self._send(status, body, kind[0])
+        if kind:                        # a route that returns bytes also returns their type (a picture, a voice)...
+            return self._send(status, body, kind[0], extra=tuple(kind[1]) if len(kind) > 1 else ())   # ...and headers
         self._send_json(status, body)
 
     def _host_ok(self) -> bool:
@@ -1977,8 +2135,12 @@ def main(argv: list[str]) -> int:
                        for b in brains.describe_all(config) if b["name"] != active["name"])
     kit = "missing (teardown.py)" if teardown is None else (
         "ready" if not (problems := teardown.diag()["problems"]) else f"NOT ready ({problems[0]})")
+    voice = voices.describe(config)         # never the key: describe() leaves it out
+    spoken = (voice["label"] + (f" / {voice['model']}" if voice["model"] else "")
+              + ("" if voice["has_key"] else " (no key)"))
     print(f"Jarviz is up: {url}\n  notes: {len(GALAXY.notes)} from {notes_dir}\n"
           f"  brain: {active['label']} / {active['model']} - {state}\n  other brains: {others}\n"
+          f"  voice: {spoken}\n"
           f"  teardown kit: {kit}\n"
           f"  page lock: {lock}\n"
           f"  test tab: {url}/?mute=1\n"

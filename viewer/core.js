@@ -39,25 +39,46 @@
     return british[0] || list.find(voice => /^en/i.test(voice.lang)) || list[0] || null;
   }
 
-  /* The speaker. env = { synth, Utterance, getSearch, pickVoice, onStart, onEnd } */
+  // A server voice that failed this many lines in a row is not asked again until it is chosen again.
+  const VOICE_GIVE_UP = 3;
+  const MAX_PARTS = 64;     // a guard against a strange X-Jarviz-Parts header
+
+  /* The speaker. env = { synth, Utterance, getSearch, pickVoice, onStart, onEnd,
+                          fetchAudio(text, part) -> Promise<{ blob, parts }>, Audio, createObjectURL, revokeObjectURL,
+                          onTrouble({ answer, tell, gaveUp }) }
+     Two voices behind one speak(): "browser" (speechSynthesis) and a server voice ("deepgram"): the server turns the
+     text into audio, part by part, and the page plays the parts in order. */
   function createSpeaker(env) {
     let unlocked = false;
     let waiting = null;     // a line asked for before the first click
-    let current = null;
+    let current = null;     // the line being said: an utterance (browser voice) or a job (server voice)
+    let voice = 'browser';
+    let failures = 0;       // server-voice lines that failed in a row
+    let told = false;       // the trouble line was shown since the last part that played well
+    let gaveUp = false;     // VOICE_GIVE_UP failures in a row: the server voice is not asked until setVoice
+
+    const serverVoice = () => voice !== 'browser' && !gaveUp && Boolean(env.fetchAudio && env.Audio && env.createObjectURL);
 
     // THE ONE FUNCTION THAT SPEAKS. Nothing else may make sound.
     function speak(text) {
-      if (isMuted(env.getSearch())) return false;         // ?mute=1: this tab never speaks
+      if (isMuted(env.getSearch())) return false;         // ?mute=1: this tab never speaks, and never asks for audio
       const line = String(text || '').trim();
-      if (!line || !env.synth || !env.Utterance) return false;
+      if (!line) return false;
+      if (!serverVoice() && (!env.synth || !env.Utterance)) return false;
       if (!unlocked) { waiting = line; return false; }    // browsers block audio before the first click
-      if (env.synth.speaking || env.synth.pending) env.synth.cancel();
+      cut();                                              // the newest line wins: the one being said stops now
+      return serverVoice() ? speakAudio(line) : speakBrowser(line, false);
+    }
+
+    // The browser voice. `started`: the line already began in the server voice, so its start is not told twice.
+    function speakBrowser(line, started) {
+      if (!env.synth || !env.Utterance) return false;
       const utterance = new env.Utterance(line);
-      const voice = env.pickVoice ? env.pickVoice() : null;
-      if (voice) { utterance.voice = voice; utterance.lang = voice.lang; }
+      const chosen = env.pickVoice ? env.pickVoice() : null;
+      if (chosen) { utterance.voice = chosen; utterance.lang = chosen.lang; }
       utterance.rate = 1.03;
       utterance.pitch = 0.95;
-      utterance.onstart = () => { if (current === utterance && env.onStart) env.onStart(line); };
+      utterance.onstart = () => { if (current === utterance && !started && env.onStart) env.onStart(line); };
       utterance.onend = utterance.onerror = () => {
         if (current !== utterance) return;                // an older line that was cut off
         current = null;
@@ -67,6 +88,106 @@
       env.synth.speak(utterance);
       watch(utterance);
       return true;
+    }
+
+    // The server voice: part 0 first. While a part plays, the next one is asked for, so there is no gap.
+    function speakAudio(line) {
+      const job = { audioJob: true, line, parts: 1, started: false, audio: null, url: null, ahead: null };
+      current = job;
+      fetchPart(job, 0).then(outcome => playPart(job, 0, outcome));
+      return true;
+    }
+
+    // One part's audio as an outcome that never fails: { ok: { blob, parts } } or { error }.
+    function fetchPart(job, part) {
+      let asked;
+      try { asked = Promise.resolve(env.fetchAudio(job.line, part)); } catch (error) { asked = Promise.reject(error); }
+      return asked.then(ok => ({ ok }), error => ({ error }));
+    }
+
+    function playPart(job, part, outcome) {
+      if (current !== job) return;                        // cut off or stopped: a part still on its way is dropped
+      if (!outcome.ok || !outcome.ok.blob) return fail(job, outcome.error);
+      if (part === 0) {
+        const parts = Number(outcome.ok.parts);
+        job.parts = Number.isInteger(parts) && parts >= 1 ? Math.min(parts, MAX_PARTS) : 1;
+      }
+      let audio;
+      try {
+        job.url = env.createObjectURL(outcome.ok.blob);
+        audio = job.audio = new env.Audio(job.url);
+      } catch (error) {
+        return fail(job, error);                          // no element to play it: the browser voice says the line
+      }
+      const mine = () => current === job && job.audio === audio;
+      const askAhead = () => {                            // the next part, asked for once
+        if (part + 1 >= job.parts || (job.ahead && job.ahead.part === part + 1)) return;
+        job.ahead = { part: part + 1, outcome: fetchPart(job, part + 1) };
+      };
+      audio.onended = () => {
+        if (!mine()) return;
+        release(job);
+        failures = 0;                                     // a part that played well
+        told = false;
+        if (part + 1 >= job.parts) return finish(job);
+        askAhead();
+        job.ahead.outcome.then(next => playPart(job, part + 1, next));
+      };
+      audio.onerror = () => { if (mine()) fail(job, null); };
+      let playing;
+      try { playing = Promise.resolve(audio.play()); } catch (error) { playing = Promise.reject(error); }
+      playing.then(() => {
+        if (!mine()) return;
+        if (!job.started) { job.started = true; if (env.onStart) env.onStart(job.line); }
+        askAhead();
+      }, error => { if (mine()) fail(job, error); });
+      return undefined;
+    }
+
+    function release(job) {                               // the audio stops, and its object URL is given back
+      const { audio, url } = job;
+      job.audio = null;
+      job.url = null;
+      if (audio) {
+        audio.onended = audio.onerror = null;
+        try { audio.pause(); } catch (error) { /* already stopped */ }
+      }
+      if (url && env.revokeObjectURL) env.revokeObjectURL(url);
+    }
+
+    function finish(job) {
+      current = null;
+      if (job.started && env.onEnd) env.onEnd(job.line);
+    }
+
+    // A part could not be fetched or played: the browser voice says the line at once, so nothing is lost. The page
+    // does not know where the server cut the text, so after a part that played, the line is said from its start.
+    function fail(job, error) {
+      release(job);
+      failures += 1;
+      const gaveUpNow = failures >= VOICE_GIVE_UP && !gaveUp;
+      if (gaveUpNow) gaveUp = true;
+      const tell = !told;
+      told = true;
+      if ((tell || gaveUpNow) && env.onTrouble) {
+        env.onTrouble({ answer: error && typeof error.answer === 'string' ? error.answer : '', tell, gaveUp: gaveUpNow });
+      }
+      current = null;
+      if (!speakBrowser(job.line, job.started)) finish(job);
+    }
+
+    function cut() {                                      // stop the line being said, with no signal: a new one follows
+      const was = current;
+      current = null;
+      if (was && was.audioJob === true) release(was);
+      if (env.synth && (env.synth.speaking || env.synth.pending)) env.synth.cancel();
+    }
+
+    function setVoice(name) {                             // "browser", or a server voice such as "deepgram"
+      voice = typeof name === 'string' && name && name !== 'browser' ? name : 'browser';
+      failures = 0;
+      told = false;
+      gaveUp = false;
     }
 
     // Chrome sometimes never reports that a line has ended. Then the page would think Jarviz is
@@ -92,12 +213,13 @@
     function stop() {
       waiting = null;
       const wasSpeaking = current !== null;
-      current = null;
+      cut();                                              // the audio stops at once; parts still on their way are dropped
       if (env.synth) env.synth.cancel();
       if (wasSpeaking && env.onEnd) env.onEnd('');
     }
 
-    return { speak, unlock, stop, isUnlocked: () => unlocked, isSpeaking: () => current !== null };
+    return { speak, unlock, stop, setVoice, isUnlocked: () => unlocked, isSpeaking: () => current !== null,
+             voiceState: () => ({ name: voice, gaveUp }) };
   }
 
   function interruptWord(sentence) {
@@ -192,6 +314,32 @@
     for (const pattern of BRAIN_SWITCH) {
       const match = text.match(pattern);
       if (match) return match[1].trim();
+    }
+    return null;
+  }
+
+  // "Switch voice to Deepgram", "use the browser voice", "speak with Deepgram" -> the name that was said.
+  // With the word "voice" any name is taken. Without it only the names in VOICE_NAMES, and the sentence must end
+  // there. A sentence that matchBrainSwitch takes is never a voice switch. The server resolves the name.
+  const VOICE_NAMES = '(deep\\s?gram(?:\\s+aura)?|aura|browser(?:[\'’]s)?|built[\\s-]?in|normal|default|system|chrome)';
+  const VOICE_SWITCH = [
+    /^(?:switch|change|swap|set)\s+(?:the\s+|your\s+|my\s+)?voices?\s+(?:back\s+)?to\s+(?:the\s+)?(.+?)(?:\s+voice)?$/i,
+    /^(?:switch|change|swap)\s+(?:back\s+)?to\s+(?:the\s+|your\s+)?(.+?)\s+voice$/i,
+    /^use\s+(?:the\s+|your\s+)?(.+?)\s+voice$/i,
+    new RegExp('^(?:speak|talk)\\s+(?:with|in|using)\\s+(?:the\\s+|your\\s+|a\\s+)?' + VOICE_NAMES + '(?:\\s+voice)?$', 'i'),
+    /^(?:switch|change|swap)\s+(?:back\s+)?to\s+(?:the\s+)?(deep\s?gram(?:\s+aura)?|aura)$/i,
+  ];
+  const NO_VOICE_NAME = /^(?:the|your|my|a|an|own|his|her|its|our|their|this|that|same|new|other)$/i;   // "use your voice"
+
+  function matchVoiceSwitch(sentence) {
+    if (matchBrainSwitch(sentence)) return null;        // a brain switch first: the two never take the same sentence
+    const text = String(sentence || '').trim().replace(/[.!?]+$/, '')
+      .replace(/^(?:(?:hey|ok|okay)\s+)?(?:jarviz|jarvis)[,.!]?\s+/i, '')
+      .replace(/^please\s+/i, '').replace(/,?\s+please$/i, '');
+    for (const pattern of VOICE_SWITCH) {
+      const match = text.match(pattern);
+      const name = match ? match[1].trim() : '';
+      if (name && !NO_VOICE_NAME.test(name)) return name;
     }
     return null;
   }
@@ -313,7 +461,7 @@
   return {
     FINISH_MS, INTERRUPT_WORDS, REMEMBER_TRIGGERS, CLUSTER_MIN,
     isMuted, pickVoice, createSpeaker, interruptWord, createFinishBuffer,
-    createRouter, matchRemember, matchBrainSwitch, planFocus, escapeHtml,
+    createRouter, matchRemember, matchBrainSwitch, matchVoiceSwitch, planFocus, escapeHtml,
     TEARDOWN_COMMANDS, spokenToAddress, findAddress, matchTeardown,
   };
 });

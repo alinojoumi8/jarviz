@@ -30,6 +30,7 @@ import brains
 import build
 import server
 import teardown
+import voices
 
 PASS, FAIL, WARN = "pass", "fail", "warn"
 
@@ -119,6 +120,11 @@ console.log(JSON.stringify({
   brains: [Core.matchBrainSwitch('Switch brain to Deep Seek.'), Core.matchBrainSwitch('Jarvis, use the OpenAI brain'),
            Core.matchBrainSwitch('switch to claude'), Core.matchBrainSwitch('How does a brain switch work?'),
            Core.matchBrainSwitch('switch to decaf')],
+  // null: the served core.js has no voice-switch route (check_voice_rules says "not checked", and fails).
+  voices: typeof Core.matchVoiceSwitch === 'function'
+    ? ['switch voice to deepgram', 'use the browser voice', 'switch brain to deepseek', 'what is your voice like']
+        .map(s => { const hit = Core.matchVoiceSwitch(s); return hit === undefined ? null : hit; })
+    : null,
   teardowns: ['reverse engineer igloo dot inc', 'tear down linear.app', 'how does stripe.com do that', 'what is example.com built with',
               'how does this site do that', 'Tear down the old shed', 'how should I reverse engineer my pricing',
               'what do we charge Hotel Marlowe', 'how does server.py work', 'Tear down Example.com/Docs'].map(s => { const hit = Core.matchTeardown(s); return hit ? hit.site : null; }),
@@ -346,10 +352,24 @@ def check_other_brains(report: Report, ctx: dict) -> None:
               flush=True)
 
 
-def check_brain_locks(report: Report, ctx: dict) -> None:
+# agy's backend sometimes starts no conversation ("an empty conversation id", about 1 run in 7). That is no lock
+# result, so a trap that could not look gets ONE more try after this pause. A verdict (held or not) is never retried.
+LOCK_RETRY_PAUSE_S = 5.0
+
+
+def _try_lock(config: dict, name: str) -> tuple[bool | None, str]:
+    """One real trap (brains.prove_lock). A trap that stops is "could not look" (None), never a crash."""
+    try:
+        return brains.prove_lock(config, name)
+    except Exception as error:          # noqa: BLE001 - a check that stops says so, it never crashes preflight
+        return None, f"could not look: the check stopped ({type(error).__name__})"
+
+
+def check_brain_locks(report: Report, ctx: dict, sleep=time.sleep) -> None:
     """Each installed sign-in brain: a REAL trap proves that this version of its tool, with these flags, cannot read a
     file, write a file or run a command. It runs before any question goes through the server. "Could not look" is
-    never a pass."""
+    never a pass: it gets one more try after LOCK_RETRY_PAUSE_S, and twice "could not look" is a FAIL. `sleep`: a
+    test hands in a fake one."""
     installed = [b for b in brains.describe_all(ctx["config"]) if b.get("sign_in") and b["has_key"]]
     if not installed:
         print("   note  No sign-in brain (Codex, Antigravity) is installed: there is no lock to prove.", flush=True)
@@ -359,23 +379,26 @@ def check_brain_locks(report: Report, ctx: dict) -> None:
     lock_seen = getattr(brains, "lock_seen", None)
     for brain in installed:
         name = f"The {brain['label']} brain is locked: no file read, no file write, no command (a real trap)"
-        try:
-            held, detail = brains.prove_lock(ctx["config"], brain["name"])
-        except Exception as error:      # noqa: BLE001 - a check that stops says so, it never crashes preflight
-            held, detail = None, f"could not look: the check stopped ({type(error).__name__})"
+        held, detail = _try_lock(ctx["config"], brain["name"])
+        again, first = "", detail
+        if held is None:                # could not look: one more try. True or False is a verdict: never retried
+            sleep(LOCK_RETRY_PAUSE_S)
+            held, detail = _try_lock(ctx["config"], brain["name"])
+            again = " (second try)"
         if held is True:
             try:
                 seen = lock_seen(brain["name"]) if callable(lock_seen) else None
             except Exception:           # noqa: BLE001 - a proof that cannot be read is not a strong one
                 seen = None
             if seen is True:
-                report.add(PASS, name, short(detail, 300))
+                report.add(PASS, name, short(detail, 300) + again)
             else:
-                report.add(WARN, name, f"{short(detail, 300)}. The lock held, but the trap saw no refused attempt.")
+                report.add(WARN, name, f"{short(detail, 300)}{again}. The lock held, but the trap saw no refused attempt.")
         elif held is False:
-            report.add(FAIL, name, short(detail, 300) + ". Jarviz refuses this brain until the lock holds.")
+            report.add(FAIL, name, short(detail, 300) + again + ". Jarviz refuses this brain until the lock holds.")
         else:
-            report.add(FAIL, name, "NOT VERIFIED: " + short(detail, 300))
+            report.add(FAIL, name, f"NOT VERIFIED, tried twice, {LOCK_RETRY_PAUSE_S:.0f} s apart: first "
+                                   f"{short(first, 200)}; then {short(detail, 200)}")
 
 
 def check_brains_offline(report: Report) -> None:
@@ -387,6 +410,129 @@ def check_brains_offline(report: Report) -> None:
         return
     failed = [f"{label} ({detail})" for label, passed, detail in results if not passed]
     report.add(FAIL if failed else PASS, name, short("; ".join(failed), 400) if failed else f"{len(results)} checks")
+
+
+def check_voices_offline(report: Report) -> None:
+    name = "The voice offline checks pass (the Deepgram request, its errors, no redirect, the key removed, the split)"
+    try:
+        results = voices.offline_checks()
+    except Exception as error:          # noqa: BLE001 - a check that stops says so, it never crashes preflight
+        report.add(FAIL, name, f"the checks stopped: {type(error).__name__}: {short(str(error), 200)}")
+        return
+    failed = [f"{label} ({detail})" for label, passed, detail in results if not passed]
+    report.add(FAIL if failed else PASS, name, short("; ".join(failed), 400) if failed else f"{len(results)} checks")
+
+
+def voice_keys(config: dict) -> list[bytes]:
+    """The keys of the voices that have one in config.json. None of them may ever show in an answer."""
+    return [str(config[spec["key"]]).encode("utf-8") for name, spec in voices.VOICES.items()
+            if "key" in spec and voices.describe(config, name)["has_key"]]
+
+
+def check_voice_key(report: Report, ctx: dict) -> None:
+    """The Deepgram voice, when config.json has its key: one real, very small request on the same path as /voice/speak
+    (voices.probe), for the key and for the voice id. No key: a note only."""
+    deepgram = voices.describe(ctx["config"], "deepgram")
+    if not deepgram["has_key"]:
+        print("   note  The Deepgram key was not checked: config.json has none yet.", flush=True)
+        return
+    key_name = "The Deepgram key in config.json is valid (one real call)"
+    voice_name = "The Deepgram voice id in config.json is one the key can use"
+    try:
+        result = voices.probe(ctx["config"])
+    except Exception as error:          # noqa: BLE001 - a check that stops says so, it never crashes preflight
+        report.add(FAIL, key_name, f"NOT VERIFIED: the check stopped ({type(error).__name__})")
+        return
+    (key_ok, key_detail), (voice_ok, voice_detail) = result["key"], result["voice"]
+    report.add(PASS if key_ok else FAIL, key_name, short(key_detail, 240))     # None ("not proven") is no pass
+    if voice_ok is None:
+        report.add(WARN, voice_name, f"Not checked: it needs a valid key first. The voice id is {deepgram['model']!r}.")
+    else:
+        report.add(PASS if voice_ok else FAIL, voice_name, short(voice_detail, 400))
+
+
+def check_voice_routes(report: Report, ctx: dict) -> None:
+    """The voice routes through the live server: /status names the voices, /voice judges a wish and saves nothing,
+    /voice/speak gives mp3 bytes (with a key) or a clean JSON refusal (without one), and never shows a key. A bad
+    request is refused before any call to Deepgram, so those checks cost nothing."""
+    name = "The voice routes answer: /status, /voice and /voice/speak"
+    config = ctx["config"]
+    deepgram = voices.describe(config, "deepgram")
+    keys, trouble, answers = voice_keys(config), [], []
+
+    def post(path: str, body: dict, timeout: float = 60) -> tuple[int, dict, bytes, dict]:
+        """(status, headers, raw body, the body as JSON or {})."""
+        kind, got = try_probe(lambda: call_full("POST", path, body, timeout=timeout))
+        if kind != "answer":
+            trouble.append(f"NOT VERIFIED (no answer, {got}): POST {path} {short(json.dumps(body), 60)}")
+            return 0, {}, b"", {}
+        status, headers, raw = got
+        answers.append(raw)
+        try:
+            parsed = json.loads(raw.decode("utf-8"))
+        except ValueError:
+            parsed = {}
+        return status, headers, raw, parsed if isinstance(parsed, dict) else {}
+
+    def refused(path: str, body: dict, status: int, error: str) -> None:
+        got, _, _, parsed = post(path, body)
+        if got and (got != status or parsed.get("ok") is not False or parsed.get("error") != error
+                    or not isinstance(parsed.get("answer"), str) or not parsed["answer"].strip()):
+            trouble.append(f"POST {path} {short(json.dumps(body), 60)} gave HTTP {got} {parsed.get('error')!r}, "
+                           f"not {status} {error!r} with a line")
+
+    # /status: the voice block
+    _, status = call_json("GET", "/status")
+    block = status.get("voice")
+    named = voices.describe(config)
+    default = named["name"] if named["has_key"] else "browser"
+    if (not isinstance(block, dict) or block.get("default") != default
+            or block.get("voices") != voices.describe_all(config)):
+        trouble.append(f"/status does not give the voice block {{'default': {default!r}, 'voices': [...]}}: "
+                       f"{short(json.dumps(block), 160)}")
+
+    # /voice: it judges the wish
+    refused("/voice", {"name": "eleven labs"}, 400, "unknown_voice")
+    for said, wanted in (("the browser voice", "browser"), ("Deepgram", "deepgram")):
+        if wanted == "deepgram" and not deepgram["has_key"]:
+            refused("/voice", {"name": said}, 409, "voice_no_key")
+            continue
+        got, _, _, parsed = post("/voice", {"name": said})
+        if got and (got != 200 or parsed.get("ok") is not True or parsed.get("voice") != voices.describe(config, wanted)
+                    or not isinstance(parsed.get("answer"), str) or not parsed["answer"].strip()):
+            trouble.append(f"POST /voice {said!r} gave HTTP {got} {parsed.get('error')!r}, not the {wanted} voice")
+
+    # /voice/speak: a bad request is refused before Deepgram is asked (no key needed, no cost)
+    for body in ({"text": ""}, {"text": "   "}, {"text": 42}, {"text": "OK.", "part": 1}, {"text": "OK.", "part": -1},
+                 {"text": "OK.", "part": "0"}, {"text": "OK.", "part": 1.5}, {"text": "OK.", "part": True},
+                 {"text": "OK.", "part": None}):
+        refused("/voice/speak", body, 400, "bad_speak_request")
+    two = "OK. " + "x" * voices.MAX_TEXT_CHARS        # two pieces: "OK." and a long word that is never sent
+    if len(voices.split_text(server.clean_text(two, server.MAX_SPEAK_CHARS))) != 2:
+        trouble.append("the test text for two pieces does not split into two")
+    if not deepgram["has_key"]:
+        refused("/voice/speak", {"text": "OK."}, 503, "voice_key_missing")
+        refused("/voice/speak", {"text": two, "part": 5}, 400, "bad_speak_request")
+    else:                               # two real requests of "OK." each: the smallest text that can prove the path
+        for body, parts in (({"text": "OK."}, "1"), ({"text": two, "part": 0}, "2")):
+            got, headers, raw, parsed = post("/voice/speak", body)
+            if got and (got != 200 or headers.get("content-type") != "audio/mpeg" or not voices.looks_like_mp3(raw)
+                        or headers.get("x-jarviz-parts") != parts or headers.get("cache-control") != "no-store"):
+                trouble.append(f"POST /voice/speak {short(json.dumps(body), 40)} gave HTTP {got} "
+                               f"{headers.get('content-type')!r}, parts {headers.get('x-jarviz-parts')!r}"
+                               + (f": {short(parsed.get('answer') or '', 160)}" if parsed else ""))
+        refused("/voice/speak", {"text": two, "part": 5}, 400, "bad_speak_request")
+    if any(key in raw for key in keys for raw in answers):
+        trouble.append("AN ANSWER SHOWS THE DEEPGRAM KEY")
+    if trouble:
+        report.add(FAIL, name, short("; ".join(trouble), 600))
+    elif not deepgram["has_key"]:
+        report.add(PASS, name, "no Deepgram key: the route refuses cleanly (voice_key_missing). /status and /voice "
+                               "answer, and a bad request is refused before Deepgram is asked.")
+        print('   note  To use the Deepgram voice, type its key into "deepgram_api_key" in config.json, then say '
+              '"switch voice to Deepgram".', flush=True)
+    else:
+        report.add(PASS, name, f"mp3 from Deepgram ({deepgram['model']}), 1 and 2 pieces; bad requests refused")
 
 
 def remove_fixture(notes_dir: Path, receipt: dict) -> tuple[bool, str]:
@@ -1019,7 +1165,7 @@ def check_brain_choice_saved(report: Report) -> None:
         "a byte order mark": ('﻿{"brain": "openai"}', '﻿{"brain": "deepseek"}'),
     }
     broken = {"a typing mistake": '{"brain": "openai",, "model": "x"}', "a list, not an object": '["brain"]'}
-    real_path = server.CONFIG_PATH
+    real_path, modes = server.CONFIG_PATH, "the file modes were not checked: the check stopped before them"
     try:
         with tempfile.TemporaryDirectory() as folder:
             server.CONFIG_PATH = Path(folder) / "config.json"
@@ -1047,14 +1193,64 @@ def check_brain_choice_saved(report: Report) -> None:
             if left:
                 trouble.append(f"files left behind: {left}")
             _staging_steps(Path(folder), trouble)
+            modes = _mode_steps(trouble)
     except Exception as error:                          # noqa: BLE001 - a check that stops says so, it never crashes preflight
         trouble.append(f"the check stopped: {type(error).__name__}: {error}")
     finally:
         server.CONFIG_PATH = real_path
-    report.add(FAIL if trouble else PASS, name, "; ".join(trouble) or
+    unlooked = [modes] if "NOT checked" in modes or "not checked" in modes else []    # said also next to a failure
+    report.add(FAIL if trouble else PASS, name, "; ".join(trouble + unlooked) if trouble else
                f"{len(cases)} files kept every other character; {len(broken)} broken files were left as they were; "
                "the staging copy (it holds the keys) never writes over a file and never stays; the start-up sweep "
-               "removes only a crash's staging copy")
+               f"removes only a crash's staging copy; {modes}")
+
+
+def _mode_steps(trouble: list[str]) -> str:
+    """config.json holds the keys. Run inside check_brain_choice_saved, with server.CONFIG_PATH in a temporary folder:
+    (d) on a Mac or Linux, with the usual umask 022: a config.json of mode 0600 stays 0600 after a change of brain, and
+    its staging copy is never wider than 0600, from the moment it is made to the replace; one of mode 0644 stays 0644;
+    a new starter config.json is made 0600. Returns the words for the check's detail. Windows keeps no owner-only bits:
+    then the words say that this part was not checked (a check that cannot look says so)."""
+    if os.name == "nt" or not hasattr(os, "fchmod") or not hasattr(os, "umask"):
+        return "the file modes (0600) were NOT checked: Windows keeps no owner-only bits"
+    config, seen = server.CONFIG_PATH, []
+    real_open, real_replace = os.open, os.replace
+
+    def watched_open(path, flags, mode=0o777, *args, **kwargs):
+        descriptor = real_open(path, flags, mode, *args, **kwargs)
+        if Path(path).name.startswith(config.name + "."):       # the staging copy, the moment it is made
+            seen.append(stat.S_IMODE(os.fstat(descriptor).st_mode))
+        return descriptor
+
+    def watched_replace(source, destination, *args, **kwargs):
+        if Path(destination) == config:                          # the staging copy, just before the replace
+            seen.append(stat.S_IMODE(os.stat(source).st_mode))
+        return real_replace(source, destination, *args, **kwargs)
+
+    umask = os.umask(0o022)
+    os.open, os.replace = watched_open, watched_replace
+    try:
+        for start in (0o600, 0o644):
+            config.write_bytes(b'{"brain": "openai", "openai_api_key": "test-only"}')
+            os.chmod(config, start)
+            seen.clear()
+            server.save_brain_choice("deepseek")
+            after = stat.S_IMODE(os.stat(config).st_mode)
+            if after != start:
+                trouble.append(f"(d) a config.json of mode {start:o} became {after:o} after a change of brain")
+            if len(seen) != 2 or seen[0] & ~0o600 or seen[1] & ~start:
+                trouble.append(f"(d) the staging copy of a {start:o} config.json had the modes "
+                               f"{[format(mode, 'o') for mode in seen]} (made, before the replace): "
+                               f"it must be made 600 and never be wider than {start:o}")
+        config.unlink()
+        server.write_starter_config()
+        made = stat.S_IMODE(os.stat(config).st_mode)
+        if made != 0o600:
+            trouble.append(f"(d) a new starter config.json is made with mode {made:o}, not 600")
+    finally:
+        os.open, os.replace = real_open, real_replace
+        os.umask(umask)
+    return "a 0600 config.json stays 0600, its staging copy is never wider, and a new one is made 0600"
 
 
 def _staging_steps(folder: Path, trouble: list[str]) -> None:
@@ -1106,51 +1302,80 @@ def _staging_steps(folder: Path, trouble: list[str]) -> None:
 
 
 def check_teardown_one_folder(report: Report) -> None:
-    """A teardown writes its picture and its notes into ONE notes folder. The galaxy moves to another folder between
-    the picture and the first note (build.py ran for another notes_dir): the birth refuses, the job fails, and no
-    picture and no note is left in either folder. Pure: a test Galaxy over two temporary folders (a fake save), the
-    real door (server._teardown_birth) and a real Bay with a made-up brain. build.write_graph is a recorder."""
+    """A teardown writes its picture and its notes into ONE notes folder. (1) The galaxy moves to another folder
+    between the picture and the first note (build.py ran for another notes_dir): the birth refuses, the job fails, and
+    no picture and no note is left in either folder. (2) It moves between the first note (the Jarviz note) and the
+    second: the job fails, and its first note is taken back from the folder it bound itself to, by the file alone (the
+    galaxy has no entry for it any more); nothing of the job is in the other folder. (3) The same, but the user edited
+    the first note meanwhile: it stays, the job keeps it on its list, and its receipt names it. Pure: a test Galaxy
+    over two temporary folders (a fake save), the real door (server._teardown_birth), the real take-backs and a real
+    Bay with a made-up brain. build.write_graph is a recorder."""
     name = "A teardown writes its picture and its notes into one notes folder, or into none"
     trouble: list[str] = []
     real_galaxy, real_write, writes = server.GALAXY, build.write_graph, []
     reply = ("LABEL: Teardown · a.test\nSPOKEN: It is a plain page, sir.\nSUMMARY: A page.\n" + teardown.MARK
              + "\n> Verdict.\n\n" + "\n\n".join(f"## {section}\nText." for section in teardown.NOTE_SECTIONS))
     build.write_graph = lambda *args, **kwargs: writes.append(args)
+    kept = ["first notes/Kept.md", "second notes/Kept.md"]
+    edited = "\nA line the user added while the teardown ran.\n"
     try:
-        with tempfile.TemporaryDirectory() as folder:
-            root = Path(folder).resolve()
-            first, second = root / "first notes", root / "second notes"
-            for notes in (first, second):
-                notes.mkdir()
-                (notes / "Kept.md").write_text("# Kept\n\nA note of the user's own.\n", encoding="utf-8")
-            galaxy, looks = server.Galaxy(), []
+        # (where the galaxy moves: the number of its look for a rebuild, the user edits the first note, files left)
+        for story, move_at, edit, expected in (
+                ("(1) between the picture and the first note", 2, False, kept),
+                ("(2) between the first note and the second", 3, False, kept),
+                ("(3) the same, and the first note was edited", 3, True,
+                 sorted(kept + ["first notes/" + teardown.OWNER_PATH]))):
+            with tempfile.TemporaryDirectory() as folder:
+                root = Path(folder).resolve()
+                first, second = root / "first notes", root / "second notes"
+                for notes in (first, second):
+                    notes.mkdir()
+                    (notes / "Kept.md").write_text("# Kept\n\nA note of the user's own.\n", encoding="utf-8")
+                galaxy, looks = server.Galaxy(), []
 
-            def move_to(notes: Path, build_id: str) -> None:       # as a load of that folder leaves the index
-                galaxy.notes_dir, galaxy.build_id, galaxy.rev = notes, build_id, 0
-                galaxy.notes[:] = [build.make_note(path, notes) for path in build.note_files(notes)]
-                galaxy.links.clear()
+                def move_to(notes: Path, build_id: str, galaxy=galaxy) -> None:     # as a load of that folder does
+                    galaxy.notes_dir, galaxy.build_id, galaxy.rev = notes, build_id, 0
+                    galaxy.notes[:] = [build.make_note(path, notes) for path in build.note_files(notes)]
+                    galaxy.links.clear()
 
-            def look_for_rebuild() -> None:     # the first look (the job binds its folder) finds nothing new; the
-                looks.append(1)                 # second (the first birth) finds build.py ran for the other folder
-                if len(looks) == 2:
-                    move_to(second, "second")
+                def look_for_rebuild(looks=looks, move_to=move_to, move_at=move_at, edit=edit, first=first,
+                                     second=second) -> None:
+                    looks.append(1)             # look 1: the job binds its folder, 2: the first birth, 3: the second
+                    if len(looks) == move_at:
+                        if edit:
+                            with open(first / teardown.OWNER_PATH, "a", encoding="utf-8") as handle:
+                                handle.write(edited)
+                        move_to(second, "second")
 
-            move_to(first, "first")
-            galaxy._save_graph, galaxy.refresh_if_rebuilt, server.GALAXY = (lambda: None), look_for_rebuild, galaxy
-            bay = teardown.Bay(notes_dir=lambda: galaxy.notes_dir, notes_folder=galaxy.current_folder,
-                               ask=lambda system, message: reply, birth=server._teardown_birth, unbirth=galaxy.unbirth,
-                               note_titles=galaxy.titles, writer_name=lambda: "test", voice="plain",
-                               plain_line="{host} is done.")
-            job, code = teardown.Job(teardown.Site("https://a.test/", "a.test"), "how is it built", True), None
-            try:
-                bay._write(job, {"snapshot": teardown.PNG_SIGNATURE + b"picture"})
-            except teardown.TeardownError as error:
-                code = error.code
-            left = sorted(path.relative_to(root).as_posix() for path in root.rglob("*") if path.is_file())
-            if code != "notes_moved" or job.births or left != ["first notes/Kept.md", "second notes/Kept.md"]:
-                trouble.append(f"the job ended as {code!r}, births {job.births}, files left {left}")
-            if len(looks) != 2:
-                trouble.append(f"the galaxy looked for a rebuild {len(looks)} times, not twice (bind, first birth)")
+                move_to(first, "first")
+                galaxy._save_graph, galaxy.refresh_if_rebuilt, server.GALAXY = (lambda: None), look_for_rebuild, galaxy
+                bay = teardown.Bay(notes_dir=lambda galaxy=galaxy: galaxy.notes_dir, notes_folder=galaxy.current_folder,
+                                   ask=lambda system, message: reply, birth=server._teardown_birth,
+                                   unbirth=galaxy.unbirth, unbirth_left=galaxy.unbirth_left, note_titles=galaxy.titles,
+                                   writer_name=lambda: "test", voice="plain", plain_line="{host} is done.")
+                job, code = teardown.Job(teardown.Site("https://a.test/", "a.test"), "how is it built", True), None
+                try:
+                    bay._write(job, {"snapshot": teardown.PNG_SIGNATURE + b"picture"})
+                except teardown.TeardownError as error:
+                    code = error.code
+                left = sorted(path.relative_to(root).as_posix() for path in root.rglob("*") if path.is_file())
+                stayed = [birth.get("title") for birth in job.births]
+                if code != "notes_moved" or stayed != (["Jarviz"] if edit else []) or left != expected:
+                    trouble.append(f"{story}: the job ended as {code!r}, kept on its list {stayed}, files left {left}")
+                if len(looks) < move_at:
+                    trouble.append(f"{story}: the galaxy looked for a rebuild {len(looks)} times, not {move_at}")
+                if move_at == 3 and not edit and (first / "captures").exists():
+                    trouble.append(f"{story}: the empty captures folder the job made stays in the first folder")
+                if edit:
+                    text = (first / teardown.OWNER_PATH).read_text(encoding="utf-8")
+                    session = server.Session()
+                    turn = session.record("tear down a.test", "Taking a.test apart now.", frozenset(), [])
+                    server._teardown_done(job, session, turn)
+                    said = " ".join(turn[2])
+                    if not text.endswith(edited):
+                        trouble.append(f"{story}: the edited note did not stay as the user left it")
+                    if "stay: Jarviz" not in said:
+                        trouble.append(f"{story}: the failure receipt does not name the note that stays: {said!r}")
     except Exception as error:                          # noqa: BLE001 - a check that stops says so, it never crashes preflight
         trouble.append(f"the check stopped: {type(error).__name__}: {error}")
     finally:
@@ -1158,8 +1383,8 @@ def check_teardown_one_folder(report: Report) -> None:
     if writes:
         trouble.append(f"build.write_graph was called {len(writes)} times: nothing may write here")
     report.add(FAIL if trouble else PASS, name, "; ".join(trouble) or
-               "the folder moved between the picture and the first note: the job failed, no picture and no note in "
-               "either folder")
+               "the folder moved between the picture and the first note, and between the first note and the second: "
+               "the job failed, no picture and no note in either folder; a first note edited meanwhile stays, named")
 
 
 def check_build_survives(report: Report) -> None:
@@ -1641,6 +1866,7 @@ def check_config_hidden(report: Report, ctx: dict) -> None:
     config = ctx["config"]
     keys = [str(config[spec["key"]]).encode("utf-8") for name, spec in brains.PROVIDERS.items()
             if "key" in spec and brains.describe(config, name)["has_key"]]     # a sign-in brain has no key
+    keys += voice_keys(config)                                                  # ...and the browser voice none
     leaks, silent, unsent, odd, refused = [], [], [], [], 0
     for probe in CONFIG_PROBES + TEARDOWN_PROBES:
         kind, got = try_probe(lambda probe=probe: call("GET", probe, timeout=10))
@@ -1697,6 +1923,8 @@ def check_other_sites(report: Report) -> None:
         "a teardown cancelled by another website": lambda: call("POST", "/teardown/cancel", {"job": "preflight-no-such-job"},
                                                                 extra_headers={"Sec-Fetch-Site": "cross-site"}),
         "a teardown note read by another website": lambda: call("GET", "/teardown/last", extra_headers={"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Dest": "empty"}),
+        # An empty text: it can never reach Deepgram, even if the guard were broken.
+        "a spoken line asked by another website": lambda: call("POST", "/voice/speak", {"text": ""}, extra_headers={"Origin": evil}),
     }
     let_in, silent, unsent = [], [], []
     for what, send in attempts.items():
@@ -1781,6 +2009,8 @@ def check_lock(report: Report) -> None:
         "a question to the brain": lambda: outsider("POST", "/chat", nothing),
         "a new note": lambda: outsider("POST", "/remember", empty_note),
         "a change of brain": lambda: outsider("POST", "/brain", {"brain": ""}),
+        "a change of voice": lambda: outsider("POST", "/voice", {"name": ""}),
+        "a spoken line": lambda: outsider("POST", "/voice/speak", {"text": ""}),
         "a teardown": lambda: outsider("POST", "/teardown/start", {"site": INERT_SITE}),
         "the last teardown": lambda: outsider("GET", "/teardown/last"),
         "a second try without a key": lambda: outsider("GET", f"/?{server.AGAIN_PARAM}=1"),
@@ -2082,12 +2312,18 @@ def check_voice_rules(report: Report, ctx: dict) -> None:
         sources[served] = raw.decode("utf-8", "replace") if status == 200 else ""
     speak_calls = {served: len(re.findall(r"\b(?:synth|speechSynthesis)\s*\.\s*speak\s*\(", text))
                    for served, text in sources.items()}
-    other_sound = [served for served, text in sources.items() if re.search(r"new\s+Audio\s*\(|AudioContext|\.play\s*\(", text)]
+    # The Deepgram voice is played by the one speak function too: core.js may hold ONE call that plays audio, app.js
+    # and index.html none, and nothing an AudioContext.
+    plays = {served: len(re.findall(r"\.play\s*\(", text)) for served, text in sources.items()}
+    other_sound = [served for served, text in sources.items() if "AudioContext" in text
+                   or (served != "core.js" and re.search(r"new\s+Audio\s*\(|\.play\s*\(", text))]
     problems = []
     if speak_calls != {"core.js": 1, "app.js": 0, "index.html": 0}:
         problems.append(f"there must be exactly one synth.speak call, in core.js; found {speak_calls}")
     if other_sound:
         problems.append(f"another way to make sound exists in {other_sound}")
+    if plays["core.js"] > 1:
+        problems.append(f"core.js may play audio in one place only (the one speak function); found {plays['core.js']}")
     if "getSearch: () => window.location.search" not in sources["app.js"]:
         problems.append("app.js does not hand the page address to the speaker")
 
@@ -2125,6 +2361,11 @@ def check_voice_rules(report: Report, ctx: dict) -> None:
         rules.append(f"the camera plan is wrong: {result['focus']}")
     if result["brains"] != ["Deep Seek", "OpenAI", "claude", None, None]:
         rules.append(f"the \"switch brain\" route matched the wrong sentences: {result['brains']}")
+    said_voices = result.get("voices")
+    if said_voices is None:             # a route that is not there is not checked, and that is no pass
+        rules.append("the \"switch voice\" route was not checked: the served core.js has no Core.matchVoiceSwitch")
+    elif said_voices != ["deepgram", "browser", None, None]:
+        rules.append(f"the \"switch voice\" route matched the wrong sentences: {said_voices}")
     routes = []
     if result.get("teardowns") != ["igloo.inc", "linear.app", "stripe.com", "example.com", "this", None, None, None,
                                    None, "Example.com/Docs"]:
@@ -2236,10 +2477,13 @@ def main() -> int:
     if check_server(report):
         check_graph(report, ctx)
         check_brains_offline(report)
+        check_voices_offline(report)
         check_brain_locks(report, ctx)          # before the first question goes through the server
         check_chat(report, ctx)
         check_key_and_model(report, ctx)
         check_other_brains(report, ctx)
+        check_voice_key(report, ctx)
+        check_voice_routes(report, ctx)
         check_remember(report, ctx)
         check_links_stay_true(report)
         check_take_back_safe(report)

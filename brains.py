@@ -138,27 +138,41 @@ class BrainError(Exception):
         self.model = (brain or {}).get("model", "")
 
 
+def _key_forms(key: str) -> list[str]:
+    """The key as it is, and white-space-normalised the way a BrainError normalises its detail. Longest first."""
+    forms = {key, " ".join(key.split())} - {""}
+    return sorted(forms, key=len, reverse=True)
+
+
 def _without_key(text, key: str) -> str:
     """The FIRST net: the configured key is taken out of a provider's raw text wherever it stands, BEFORE a
-    BrainError cuts the text. Any key that is not empty and not the placeholder, whatever its shape or length."""
-    text = str(text)
-    if key and key != KEY_PLACEHOLDER:
-        text = text.replace(key, KEY_REMOVED)
+    BrainError cuts the text. Any key that is not empty and not the placeholder, whatever its shape or length. The
+    text is white-space-normalised first (as the detail will be), so a key that the provider wrote with other white
+    space ("ABCDEFGHIJ   KLMNOPQRST" for "ABCDEFGHIJ KLMNOPQRST") is found too."""
+    if not key or key == KEY_PLACEHOLDER:
+        return str(text)
+    text = " ".join(str(text).split())
+    for form in _key_forms(key):
+        text = text.replace(form, KEY_REMOVED)
     return text
 
 
 def scrub_key(error: BrainError, key: str) -> BrainError:
     """The second net: the key never travels on from here, it becomes "[key removed]". A detail that was cut can end
-    in the first part of the key, so a cut detail loses any such piece too, however short the key is."""
+    in the first part of the key, so a cut detail loses any such piece too, however short the key is. Whether the
+    detail was cut is read from the text BEFORE any replacement: a replacement makes it shorter."""
     if not key or key == KEY_PLACEHOLDER:
         return error
 
     def clean(text: str) -> str:
-        text = text.replace(key, KEY_REMOVED)
-        if len(text) >= DETAIL_CHARS:               # only a cut text can end in a piece of the key
-            for size in range(len(key) - 1, 0, -1):
-                if text.endswith(key[:size]):
-                    return text[:-size] + KEY_REMOVED
+        was_cut = len(text) >= DETAIL_CHARS
+        for form in _key_forms(key):
+            text = text.replace(form, KEY_REMOVED)
+        if was_cut:                                 # only a cut text can end in a piece of the key
+            for form in _key_forms(key):
+                for size in range(len(form) - 1, 0, -1):
+                    if text.endswith(form[:size]):
+                        return text[:-size] + KEY_REMOVED
         return text
 
     error.detail = clean(error.detail)
@@ -469,12 +483,15 @@ def _chat_once(key, brain, spec, route, system, messages, budget) -> str:
     if not isinstance(choice, dict):
         raise _bad_reply(brain, "a choice is not an object")
     message = choice.get("message")
-    if message is not None and not isinstance(message, dict):
-        raise _bad_reply(brain, "the message is not an object")
-    message = message or {}
+    if not isinstance(message, dict):                   # the first choice must hold a message object
+        raise _bad_reply(brain, "the first choice holds no message object")
     content = message.get("content")
     if content is not None and not isinstance(content, (str, list)):
         raise _bad_reply(brain, "the message content is not text or a list")
+    # No content (null or missing) is a completion only when the choice says why it ended: a cut-off answer of the
+    # tiny probe budget ("length"), a refusal ("stop" with message.refusal), a filter ("content_filter").
+    if content is None and not (isinstance(choice.get("finish_reason"), str) and choice["finish_reason"]):
+        raise _bad_reply(brain, "the message has no content and the choice no finish reason")
     text = THINK_RE.sub("", _text_of(content)).strip()
     if not text and (message.get("refusal") or choice.get("finish_reason") == "content_filter"):
         raise BrainError("refused", brain=brain)
@@ -499,12 +516,14 @@ def _responses_once(key, brain, spec, route, system, messages, budget) -> str:
     if not isinstance(output, list):                    # the envelope of a completion: an output list
         raise _bad_reply(brain, "no output in the answer")
     texts, refused = [], False
-    for item in output or []:
-        if not isinstance(item, dict) or item.get("type") != "message":
-            continue
+    for item in output:
+        if not isinstance(item, dict) or not isinstance(item.get("type"), str):
+            raise _bad_reply(brain, "an output item is not an object with a type")
+        if item["type"] != "message":
+            continue                                    # reasoning and other items hold no answer text
         content = item.get("content")
-        if content is not None and not isinstance(content, list):
-            raise _bad_reply(brain, "the message content is not a list")
+        if not isinstance(content, list):               # a message item always holds a content list
+            raise _bad_reply(brain, "a message holds no content list")
         for part in content or []:
             if isinstance(part, dict) and part.get("type") == "refusal":
                 refused = True
@@ -532,6 +551,14 @@ MODELS_TIMEOUT_S = 30.0
 SIGN_IN_HINTS = {"codex": "Run once in a terminal: codex login",
                  "agy": "Start agy once in a terminal and sign in."}
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+# agy's backend sometimes fails to START a conversation (seen about 1 time in 3, also with plain agy). Such a run
+# sent nothing to a model, so _cli_call tries it again: 3 tries in all, after pauses of 2 and 5 seconds. A try needs
+# CLI_START_MIN_TRY_S of the route's time at least. The clock and the sleep are module values the checks can swap.
+CLI_START_TRIES = 3
+CLI_START_PAUSES = (2.0, 5.0)
+CLI_START_MIN_TRY_S = 10.0
+_clock = time.monotonic
+_sleep = time.sleep
 # npm puts codex on Windows as a .cmd shim. Beside it lies the script that the shim gives to node.
 CODEX_NPM_SCRIPT = ("node_modules", "@openai", "codex", "bin", "codex.js")
 # On Windows only a real program is started. A batch file (.cmd, .bat) would run in cmd.exe even with shell=False,
@@ -992,6 +1019,16 @@ def _agy_init_holds(inits: list, started: bool, brain: dict | None) -> None:
         raise BrainError("cli_not_locked", "agy gave no init event, so its lock is not confirmed.", brain)
 
 
+def _agy_never_started(result: dict) -> bool:
+    """A run that did not START: status ERROR, an empty conversation id, no turn (and, checked by the caller, not one
+    step update). Nothing was sent to a model and no tool can have run. Real result: {"conversation_id": "",
+    "status": "ERROR", "response": "", "error": "failed to start conversation: backend returned an empty conversation
+    id", "duration_seconds": 0, "num_turns": 0}."""
+    turns = result.get("num_turns")
+    return (result.get("status") == "ERROR" and result.get("conversation_id") == ""
+            and isinstance(turns, int) and not isinstance(turns, bool) and turns == 0)
+
+
 def _agy_listing(names: set, subagent: bool) -> bool:
     """True for a step of a harmless listing tool of agy (HARMLESS_LISTING). A step that also showed another name, or
     a sub-agent, is not one."""
@@ -1005,7 +1042,7 @@ def _agy_answer(stdout_text: str, code: int = 0, stderr_text: str = "", brain: d
     that a tool ran or may have run: BrainError("cli_tool_ran"). `tally` (the trap) gets the refused attempts, the
     calls that were not sent and the listing steps."""
     steps: dict[int, dict] = {}
-    result, inits = None, []
+    result, inits, updates = None, [], 0
     for event in _events(stdout_text, brain):
         if event.get("event") == "init":
             inits.append(event.get("init"))
@@ -1015,6 +1052,7 @@ def _agy_answer(stdout_text: str, code: int = 0, stderr_text: str = "", brain: d
             continue
         if event.get("event") != "step_update":
             continue
+        updates += 1
         update = event.get("step_update")
         if not isinstance(update, dict):
             raise _bad_reply(brain, "a step update is not an object")
@@ -1075,7 +1113,10 @@ def _agy_answer(stdout_text: str, code: int = 0, stderr_text: str = "", brain: d
         status = result.get("status") if isinstance(result.get("status"), str) else "unknown"
         message, cause = _message_of(result.get("error")), _stderr_cause(stderr_text)
         text = cause if message and message in cause else f"{message} {cause}".strip()     # stderr often repeats it
-        raise _cli_trouble(text or f"status {status}", brain)
+        trouble = _cli_trouble(text or f"status {status}", brain)       # the text first: "not signed in" wins
+        if trouble.code == "cli_failed" and not updates and _agy_never_started(result):
+            raise BrainError("cli_not_started", trouble.detail, brain)  # nothing reached a model: may run again
+        raise trouble
     response = result.get("response")
     if not isinstance(response, str):
         raise _bad_reply(brain, "the response is not text")
@@ -1089,10 +1130,32 @@ def _agy_answer(stdout_text: str, code: int = 0, stderr_text: str = "", brain: d
 def _cli_call(config: dict, name: str, route: str, system: str, messages: list[dict], run: Runner | None,
               tool: list[str], left: dict | None = None, frame: str | None = None,
               tally: dict | None = None) -> str:
-    """ONE question to a sign-in brain, in a new empty room that is removed afterwards. This is the one command line
-    for every call: only the frame differs (CLI_FRAME, or TRAP_FRAME for the trap). `left` (the trap) gets
-    left["room"]: what the tool left in the room that Jarviz did not write (a list), or None when the room could not
-    be looked at; no key when the tool never started. `tally` gets the attempts that were refused or ignored."""
+    """ONE question to a sign-in brain. This is the one command line for every call: only the frame differs
+    (CLI_FRAME, or TRAP_FRAME for the trap). `left` (the trap) gets left["room"]: what the tool left in the room that
+    Jarviz did not write (a list), or None when the room could not be looked at; no key when the tool never started.
+    `tally` gets the attempts that were refused or ignored.
+
+    The ONE place that tries again: only a run that did not START (cli_not_started: nothing reached a model, no tool
+    ran) is tried again, at most CLI_START_TRIES in all, after the pauses of CLI_START_PAUSES, each try in a new room.
+    A run that started is never run twice. All tries together stay inside the route's timeout."""
+    deadline = _clock() + TIMEOUT_S.get(route, REQUEST_TIMEOUT_S)
+    for attempt in range(CLI_START_TRIES):
+        try:
+            return _cli_call_once(config, name, route, system, messages, run, tool, left, frame, tally,
+                                  max(1.0, deadline - _clock()))
+        except BrainError as error:
+            if error.code != "cli_not_started" or attempt + 1 >= CLI_START_TRIES:
+                raise
+            pause = CLI_START_PAUSES[min(attempt, len(CLI_START_PAUSES) - 1)]
+            if deadline - _clock() < pause + CLI_START_MIN_TRY_S:      # no time left for a pause and a fair try
+                raise
+            _sleep(pause)
+    raise AssertionError("unreachable: the last try returns or raises")
+
+
+def _cli_call_once(config: dict, name: str, route: str, system: str, messages: list[dict], run: Runner | None,
+                   tool: list[str], left: dict | None, frame: str | None, tally: dict | None, timeout: float) -> str:
+    """One try of _cli_call, in a new empty room that is removed afterwards."""
     spec, brain = PROVIDERS[name], _brain_of(config, name)
     run = run or _run_tool
     frame = CLI_FRAME if frame is None else frame
@@ -1116,7 +1179,7 @@ def _cli_call(config: dict, name: str, route: str, system: str, messages: list[d
             env, read = _codex_env(), _codex_answer
         started = True
         try:
-            code, out, err = run(argv, stdin, room, env, TIMEOUT_S.get(route, REQUEST_TIMEOUT_S))
+            code, out, err = run(argv, stdin, room, env, timeout)
         except BrainError as error:                 # the runner knows no brain: name it
             raise BrainError(error.code, _cli_detail(error.detail), brain) from None
         return read(out, code, err, brain, tally)
@@ -1315,14 +1378,45 @@ def prove_lock(config: dict, name: str, run: Runner | None = None, locks: Path |
     version = tool_version(tool, run)
     if version is None:
         return None, f"could not look: the version of the {spec['label']} tool could not be read."
-    held, detail, _, seen = _prove(config, name, run, locks, tool, version)
+    held, detail, _, seen = _prove_twice(config, name, run, locks, tool, version)
     if held is not None:
         try:
-            _write_lock(name, {"version": version, "recipe": lock_recipe(name), "held": held, "detail": detail,
-                               "seen": seen}, locks)
+            detail = _record_proof(name, version, lock_recipe(name), held, detail, seen, locks)
         except OSError as error:
             detail += f" (the record could not be written: {type(error).__name__})"
     return held, detail
+
+
+def _prove_twice(config: dict, name: str, run: Runner | None, locks: Path, tool: list[str],
+                 version: str) -> tuple[bool | None, str, BrainError | None, list[str]]:
+    """The trap, and ONE more time with the same lock when it ended True with no evidence (the model may simply not
+    have sent the call). Any False is the verdict. A second run that could not look does not undo the first True.
+    Else True with the evidence that either run saw. At most 2 trap runs."""
+    first = _prove(config, name, run, locks, tool, version)
+    if first[0] is not True or first[3]:
+        return first
+    held, detail, stopped, seen = _prove(config, name, run, locks, tool, version)
+    if held is None:
+        return True, first[1] + " (two runs; the second could not look)", None, first[3]
+    return held, detail + " (two runs)", stopped, list(dict.fromkeys(first[3] + seen))
+
+
+def _strong_on_file(name: str, version: str, recipe: str, locks: Path) -> bool:
+    """True when the record holds a STRONG proof (held, evidence seen) for this very version and recipe."""
+    entry = _lock_entry(name, locks)
+    seen = (entry or {}).get("seen")
+    return (entry is not None and entry["held"] is True and entry["version"] == version and entry["recipe"] == recipe
+            and isinstance(seen, list) and bool(seen) and all(isinstance(label, str) for label in seen))
+
+
+def _record_proof(name: str, version: str, recipe: str, held: bool, detail: str, seen: list[str], locks: Path) -> str:
+    """Write the verdict, and return the detail. A weak run (True, no evidence) never replaces a strong proof of the
+    same version and recipe: that record stays, and the detail says so. A False verdict always replaces the record,
+    and a strong run replaces a weak one. Raises OSError when the record cannot be written."""
+    if held and not seen and _strong_on_file(name, version, recipe, locks):
+        return detail + "; an earlier run of this version did see a refused attempt (the strong proof on file stays)"
+    _write_lock(name, {"version": version, "recipe": recipe, "held": held, "detail": detail, "seen": seen}, locks)
+    return detail
 
 
 def lock_seen(name: str, locks: Path | None = None, run: Runner | None = None,
@@ -1367,12 +1461,11 @@ def ensure_locked(config: dict, name: str, run: Runner | None = None, locks: Pat
     with _prove_lock:
         if verdict():                   # another question proved it meanwhile
             return
-        held, detail, stopped, seen = _prove(config, name, run, locks, tool, version)
+        held, detail, stopped, seen = _prove_twice(config, name, run, locks, tool, version)
         if held is None:
             raise stopped               # the user hears "not signed in", not "not locked"
         try:
-            _write_lock(name, {"version": version, "recipe": recipe, "held": held, "detail": detail, "seen": seen},
-                        locks)
+            detail = _record_proof(name, version, recipe, held, detail, seen, locks)
         except OSError:
             pass                        # no record: the next question proves it again
         if not held:
@@ -1879,6 +1972,19 @@ def offline_checks() -> list[tuple[str, bool, str]]:
           not error.detail.endswith(long_key[:4]) and error.detail.endswith(KEY_REMOVED), error.detail[-20:])
     check("key: the placeholder is never treated as a key", _without_key(f"a {KEY_PLACEHOLDER} b", KEY_PLACEHOLDER)
           == f"a {KEY_PLACEHOLDER} b" and _without_key("abc", "") == "abc", "")
+    spaced_key = "ABCDEFGHIJ KLMNOPQRST"                    # CodeRabbit's case: there is no key-format rule
+    raw = "ABCDEFGHIJ   KLMNOPQRST " + "x" * 270 + " ABCDEFGHIJ   KLMNOPQRST"
+    error = scrub_key(_http_error(401, {"error": raw}, {"label": "Example"}, spaced_key), spaced_key)
+    check("key: a key that the provider wrote with other white space leaves no piece (CodeRabbit's case)",
+          not any(error.detail.endswith(spaced_key[:size]) for size in range(1, len(spaced_key)))
+          and "ABCDEFG" not in error.detail and "KLMNOP" not in error.detail, error.detail[-40:])
+    for size in range(1, 8):
+        # The whole key first (a replacement makes the text shorter), then the cut leaves `size` characters of it.
+        raw = long_key + " " + "y" * (DETAIL_CHARS - len(long_key) - 2 - size) + " " + long_key
+        error = scrub_key(BrainError("bad_request", raw), long_key)
+        check(f"key: after a replacement, a cut-off piece of {size} character{'s' if size > 1 else ''} at the end goes too",
+              not error.detail.endswith(long_key[:size]) and error.detail.endswith(KEY_REMOVED)
+              and long_key not in error.detail, error.detail[-24:])
     if anthropic is None:
         check("Claude: the key leaves its error text, and the client follows no redirect: NOT CHECKED "
               "(the anthropic package is missing)", True, "")
@@ -1928,7 +2034,14 @@ def offline_checks() -> list[tuple[str, bool, str]]:
 
     for label, payload, wanted in (("an empty object", {}, False), ("no choices", {"choices": []}, False),
                                    ("choices that are no list", {"choices": "x"}, False),
-                                   ("a cut-off answer (empty text, the budget ended)", cut_off, True)):
+                                   ("a first choice with no message", {"choices": [{}]}, False),
+                                   ("a message with no content and no finish reason", {"choices": [{"message": {}}]}, False),
+                                   ("a message that is no object", {"choices": [{"message": "OK"}]}, False),
+                                   ("a normal answer", {"choices": [{"message": {"role": "assistant", "content": "OK"},
+                                                                     "finish_reason": "stop"}]}, True),
+                                   ("a cut-off answer (empty text, the budget ended)", cut_off, True),
+                                   ("a cut-off answer with null content",
+                                    {"choices": [{"message": {"content": None}, "finish_reason": "length"}]}, True)):
         result = chat_probe(payloads(payload)[0])
         check(f"probe (chat): {label} -> model {'works' if wanted else 'fails'}",
               result["model"][0] is wanted and (wanted or "not a completion" in result["model"][1]), str(result["model"]))
@@ -1940,7 +2053,13 @@ def offline_checks() -> list[tuple[str, bool, str]]:
     for label, payload, wanted in (("an empty object", {}, False), ("output that is no list", {"output": "x"}, False),
                                    ("a status that says the budget ended", {"status": "incomplete", "incomplete_details":
                                                                             {"reason": "max_output_tokens"}}, True),
-                                   ("an empty output list", {"output": []}, True)):
+                                   ("an empty output list", {"output": []}, True),
+                                   ("output items that are not objects", {"output": [5, "x"]}, False),
+                                   ("a message item with no content", {"output": [{"type": "message"}]}, False),
+                                   ("only a reasoning item (the budget went to thinking)",
+                                    {"output": [{"type": "reasoning", "summary": []}]}, True),
+                                   ("a normal answer", {"output": [{"type": "message", "content": [
+                                       {"type": "output_text", "text": "OK"}]}]}, True)):
         fake_call, asked = payloads(payload)
         with swapped(_call=fake_call):
             result = probe(chat_cfg, "openai")
@@ -2064,6 +2183,88 @@ def offline_checks() -> list[tuple[str, bool, str]]:
           text.startswith("The conversation so far:") and "User: a1" in text and "Jarviz: b2" in text
           and text.endswith("The user says now:\nc3") and cli_conversation(three[:1]) == "a1", text)
 
+    # -- a run that did not START is tried again (agy's backend), in ONE place: _cli_call. A started run never twice.
+    hiccup = "failed to start conversation: backend returned an empty conversation id"
+    not_started = json.dumps({"event": "result", "result": {"conversation_id": "", "status": "ERROR", "response": "",
+                                                            "error": hiccup, "duration_seconds": 0, "num_turns": 0}})
+    got = outcome(lambda: _agy_answer(not_started, 1, f"error: {hiccup}"))
+    check("agy: the real 'empty conversation id' result is cli_not_started", got == "cli_not_started", got)
+    signed_out = json.dumps({"event": "result", "result": {"conversation_id": "", "status": "ERROR", "response": "",
+                                                           "error": "authentication required", "num_turns": 0}})
+    check("agy: a signed-out text still wins over 'not started'",
+          outcome(lambda: _agy_answer(signed_out, 1)) == "cli_signed_out", "")
+    for label, odd in (("a conversation id", {"conversation_id": "c-9"}), ("a turn", {"num_turns": 1}),
+                       ("num_turns of a wrong type", {"num_turns": False}), ("no conversation id", {"conversation_id": None})):
+        result = {"conversation_id": "", "status": "ERROR", "error": hiccup, "num_turns": 0, **odd}
+        got = outcome(lambda result=result: _agy_answer(json.dumps({"event": "result", "result": result}), 1))
+        check(f"agy: a failed run with {label} is not 'not started' (cli_failed)", got == "cli_failed", got)
+    got = outcome(lambda: _agy_answer('{"event":"step_update","step_update":{"step_index":0,"state":"DONE",'
+                                      '"step_type":"user_input"}}\n' + not_started, 1))
+    check("agy: a failed run with a step update is not 'not started'", got != "cli_not_started", got)
+
+    def sequence(*answers):
+        """A fake runner that gives the answers in turn (code, stdout, stderr), and a fake clock and sleep."""
+        calls, pauses, now = [], [], [0.0]
+
+        def run(argv, stdin_text, room, env, timeout):
+            if argv[-1:] == ["--version"]:
+                return 0, "9.9.9\n", ""
+            calls.append({"room": room, "timeout": timeout, "files": sorted(os.listdir(room))})
+            now[0] += 3.0                       # a failed start takes about 3 seconds
+            return answers[min(len(calls), len(answers)) - 1]
+
+        return run, calls, pauses, now
+
+    def tried(answers, brain_name="antigravity", route="chat", step: float | None = None):
+        """(outcome, calls, pauses) of one _cli_call against a fake runner, with a fake clock and sleep."""
+        run, calls, pauses, now = sequence(*answers)
+        if step is not None:                    # each run takes this long instead
+            def slow(argv, *rest, run=run):
+                result = run(argv, *rest)
+                now[0] += step - 3.0
+                return result
+            run = slow
+        config = agy_cfg if brain_name == "antigravity" else cfg
+        with swapped(_clock=lambda: now[0], _sleep=lambda seconds: (pauses.append(seconds), now.__setitem__(0, now[0] + seconds))):
+            got = outcome(lambda: _cli_call(config, brain_name, route, "S", question, run, agy if brain_name ==
+                                            "antigravity" else codex))
+        return got, calls, pauses
+
+    no_start = (1, not_started + "\n", f"error: {hiccup}\n")
+    got, calls, pauses = tried([no_start, no_start, (0, _agy_says("Four, sir.\n"), "")])
+    rooms = [call["room"] for call in calls]
+    check("retry: not started twice, then an answer: 3 runs, 3 new rooms (all removed), pauses 2 and 5 seconds",
+          got == "ok:Four, sir." and len(calls) == 3 and len(set(rooms)) == 3 and pauses == list(CLI_START_PAUSES)
+          and not any(os.path.exists(room) for room in rooms)
+          and all(call["files"] == [".agents", AGY_SETTINGS_FILE] for call in calls), f"{got} {len(calls)} {pauses}")
+    check("retry: every try gets only the route's time that is left",
+          calls[0]["timeout"] == TIMEOUT_S["chat"] and calls[1]["timeout"] < calls[0]["timeout"]
+          and calls[2]["timeout"] < calls[1]["timeout"], str([round(call["timeout"]) for call in calls]))
+    got, calls, pauses = tried([no_start])
+    check("retry: three times not started raises cli_not_started after exactly 3 runs",
+          got == "cli_not_started" and len(calls) == CLI_START_TRIES == 3, f"{got} {len(calls)}")
+    started_failed = (1, with_init(real_init["init"], status="ERROR").replace('"response": "OK\\n"', '"error": "boom"'), "")
+    got, calls, pauses = tried([started_failed, (0, _agy_says("again"), "")])
+    check("retry: a run that started and failed is run ONCE", got == "cli_failed" and len(calls) == 1, f"{got} {len(calls)}")
+    got, calls, pauses = tried([(1, signed_out, "")])
+    check("retry: a signed-out run is cli_signed_out and is not tried again", got == "cli_signed_out" and len(calls) == 1,
+          f"{got} {len(calls)}")
+    got, calls, pauses = tried([(1, "", f"error: {hiccup}")], brain_name="codex")
+    check("retry: Codex is unchanged (its failure is cli_failed, run once)", got == "cli_failed" and len(calls) == 1,
+          f"{got} {len(calls)}")
+    got, calls, pauses = tried([no_start, (0, _agy_says("late"), "")], route="probe", step=52.0)
+    check("retry: no second try when the route's time left is too short for the pause and a try",
+          got == "cli_not_started" and len(calls) == 1 and not pauses, f"{got} {len(calls)} {pauses}")
+    run, calls, pauses, now = sequence(no_start)
+    with tempfile.TemporaryDirectory(prefix="jarviz-locks-") as folder:
+        trap_locks = Path(folder) / "brain-locks.json"
+        forget_versions(agy)
+        with swapped(_clock=lambda: now[0], _sleep=lambda seconds: pauses.append(seconds)):
+            held, detail = prove_lock(agy_cfg, "antigravity", run, trap_locks, agy)
+        check("retry: the trap gets the retry too; still not started -> None (could not look), no record",
+              held is None and "cli_not_started" in detail and len(calls) == 3 and not trap_locks.exists(), detail)
+    forget_versions(agy)
+
     # -- the real runner, with Python as the program (never a real tool)
     room = tempfile.mkdtemp(prefix="jarviz-brain-")
     try:
@@ -2130,6 +2331,7 @@ def offline_checks() -> list[tuple[str, bool, str]]:
               and "do not make up a name" in stdin and "server name jarviz-trap" not in stdin and "web" not in stdin.lower(),
               stdin[-200:])
         forget_versions(agy)
+        locks.unlink(missing_ok=True)       # no strong proof on file: this check is about a weak run on its own
         unsent = _FakeTool(_agy_says("CANNOT\n", *agy_step("call_mcp_tool", "ERROR", 3, invalid)))
         held, detail = prove_lock(agy_cfg, "antigravity", unsent, locks, agy)
         check("prove_lock: a call that was not valid and not sent -> True, but a WEAK proof (no evidence)",
@@ -2162,7 +2364,7 @@ def offline_checks() -> list[tuple[str, bool, str]]:
         held, detail = prove_lock(cfg, "codex", polite_tool, locks, codex)
         entry = _lock_entry("codex", locks) or {}
         check("prove_lock: no attempt seen -> a WEAK proof: held, seen [], said plainly",
-              held is True and detail.endswith("the trap saw no refused attempt") and entry.get("seen") == []
+              held is True and "the trap saw no refused attempt (two runs)" in detail and entry.get("seen") == []
               and lock_seen("codex", locks, polite_tool, codex) is False, detail)
         refusing = _FakeTool(polite, err=f"{noise}\n{router}")
         held, detail = prove_lock(cfg, "codex", refusing, locks, codex)
@@ -2212,21 +2414,22 @@ def offline_checks() -> list[tuple[str, bool, str]]:
         fake = _FakeTool(polite)
         forget_versions(codex)
         got = outcome(lambda: ensure_locked(cfg, "codex", fake, locks, codex))
-        check("ensure_locked: no record runs the trap once", got == "ok:None" and len(fake.calls) == 1, got)
+        check("ensure_locked: no record runs the trap (a weak first run is looked at twice)",
+              got == "ok:None" and len(fake.calls) == 2, got)
         got = outcome(lambda: ensure_locked(cfg, "codex", fake, locks, codex))
-        check("ensure_locked: a matching held record runs no trap", got == "ok:None" and len(fake.calls) == 1, got)
+        check("ensure_locked: a matching held record runs no trap", got == "ok:None" and len(fake.calls) == 2, got)
         newer = _FakeTool(polite, version="9.9.10")
         forget_versions(codex)
         got = outcome(lambda: ensure_locked(cfg, "codex", newer, locks, codex))
-        check("ensure_locked: another version runs the trap again", got == "ok:None" and len(newer.calls) == 1, got)
+        check("ensure_locked: another version runs the trap again", got == "ok:None" and len(newer.calls) == 2, got)
         _write_lock("codex", {"version": "9.9.10", "recipe": lock_recipe("codex"), "held": False,
                               "detail": "version 9.9.10: the brain made a file"}, locks)
         got = outcome(lambda: ensure_locked(cfg, "codex", newer, locks, codex))
-        check("ensure_locked: a held-false record refuses without a run", got == "cli_not_locked" and len(newer.calls) == 1, got)
+        check("ensure_locked: a held-false record refuses without a run", got == "cli_not_locked" and len(newer.calls) == 2, got)
         locks.write_text("{broken", encoding="utf-8")
         fake = _FakeTool(polite, version="9.9.10")
         got = outcome(lambda: ensure_locked(cfg, "codex", fake, locks, codex))
-        check("ensure_locked: a broken record is no proof (the trap runs)", got == "ok:None" and len(fake.calls) == 1, got)
+        check("ensure_locked: a broken record is no proof (the trap runs)", got == "ok:None" and len(fake.calls) == 2, got)
         locks.unlink(missing_ok=True)
         forget_versions(codex)
         got = outcome(lambda: ensure_locked(cfg, "codex", _FakeTool("", code=1, err="Not logged in"), locks, codex))
@@ -2240,10 +2443,91 @@ def offline_checks() -> list[tuple[str, bool, str]]:
         got = outcome(lambda: ask(cfg, "chat", "S", question, fake, codex, locks))
         again = outcome(lambda: ask(cfg, "chat", "S", question, fake, codex, locks))
         check("ask: a sign-in brain proves the lock once, then answers",
-              got == again == "ok:Fine, sir." and len(fake.calls) == 3, f"{got}; {len(fake.calls)} calls")
+              got == again == "ok:Fine, sir." and len(fake.calls) == 4, f"{got}; {len(fake.calls)} calls")     # 2 trap runs, 2 questions
         got = outcome(lambda: ask(cfg, "chat", "S", question, _FakeTool(lambda s, r: _codex_says(" ")), codex, locks))
         check("ask: an empty answer is empty_reply", got == "empty_reply", got)
     forget_versions(codex, agy)
+
+    # -- look twice for evidence; a weak run never replaces a strong proof of the same version and recipe
+    def trap_runs(*kinds: str, version: str = "9.9.9"):
+        """A fake Codex whose trap runs go in turn: weak (CANNOT, nothing refused), strong (the sandbox refusal on
+        stderr), false (a tool ran), none (not signed in: could not look)."""
+        count = [0]
+
+        def run(argv, stdin_text, room, env, timeout):
+            if argv[-1:] == ["--version"]:
+                return 0, version + "\n", ""
+            kind = kinds[min(count[0], len(kinds) - 1)]
+            count[0] += 1
+            return {"weak": (0, _codex_says("1. CANNOT\n2. CANNOT\n3. CANNOT"), ""),
+                    "strong": (0, _codex_says("1. CANNOT\n2. CANNOT\n3. CANNOT"), router),
+                    "false": (0, "\n".join(sample[:2] + tool_lines + sample[3:]), ""),
+                    "none": (1, "", "Error: Not logged in")}[kind]
+        return run, count
+
+    def strong_record(version: str = "9.9.9") -> dict:
+        return {"version": version, "recipe": lock_recipe("codex"), "held": True, "detail": "earlier strong proof",
+                "seen": [EVIDENCE_CODEX_WRITE]}
+
+    with tempfile.TemporaryDirectory(prefix="jarviz-locks-") as folder:
+        locks = Path(folder) / "brain-locks.json"
+
+        def proved(*kinds: str, before: dict | None = None, version: str = "9.9.9"):
+            """(held, detail, trap runs, record after, record bytes changed) of one prove_lock."""
+            locks.unlink(missing_ok=True)
+            if before is not None:
+                _write_lock("codex", before, locks)
+            old = locks.read_bytes() if locks.exists() else b""
+            run, count = trap_runs(*kinds, version=version)
+            forget_versions(codex)
+            held, detail = prove_lock(cfg, "codex", run, locks, codex)
+            new = locks.read_bytes() if locks.exists() else b""
+            return held, detail, count[0], _lock_entry("codex", locks), old != new, run
+
+        held, detail, runs, entry, _, run = proved("weak", "strong")
+        check("twice: weak, then strong on the second run -> a strong proof, 2 trap runs",
+              held is True and runs == 2 and (entry or {}).get("seen") == [EVIDENCE_CODEX_WRITE] and "(two runs)" in detail
+              and lock_seen("codex", locks, run, codex) is True, detail)
+        held, detail, runs, entry, _, run = proved("weak", "weak")
+        check("twice: weak twice with no record -> a weak record, 2 trap runs",
+              held is True and runs == 2 and (entry or {}).get("seen") == [] and (entry or {}).get("held") is True
+              and lock_seen("codex", locks, run, codex) is False, detail)
+        held, detail, runs, entry, changed, run = proved("weak", "weak", before=strong_record())
+        check("twice: weak twice over a strong record of the same version and recipe -> the record stays",
+              held is True and runs == 2 and not changed and lock_seen("codex", locks, run, codex) is True
+              and "an earlier run of this version did see a refused attempt (the strong proof on file stays)" in detail,
+              detail)
+        held, detail, runs, entry, changed, run = proved("weak", "weak", before=strong_record("9.9.8"))
+        check("twice: the same over a strong record of ANOTHER version -> a weak record is written",
+              held is True and changed and (entry or {}).get("version") == "9.9.9" and (entry or {}).get("seen") == []
+              and lock_seen("codex", locks, run, codex) is False, detail)
+        other_recipe = {**strong_record(), "recipe": "0" * 64}
+        held, detail, runs, entry, changed, run = proved("weak", "weak", before=other_recipe)
+        check("twice: the same over a strong record of ANOTHER recipe -> a weak record is written",
+              changed and (entry or {}).get("recipe") == lock_recipe("codex") and (entry or {}).get("seen") == [], detail)
+        held, detail, runs, entry, changed, run = proved("weak", "false", before=strong_record())
+        check("twice: True, then False -> False is recorded (it replaces even a strong proof)",
+              held is False and runs == 2 and (entry or {}).get("held") is False and "(two runs)" in detail, detail)
+        held, detail, runs, entry, _, run = proved("false", "weak")
+        check("twice: False on the first run -> 1 trap run only", held is False and runs == 1, detail)
+        held, detail, runs, entry, _, run = proved("strong", "weak")
+        check("twice: strong on the first run -> 1 trap run only",
+              held is True and runs == 1 and (entry or {}).get("seen") == [EVIDENCE_CODEX_WRITE]
+              and "(two runs)" not in detail, detail)
+        held, detail, runs, entry, _, run = proved("weak", "none")
+        check("twice: a second run that could not look does not undo the first True",
+              held is True and runs == 2 and "(two runs; the second could not look)" in detail
+              and (entry or {}).get("held") is True, detail)
+        held, detail, runs, entry, _, run = proved("weak", "strong", before=strong_record())
+        check("twice: a strong run replaces the record (also a strong one)",
+              held is True and (entry or {}).get("detail") != "earlier strong proof", str(entry))
+        locks.unlink(missing_ok=True)
+        run, count = trap_runs("weak", "strong")
+        forget_versions(codex)
+        got = outcome(lambda: ensure_locked(cfg, "codex", run, locks, codex))
+        check("twice: ensure_locked looks twice too (weak, then strong -> a strong record)",
+              got == "ok:None" and count[0] == 2 and lock_seen("codex", locks, run, codex) is True, got)
+    forget_versions(codex)
 
     # -- versions, recipes, the probe
     got = tool_version(["fake-version"], _FakeTool("", version="codex-cli 0.171.0\nmore"))
@@ -2292,6 +2576,8 @@ def offline_checks() -> list[tuple[str, bool, str]]:
         recipes_with(TRAP_FRAME=TRAP_FRAME + " x")[name] != before[name] for name in before), "")
     check("lock_recipe: changing the agy refusal rule changes it (it is how the trap judges)",
           recipes_with(AGY_REFUSED_RE=re.compile("denied"))["antigravity"] != before["antigravity"], "")
+    check("lock_recipe: the retry of a run that did not start is not part of the lock",
+          recipes_with(CLI_START_TRIES=1, CLI_START_PAUSES=(9.0,), CLI_START_MIN_TRY_S=1.0) == before, "")
     check("lock_recipe: changing the agy 'never sent' rule changes it",
           recipes_with(AGY_NOT_SENT_RE=re.compile("invalid"))["antigravity"] != before["antigravity"], "")
     check("lock_recipe: the values are back after the checks",

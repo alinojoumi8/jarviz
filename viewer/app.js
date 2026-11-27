@@ -610,6 +610,8 @@
     teardown_unreachable: 'I could not start the teardown. I could not reach the server.',
     cancel_unreachable: 'I could not cancel it. I could not reach the server.',
     teardown_missing: 'I cannot find that teardown on file.',
+    voice_unreachable: 'I could not switch voices. I could not reach the server.',
+    voice_failed: 'The server voice did not play. The browser voice speaks instead.',
   };
 
   async function readStatus() {
@@ -618,6 +620,7 @@
     if (status.ok === false) return status;         // the page has lost its key: the caller shows status.answer
     syncGraph(status.graph);                        // the file on screen may be older than the galaxy: then it is read again
     showBrain(status.active);
+    takeVoiceOffer(status.voice);
     const spoken = status.lines || {};
     for (const name of Object.keys(lines)) {
       if (typeof spoken[name] === 'string' && spoken[name]) lines[name] = spoken[name];
@@ -629,6 +632,86 @@
     $('answer').textContent = text;
     $('answer').hidden = !text;
     $('answer').classList.toggle('trouble', Boolean(trouble));
+  }
+
+  // ------------------------------------------------------------ the voices
+  // The browser voice, or a server voice (Deepgram): the server makes its audio, its key never leaves the server.
+  // The page keeps the choice (localStorage, one key). An old server sends no `voice` in /status: then the page
+  // has the browser voice only, no chip, and no voice route.
+
+  const VOICE_KEY = 'jarviz_voice';
+  let voiceOffer = null;        // /status "voice": { default, voices: [{ name, label, model, has_key }] }
+
+  function takeVoiceOffer(offer) {
+    if (!offer || typeof offer !== 'object' || !Array.isArray(offer.voices)) return;
+    voiceOffer = { default: offer.default, voices: offer.voices.filter(item => item && typeof item.name === 'string') };
+    showVoice();
+  }
+
+  const voiceInfo = name => (voiceOffer ? voiceOffer.voices.find(item => item.name === name) || null : null);
+  // A voice the page may use now: the browser voice always, a server voice only with a key.
+  const possibleVoice = name => name === 'browser' || Boolean(voiceInfo(name) && voiceInfo(name).has_key === true);
+
+  function keptVoice() {
+    try { return localStorage.getItem(VOICE_KEY); } catch (error) { return null; }     // storage can be blocked
+  }
+
+  // At start: the kept choice when the server says it is possible, else the server's default, else the browser.
+  function startVoice() {
+    if (!voiceOffer) return;
+    const name = [keptVoice(), voiceOffer.default].find(choice => typeof choice === 'string' && possibleVoice(choice));
+    speaker.setVoice(name || 'browser');
+    showVoice();
+  }
+
+  // The /voice answer named the new voice. It is taken BEFORE the answer is said, so the answer has the new voice.
+  function takeVoice(info) {
+    if (!info || typeof info.name !== 'string' || !info.name) return;
+    if (!voiceOffer) voiceOffer = { default: 'browser', voices: [] };
+    voiceOffer.voices = voiceOffer.voices.filter(item => item.name !== info.name).concat([info]);
+    try { localStorage.setItem(VOICE_KEY, info.name); } catch (error) { /* blocked: the choice lasts until a reload */ }
+    speaker.setVoice(info.name);
+    showVoice();
+  }
+
+  function showVoice() {                      // which voice speaks, beside the brain chip
+    const chip = $('voice');
+    if (!voiceOffer) { chip.hidden = true; return; }
+    const now = speaker.voiceState();
+    const info = voiceInfo(now.name);
+    const label = info && typeof info.label === 'string' && info.label ? info.label : now.name;
+    const model = info && typeof info.model === 'string' ? info.model : '';
+    if (now.name === 'browser') chip.textContent = 'voice: browser';
+    else if (now.gaveUp) chip.textContent = `voice: browser · ${label} off`;      // it failed: back after "switch voice to ..."
+    else chip.textContent = `voice: ${label}` + (model ? ` · ${model}` : '');
+    chip.classList.toggle('warn', now.gaveUp);
+    chip.hidden = false;
+  }
+
+  // The server voice failed: its line is shown once, under the answer, until a part plays well again.
+  function voiceTrouble(trouble) {
+    if (trouble.tell) {
+      $('answer').append(el('span', 'voice-note', trouble.answer || lines.voice_failed));
+      $('answer').hidden = false;
+    }
+    if (trouble.gaveUp) showVoice();
+  }
+
+  // One part of the audio of a text. The server cuts the text: the same whole text goes with every part.
+  async function fetchAudio(text, part) {
+    const response = await fetch('/voice/speak', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text, part }),
+    });
+    const type = (response.headers && response.headers.get('Content-Type')) || '';
+    if (!response.ok || !/^audio\//i.test(type)) {
+      let answer = '';
+      try {
+        const body = await response.json();
+        if (body && typeof body.answer === 'string') answer = body.answer;
+      } catch (error) { /* no JSON: no line */ }
+      throw Object.assign(new Error('no audio'), { answer });
+    }
+    return { blob: await response.blob(), parts: Number(response.headers.get('X-Jarviz-Parts')) };
   }
 
   function say(text, trouble) {
@@ -646,6 +729,12 @@
     pickVoice: () => Core.pickVoice(window.speechSynthesis ? window.speechSynthesis.getVoices() : []),
     onStart: () => { state.speaking = true; settle(); },
     onEnd: () => { state.speaking = false; mic.deafUntil = performance.now() + ECHO_GUARD_MS; settle(); },
+    // the server voice: the audio comes from /voice/speak, the speaker plays it
+    fetchAudio,
+    Audio: window.Audio,
+    createObjectURL: blob => URL.createObjectURL(blob),
+    revokeObjectURL: url => URL.revokeObjectURL(url),
+    onTrouble: trouble => voiceTrouble(trouble),
   });
 
   const mic = { on: false, rec: null, deafUntil: 0, failures: 0 };
@@ -782,6 +871,7 @@
       && reply.graph.rev === graphState.rev;
     // A newer sentence started while this one waited: it owns the answer. This reply only mends the galaxy.
     const owner = mine === sends;
+    if (reply.voice && reply.ok !== false) takeVoice(reply.voice);   // a new voice says its own answer
     if (owner) say(reply.answer || '', reply.ok === false);   // also after a failed read: the save did happen
     // The job a /teardown/cancel answer is about (`job_id`). An older server names none.
     const about = typeof reply.job_id === 'string' && reply.job_id ? reply.job_id : null;
@@ -825,6 +915,9 @@
   }
 
   const switchBrain = name => send('/brain', { name }, lines.brain_unreachable);
+
+  // The server judges the name and answers with the voice; the page keeps it (takeVoice in handleReply).
+  const switchVoice = name => send('/voice', { name }, lines.voice_unreachable);
 
   async function whichBrain() {
     try {
@@ -1102,6 +1195,8 @@
     .add('interrupt', text => Core.interruptWord(text), () => interrupt())
     .add('remember', text => Core.matchRemember(text), fact => remember(fact))
     .add('switch-brain', text => Core.matchBrainSwitch(text), name => switchBrain(name))
+    // only with a server that has voices: else the sentence goes to the brain, as before
+    .add('switch-voice', text => (voiceOffer ? Core.matchVoiceSwitch(text) : null), name => switchVoice(name))
     .add('which-brain', /^(?:which|what)\s+brain\b/i, () => whichBrain())
     .add('forget-last', /^(?:forget|undo|scratch|delete)\s+(?:that|the last (?:note|one|capture))[.!]?$/i, () => forgetLast())
     .add('close-panel', /^(?:close|hide)\s+(?:the\s+)?(?:panel|note)[.!]?$/i, () => Focus.clear())
@@ -1180,6 +1275,7 @@
     } catch (error) {
       console.warn('Could not read the server status', error);
     }
+    startVoice();                       // before the greeting, so the greeting has the voice of this page
     if (!touched) say(lines.hello);     // the user was faster than the status: their answer stays
     Teardown.resume();
 

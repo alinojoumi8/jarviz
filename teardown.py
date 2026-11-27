@@ -205,32 +205,11 @@ def quiet_env() -> dict:
     return {name: value for name, value in os.environ.items() if not SECRET_ENV.search(name)}
 
 
-_REA_READ: list[tuple] = []     # the last reading of the installed REA: [(stamp of its files, installed_rea())]
-
-
-def _rea_stamp() -> tuple | None:
-    """What decides the installed version: the size and the change time of the REA script and of its package.json.
-    None when one of them cannot be read: then no reading is kept, and the version is read again."""
-    try:
-        return tuple((info.st_size, info.st_mtime_ns) for info in (REA_SCRIPT.stat(), _rea_package().stat()))
-    except OSError:
-        return None
-
-
 def rea_reading() -> dict:
-    """installed_rea(), read again whenever the files that decide it changed: a new install while Jarviz runs is
-    seen at once, by run_rea and by diag() alike. A reading is kept only when the files did not change while it was
-    read."""
-    stamp = _rea_stamp()
-    kept = _REA_READ[0] if _REA_READ else None
-    if stamp is not None and kept is not None and kept[0] == stamp:
-        return dict(kept[1])
-    found = installed_rea()
-    if stamp is not None and _rea_stamp() == stamp:
-        _REA_READ[:] = [(stamp, dict(found))]
-    else:
-        _REA_READ.clear()
-    return found
+    """installed_rea(), read on EVERY call: it is one small file (package.json) and one look at the script, so nothing
+    is kept. A new install while Jarviz runs is seen at once, by run_rea and by diag() alike, also one with the same
+    size and the same file time (a size-and-time stamp would miss that one)."""
+    return installed_rea()
 
 
 def run_rea(command: str, *args: str, timeout: float = 90.0, on_start=None) -> dict:
@@ -2125,7 +2104,7 @@ class Bay:
     """Runs teardowns one at a time. server.py hands in the few things it needs from the rest of Jarviz."""
 
     def __init__(self, *, notes_dir, ask, birth, note_titles, writer_name, voice: str, plain_line: str, unbirth=None,
-                 notes_folder=None, day=today):
+                 notes_folder=None, day=today, unbirth_left=None):
         self._notes_dir = notes_dir         # () -> Path of the notes folder
         # () -> (Path, its fingerprint): the folder now, after a look for a rebuild. A job binds itself to it for the
         # whole write. None: notes_dir(), and the births name no folder.
@@ -2135,6 +2114,10 @@ class Bay:
         # when the notes folder is no longer the one the job bound itself to.
         self._birth = birth
         self._unbirth = unbirth             # (receipt) -> None: takes back a note this job made. None: they stay
+        # (receipt, folder) -> None: takes back a note that this job made in the folder it bound itself to, when the
+        # galaxy shows ANOTHER folder now (unbirth refuses that receipt). Only its file goes, and only when it still
+        # holds the bytes on the receipt. None: such a note stays.
+        self._unbirth_left = unbirth_left
         self._day = day                     # () -> the date in a new note's name (a test gives a fixed one)
         self._note_titles = note_titles     # () -> the titles of every note, lower case
         self._writer_name = writer_name     # () -> "Claude (claude-opus-5-5)"
@@ -2354,7 +2337,7 @@ class Bay:
                     path.rmdir()
                 except OSError:
                     pass
-            self._take_back(job)
+            self._take_back(job, root, vault)
             raise                           # the error that stopped the job, not one from the clean-up
         assets = evidence.get("assets") or {}
         return {"name": name, "label": job.label, "host": job.site.host, "seconds": seconds,
@@ -2363,17 +2346,34 @@ class Bay:
                 "totals": totals_line(assets), "snapshot": f"{name}.png" if image else "", "births": list(births),
                 "doubts": unsupported_claims(reply["note"], digest)}
 
-    def _take_back(self, job: Job) -> None:
+    def _take_back(self, job: Job, folder: Path | None = None, vault: str | None = None) -> None:
         """A teardown that failed takes back the notes it made, newest first. An older note cannot go while a
-        newer one stays, so the first one that cannot be taken back stops it. What stays is still on the job."""
+        newer one stays, so the first one that cannot be taken back stops it. What stays is still on the job.
+        `folder` and `vault`: the notes folder the job bound itself to. A note made there while the galaxy has moved
+        to another folder since is taken back by its file alone (unbirth_left)."""
         if self._unbirth is None:
             return
         while job.births:
+            receipt = job.births[-1]
             try:
-                self._unbirth(job.births[-1])
+                self._unbirth(receipt)
             except Exception:               # noqa: BLE001 - the error that stopped the job is the one to report
-                return
+                if not self._take_back_left(receipt, folder, vault):
+                    return
             job.births.pop()
+
+    def _take_back_left(self, receipt, folder: Path | None, vault: str | None) -> bool:
+        """unbirth refused this receipt. When it names the folder this job bound itself to, the galaxy may show
+        another folder now: then the note's file is taken back by its identity (the folder, the path in it, the bytes
+        on the receipt). unbirth_left decides, under the galaxy's lock. True when the note is gone."""
+        if (self._unbirth_left is None or folder is None or vault is None or not isinstance(receipt, dict)
+                or receipt.get("vault") != vault):
+            return False
+        try:
+            self._unbirth_left(receipt, folder)
+        except Exception:                   # noqa: BLE001 - a changed note stays, and stays on the job's list
+            return False
+        return True
 
     # -- notes on disk (they are still there after a restart)
 
@@ -2709,35 +2709,40 @@ def _offline_bay_checks(reply: str, evidence: dict) -> list[tuple[str, bool, str
                     got == ["private_site", "", "", "not_a_site", "private_site"]
                     and asked == ["intranet.example.com", "example.com", "www.example.com"],
                     f"got {got}, looked up {asked}"))
-    # Only the pinned REA runs. Its version is read again when its files change (a new install while Jarviz runs),
-    # and diag() reads it the same way. In ONE process: pinned, then another version, then pinned again. A made-up
-    # tools folder, and no Node.js: no REA process is started here, so the pinned one stops at "kit_missing".
-    saved = (globals()["REA_SCRIPT"], globals()["find_node"], list(_REA_READ))
-    codes, said = [], []
-    with tempfile.TemporaryDirectory() as temp:
-        script = Path(temp) / "node_modules" / REA_PACKAGE / "scripts" / "rea.mjs"
-        script.parent.mkdir(parents=True)
-        script.write_text("// a stand-in, never run\n", encoding="utf-8")
-        package = script.parent.parent / "package.json"
-        try:
-            globals()["REA_SCRIPT"], globals()["find_node"] = script, lambda: None
-            _REA_READ.clear()
-            for number, version in enumerate((REA_PIN, "0.0.1", REA_PIN)):
-                package.write_text(json.dumps({"name": REA_PACKAGE, "version": version}), encoding="utf-8")
-                changed = 1_700_000_000_000_000_000 + number * 1_000_000_000     # each install has its own time
-                os.utime(package, ns=(changed, changed))
-                try:
-                    run_rea("inspect-web-page", "http://127.0.0.1:1/")
-                    codes.append("ran")
-                except TeardownError as error:
-                    codes.append(error.code)
-                said.append(diag()["rea"]["installed"])
-        finally:
-            globals()["REA_SCRIPT"], globals()["find_node"] = saved[0], saved[1]
-            _REA_READ[:] = saved[2]
-    results.append(("only the pinned REA runs; a new install while Jarviz runs is read again, and diag() says the same",
-                    codes == ["kit_missing", "rea_not_pinned", "kit_missing"] and said == [REA_PIN, "0.0.1", REA_PIN],
-                    f"run_rea {codes}, diag {said}"))
+    # Only the pinned REA runs. Its version is read at every call (a new install while Jarviz runs), and diag() reads
+    # it the same way. In ONE process: pinned, then another version, then pinned again: once with a new file time for
+    # each install, once with the SAME size and the SAME time (os.utime), which a size-and-time stamp cannot tell apart.
+    # A made-up tools folder, and no Node.js: no REA process is started here, so the pinned one stops at "kit_missing".
+    other = ".".join("9" * len(part) for part in REA_PIN.split("."))         # "9.9.9": as long as the pinned version
+    saved = (globals()["REA_SCRIPT"], globals()["find_node"])
+    for same_stamp in (False, True):
+        codes, said, sizes = [], [], set()
+        with tempfile.TemporaryDirectory() as temp:
+            script = Path(temp) / "node_modules" / REA_PACKAGE / "scripts" / "rea.mjs"
+            script.parent.mkdir(parents=True)
+            script.write_text("// a stand-in, never run\n", encoding="utf-8")
+            package = script.parent.parent / "package.json"
+            try:
+                globals()["REA_SCRIPT"], globals()["find_node"] = script, lambda: None
+                for number, version in enumerate((REA_PIN, other, REA_PIN)):
+                    package.write_text(json.dumps({"name": REA_PACKAGE, "version": version}), encoding="utf-8")
+                    changed = 1_700_000_000_000_000_000 + (0 if same_stamp else number * 1_000_000_000)
+                    os.utime(package, ns=(changed, changed))
+                    sizes.add((package.stat().st_size, package.stat().st_mtime_ns))
+                    try:
+                        run_rea("inspect-web-page", "http://127.0.0.1:1/")
+                        codes.append("ran")
+                    except TeardownError as error:
+                        codes.append(error.code)
+                    said.append(diag()["rea"]["installed"])
+            finally:
+                globals()["REA_SCRIPT"], globals()["find_node"] = saved
+        how = "the same size and file time" if same_stamp else "a new file time each"
+        results.append((f"only the pinned REA runs; a new install while Jarviz runs is read again ({how}), and diag() "
+                        "says the same",
+                        codes == ["kit_missing", "rea_not_pinned", "kit_missing"] and said == [REA_PIN, other, REA_PIN]
+                        and len(sizes) == (1 if same_stamp else 3),
+                        f"run_rea {codes}, diag {said}, {len(sizes)} different stamps"))
     # A profiles folder that is there but cannot be listed is "could not look" (None), never "clean".
     real_dir, real_iterdir = globals()["PROFILES_DIR"], Path.iterdir
     with tempfile.TemporaryDirectory() as temp:

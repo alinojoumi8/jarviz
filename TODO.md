@@ -66,6 +66,27 @@ Jarviz has seven brains. One is active. The screen shows it at the top (`brain: 
 - **History:** Codex keeps nothing (`--ephemeral`). Antigravity keeps each question as one conversation in its own history (`agy`, then `/resume` shows them). Jarviz cannot turn that off and does not delete it.
 - **The first question after a tool update** takes about half a minute longer: Jarviz proves the lock again first. `python preflight.py` does the same proof.
 - **A model of your choice:** put its id on the model line. For Antigravity, `agy models` in a terminal shows the ids.
+- **Google's side sometimes does not start.** On 26 Nov about 1 start in 3 failed ("empty conversation id"), also with `agy` alone. Jarviz tries again by itself, up to 3 times. It costs about 10 seconds more.
+- **A strong proof is not seen in every run.** Sometimes the model says "cannot" and does not try. Then Jarviz runs the trap once more. A weak run never replaces a strong proof of the same version.
+
+## Voice
+
+Jarviz can speak with two voices. The screen shows the one in use at the top (`voice: ...`).
+
+| Voice | What it is | What it needs |
+| --- | --- | --- |
+| browser | The voice of your browser. It is free. | Nothing. |
+| Deepgram | A recorded-quality voice from Deepgram. The start voice is `aura-2-draco-en` (a man, British, calm). | A Deepgram key in `config.json`. |
+
+- **Add the key:** make a key at Deepgram (a new account gets free credit). Open `config.json`. Add this line right after the first `{`, with your key between the quotes: `"deepgram_api_key": "YOUR-KEY-HERE",`. Save. No restart.
+- **Switch:** say or type "switch voice to Deepgram". To go back: "switch voice to browser".
+- **The choice stays in that browser.** Another browser starts with the default voice. To make Deepgram the default, add the line `"voice": "deepgram",` to `config.json`.
+- **Another Deepgram voice:** add the line `"deepgram_voice": "aura-2-pandora-en",` (a woman, British, calm). Other names: `aura-2-odysseus-en`, `aura-2-thalia-en`.
+- **Your key stays on your computer.** The page asks Jarviz for the sound. Jarviz asks Deepgram.
+- **It costs money per letter.** Deepgram counts the letters that Jarviz says (about 3 cents for 1,000 letters). A muted test tab asks for no sound, so it costs nothing.
+- **If Deepgram does not answer,** the browser voice says the line. After three failures in a row Jarviz stops asking Deepgram until you switch again.
+- **Listening is still the browser's job** (Chrome and Edge only). Deepgram can also listen. That is not built.
+- [ ] Deepgram with a real key: NOT tested. There is no key in `config.json` yet. All Deepgram answers in the tests are made-up ones. After you add the key, run `python preflight.py`: it sends one tiny real request and checks that real sound comes back.
 
 ## Part One: the foundation
 
@@ -101,7 +122,7 @@ Still to prove:
 
 Proven with the real brain and a real public site (igloo.inc):
 
-- [x] Last run: `PREFLIGHT: 37 pass, 1 fail, 0 warn` and `DRILL: 96 pass, 0 fail`. The one fail is the OpenAI account: it has no credit (see "Brains"). Preflight has 38 checks now.
+- [x] Last run: `PREFLIGHT: 39 pass, 1 fail, 0 warn` and `DRILL: 97 pass, 0 fail`. The one fail is the OpenAI account: it has no credit (see "Brains"). Preflight has 40 checks now.
 - [ ] The page in the test browser was not opened in the last run: the test browser lost its unlock. The page rules (`page_checks.js`, 108 rules) ran against the files that the server gives out.
 - [x] The drill passed with a hidden browser, and also with the Chrome window on screen (`python drill.py --visible`). The snapshot from the visible window is a real picture.
 - [x] A full teardown in about one minute: 96 files, 14.7 MB, Three.js r165, GSAP 3.12.5, postprocessing 6.35.5.
@@ -188,6 +209,13 @@ Review:
   - Jarviz reads the REA version again when the installed files change.
   - The page: a sentence that refuses a teardown starts none. Two saves at the same moment no longer hide a note.
   - The drill fails when it did not see the end of its own job, and when the server does not confirm the clean-up.
+- [x] CodeRabbit answered those fixes with 7 replies. 5 were small real points, and all 5 are fixed:
+  - Jarviz reads the REA version at every call (a new install with the same file size and time is seen too).
+  - On a Mac or Linux a brain switch no longer makes `config.json` readable for other users of the computer.
+  - When the notes folder changes in the middle of a teardown, the first note of that teardown is removed from the old folder too.
+  - A chat brain whose answer has no message inside fails the test.
+  - One more rare case where a piece of a key could stay at the end of a cut error text.
+- The other 2 replies need no code: CodeRabbit accepts that a weak lock proof is allowed, and it asks for the preflight result (it is above).
 
 The page lock (it was the known gap, it is closed now):
 

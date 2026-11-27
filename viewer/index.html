@@ -121,6 +121,7 @@
   #heard { align-self: flex-start; max-width: 90%; padding: 0 6px; font-size: 13px; color: var(--dim); font-style: italic; }
   #answer { padding: 13px 18px; font-size: 16px; line-height: 1.5; max-height: 30vh; overflow-y: auto; }
   #answer.trouble { border-color: rgba(255, 184, 107, .5); }
+  #answer .voice-note { display: block; margin-top: 6px; font-size: 13px; color: var(--warn); }
   #ask { display: flex; align-items: center; gap: 8px; padding: 7px; border-radius: 999px; }
   #q { flex: 1; min-width: 0; border: 0; background: transparent; color: var(--ink); font: inherit; font-size: 15px; padding: 8px 6px; }
   #q::placeholder { color: var(--faint); }
@@ -149,6 +150,7 @@
   <span id="count" class="chip">0 notes</span>
   <span id="status" class="chip" data-state="idle" role="status"><i></i><b>idle</b></span>
   <span id="brain" class="chip" title="The brain that answers. Say: switch brain to ..." hidden></span>
+  <span id="voice" class="chip" title="The voice that speaks. Say: switch voice to ..." hidden></span>
   <span id="muted" class="chip warn" hidden>muted tab</span>
 </header>
 
