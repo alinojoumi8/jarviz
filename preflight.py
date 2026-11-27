@@ -682,37 +682,107 @@ def _handle_delete(root: Path, target: Path, born: str, between=None) -> tuple[b
     return True, ""
 
 
-def _folder_delete(root: Path, target: Path, born: str, between=None) -> tuple[bool | None, str]:
-    """POSIX: delete the fixture in a folder that stays open. Each folder from the vault down is opened with no link
-    followed (O_NOFOLLOW), the file is checked and read through the last one, and the unlink is made in it: a folder
-    swapped later cannot redirect it. The same answers as _handle_delete. A link on the way raises ELOOP/ENOTDIR."""
-    parts, flags = target.relative_to(root).parts, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-    folders = [os.open(root, flags)]
+class CleanupUnsure(Exception):
+    """The delete stopped half way. The text says where things are now, by their paths in the notes folder."""
+
+
+def _put_back(folder: int, hidden: str, name: str) -> bool:
+    """Move what sits at `hidden` back to `name` (both in the open `folder`), never over another file: a hard link
+    cannot replace a name, so it is tried first. Where there is none (a folder, a file system without links): only
+    while `name` is free. True when it is back."""
     try:
-        for part in parts[:-1]:
-            folders.append(os.open(part, flags, dir_fd=folders[-1]))
-        name, folder = parts[-1], folders[-1]
+        os.link(hidden, name, src_dir_fd=folder, dst_dir_fd=folder, follow_symlinks=False)
+    except FileExistsError:
+        return False
+    except (OSError, NotImplementedError):
+        try:
+            os.stat(name, dir_fd=folder, follow_symlinks=False)
+            return False                                # the name is taken: it stays at the hidden name
+        except FileNotFoundError:
+            os.rename(hidden, name, src_dir_fd=folder, dst_dir_fd=folder)
+            return True
+    os.unlink(hidden, dir_fd=folder)
+    return True
+
+
+def _folder_delete(root: Path, target: Path, born: str, between=None) -> tuple[bool | None, str]:
+    """POSIX: delete the fixture in folders that stay open.
+    1. The vault and each folder below it are checked (lstat: a real folder, no link) and their identity (st_dev,
+       st_ino) is kept.
+    2. Every folder from "/" down is opened with O_NOFOLLOW: no link ANYWHERE on the way is followed (a parent of the
+       vault swapped for a link raises ELOOP). The vault and each folder below must be the very one that was checked.
+    3. The file is opened in the last folder; its bytes must be `born`. That fd stays open to the end.
+    4. It is moved to a new random hidden name in the same folder, 5. what sits there now must be the file of that fd
+       (a name replaced before the move is put back and raises CleanupUnsure), 6. that hidden name is unlinked.
+    What remains: a process that watches the folder sees the hidden name after the move and could swap it in the
+    instant before the unlink. Nobody can guess the name before. The same answers as _handle_delete, and "moved"."""
+    parts = target.relative_to(root).parts
+    inner, name = parts[:-1], parts[-1]
+    checked, step = [], root
+    for part in (None, *inner):
+        step = step if part is None else step / part
+        seen = step.lstat()
+        if stat.S_ISLNK(seen.st_mode) or not stat.S_ISDIR(seen.st_mode):
+            return False, "linked"
+        checked.append((seen.st_dev, seen.st_ino))
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    fds = [os.open(root.anchor, os.O_RDONLY | os.O_DIRECTORY)]
+    try:
+        for part in root.parts[1:]:
+            fds.append(os.open(part, flags, dir_fd=fds[-1]))
+        vault_at = len(fds) - 1
+        for part in inner:
+            fds.append(os.open(part, flags, dir_fd=fds[-1]))
+        if [(found.st_dev, found.st_ino) for found in map(os.fstat, fds[vault_at:])] != checked:
+            return False, "moved"                       # another folder than the one checked
+        folder = fds[-1]
         seen = os.stat(name, dir_fd=folder, follow_symlinks=False)
         if not stat.S_ISREG(seen.st_mode):
             return False, "not_plain"
-        handle = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0), dir_fd=folder)
-        try:
-            opened = os.fstat(handle)
-            same = ((opened.st_dev, opened.st_ino) == (seen.st_dev, seen.st_ino)
-                    and _fixture_bytes_ok(lambda: os.read(handle, 65536), born))
-        finally:
-            os.close(handle)
-        if not same:
+        fds.append(os.open(name, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0), dir_fd=folder))
+        handle = fds[-1]
+        opened = os.fstat(handle)
+        if ((opened.st_dev, opened.st_ino) != (seen.st_dev, seen.st_ino) or not stat.S_ISREG(opened.st_mode)
+                or not _fixture_bytes_ok(lambda: os.read(handle, 65536), born)):
             return False, "changed"
         if between:
             between()
-        if os.stat(name, dir_fd=folder, follow_symlinks=False).st_ino != seen.st_ino:
-            return False, "changed"                     # another file at that name now: it stays
-        os.unlink(name, dir_fd=folder)
+        hidden = f".{secrets.token_hex(16)}.preflight-gone"     # new and random: nobody can have made it before
+        try:
+            os.stat(hidden, dir_fd=folder, follow_symlinks=False)
+            return None, "a new hidden name was taken"
+        except FileNotFoundError:
+            pass
+        os.rename(name, hidden, src_dir_fd=folder, dst_dir_fd=folder)
+        where, hidden_at = "/".join((*inner, name)), "/".join((*inner, hidden))
+        try:
+            now = os.stat(hidden, dir_fd=folder, follow_symlinks=False)
+        except OSError:
+            now = None          # WSL's /mnt drives show a moved file again only once it is closed: no check, no delete
+        mine = (now is not None and stat.S_ISREG(now.st_mode)
+                and (now.st_dev, now.st_ino) == (opened.st_dev, opened.st_ino))
+        if mine:
+            try:
+                os.unlink(hidden, dir_fd=folder)
+                return True, ""
+            except OSError as error:
+                trouble = (f"the test note at {where} could not be removed after it was moved for the delete "
+                           f"({error.strerror or type(error).__name__})")
+        elif now is None:
+            trouble = f"the test note at {where} could not be checked again after it was moved for the delete"
+        else:
+            trouble = f"another file took the place of the test note at {where} right before the delete"
+        os.close(fds.pop())                             # the file's fd: what sits at the hidden name goes back
+        try:
+            back = _put_back(folder, hidden, name)
+        except OSError:
+            back = False
+        raise CleanupUnsure(f"{trouble}, and " + ("it was put back there" if back else f"it was left at {hidden_at}")
+                            + ("; where the test note went is not known" if now is not None and not mine
+                               else ": remove it by hand"))
     finally:
-        for folder in reversed(folders):
-            os.close(folder)
-    return True, ""
+        for fd in reversed(fds):
+            os.close(fd)
 
 
 def delete_fixture_file(root: Path, target: Path, born: str, between=None) -> tuple[bool | None, str]:
@@ -720,7 +790,7 @@ def delete_fixture_file(root: Path, target: Path, born: str, between=None) -> tu
     opened with no link followed (POSIX). Neither: (None, why), and nothing is deleted (fail closed)."""
     if os.name == "nt":
         return _handle_delete(root, target, born, between)
-    if ({os.open, os.stat, os.unlink} <= os.supports_dir_fd and os.stat in os.supports_follow_symlinks
+    if ({os.open, os.stat, os.unlink, os.rename} <= os.supports_dir_fd and os.stat in os.supports_follow_symlinks
             and hasattr(os, "O_NOFOLLOW") and hasattr(os, "O_DIRECTORY")):
         return _folder_delete(root, target, born, between)
     return None, "this system has no delete tied to the file or to a checked folder"
@@ -745,13 +815,16 @@ def remove_fixture(notes_dir: Path, receipt: dict) -> tuple[bool | None, str]:
     stays = {"linked": f"a folder on the way to {target} is a link or a junction (it can lead out of the notes "
                        "folder), so it stays",
              "not_plain": f"the test note at {target} is not a plain file any more, so it stays",
-             "changed": f"the test note at {target} was changed after it was made, so it stays"}
+             "changed": f"the test note at {target} was changed after it was made, so it stays",
+             "moved": f"a folder on the way to {target} was swapped for another after it was checked, so it stays"}
     try:
         if not real_folders(root, target.parent):
             return False, stays["linked"]
         if not stat.S_ISREG(target.lstat().st_mode):
             return False, stays["not_plain"]
         done, why = delete_fixture_file(root, target, born)
+    except CleanupUnsure as error:      # it says where things are now
+        return None, str(error)
     except FileNotFoundError:
         return None, f"the test note is not at {target} any more"
     except OSError as error:

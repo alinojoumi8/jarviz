@@ -214,8 +214,11 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
   to that check, and preflight never stops without its summary.
 - A test fixture is deleted only through something that names the file itself: on Windows one handle (no link
   followed, real path = the place in the vault, no reparse point, bytes = `born` read through that handle, then
-  delete through it); on POSIX folders opened with O_NOFOLLOW and `dir_fd`. Where neither is possible, nothing is
-  deleted and preflight says "cleanup not confirmed" with the note's path in the notes folder (`delete_fixture_file`).
+  delete through it); on POSIX every folder is opened from "/" with O_NOFOLLOW and `dir_fd`, the vault and each
+  folder below must keep the st_dev/st_ino that was checked, and the file is moved to a random hidden name and
+  unlinked there only when it is still the file whose bytes were read (`_folder_delete`). Anything else is put back
+  and is "cleanup not confirmed". Where neither is possible, nothing is deleted and preflight says "cleanup not
+  confirmed" with the note's path in the notes folder (`delete_fixture_file`).
 - Every check in `main` runs through `run_check`: a check that stops is a FAIL that names only the type of its error,
   never its text, and preflight always ends with its summary. A request that gets no answer is "could not look"
   (`try_probe`), never a crash.
