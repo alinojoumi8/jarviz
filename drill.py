@@ -443,6 +443,42 @@ def link_checks(notes: Path, ours: str, place) -> list[tuple[str, bool, str]]:
             for entry in beside:
                 entry.unlink()
             path.unlink(missing_ok=True)
+        # POSIX: the write in that instant makes the note bigger than the read cap. It is not `born`, and the copy is
+        # streamed from the held fd with no cap, over more than one piece: every byte goes back to its name. A small
+        # cap keeps the check fast.
+        if os.name != "nt":
+            named, born = place(f"{teardown.TEARDOWNS_DIR}/t8.md", text)
+            path, saved, module, cap = notes / named, [], globals(), 4096
+            huge = bytes(range(256)) * 800                  # 200 KiB: 50 times the cap, and more than 3 read pieces
+            writer = os.open(path, os.O_WRONLY | os.O_APPEND)
+
+            def grow(writer=writer, saved=saved) -> None:
+                try:
+                    view = memoryview(huge)
+                    while view:
+                        view = view[os.write(writer, view):]
+                    saved.append("saved")
+                except OSError:
+                    saved.append("refused")
+            real_cap = module["HELD_MAX_BYTES"]
+            module["HELD_MAX_BYTES"] = cap
+            try:
+                trouble = remove_made(notes, ours, [(named, ours, born)], last=grow)
+            finally:
+                module["HELD_MAX_BYTES"] = real_cap
+                os.close(writer)
+            kept = path.read_bytes() if path.exists() else None
+            beside = [entry for entry in path.parent.iterdir() if entry.name.endswith(".drill-kept")]
+            hidden = [entry.name for entry in path.parent.iterdir() if entry.name.endswith(".drill-gone")]
+            results.append(("drill: a write in the instant before the delete that makes the note bigger than the read "
+                            "cap is never lost, and the kept copy holds every byte",
+                            saved == ["saved"] and len(trouble) == 1 and f"written back to {named}" in trouble[0]
+                            and kept == text.encode("utf-8") + huge and not beside and not hidden,
+                            f"write {saved}, trouble {trouble}, left {None if kept is None else len(kept)} bytes, "
+                            f"kept {beside}, hidden {hidden}"))
+            for entry in beside:
+                entry.unlink()
+            path.unlink(missing_ok=True)
         # One receipt whose path cannot be looked at is trouble for it alone; a notes folder that cannot be looked at
         # removes nothing, and the clean-up is not confirmed.
         first, first_born = place(f"{teardown.TEARDOWNS_DIR}/t5.md", text)
@@ -655,7 +691,8 @@ def made_by(job: dict) -> list[tuple[str, str, str]]:
     return files
 
 
-# -- the delete of a file of the test, tied to the very file that was checked (as preflight's delete_fixture_file)
+# -- the delete of a file of the test, tied to the very file that was checked (on Windows as preflight's
+# delete_fixture_file; on POSIX preflight deletes nothing by hand, and the drill writes back a last-instant change)
 # Windows (kernel32 by ctypes): the access, the share, the flags and the info classes that _handle_delete uses.
 WIN_READ_AND_DELETE = 0x80000000 | 0x00010000       # GENERIC_READ | DELETE
 WIN_SHARE_READ = 0x1                                # others may read it, never write, rename or delete it meanwhile
@@ -673,10 +710,14 @@ class CleanupUnsure(Exception):
     """The delete stopped half way. The text says where things are now, by their paths in the notes folder."""
 
 
-def _bytes_are(read, born: str) -> bool:
-    """True when the bytes that `read()` gives, piece by piece until b"", have the sha256 `born`."""
-    digest = hashlib.sha256()
+def _bytes_are(read, born: str, most: int | None = None) -> bool:
+    """True when the bytes that `read()` gives, piece by piece until b"", have the sha256 `born`. More than `most`
+    bytes never do (None: no cap)."""
+    digest, size = hashlib.sha256(), 0
     while piece := read():
+        size += len(piece)
+        if most is not None and size > most:
+            return False
         digest.update(piece)
     return digest.hexdigest() == born
 
@@ -765,28 +806,27 @@ def _put_back(folder: int, hidden: str, name: str) -> bool:
     return True
 
 
-# What a note held in the instant of its delete goes back (as preflight's _held_bytes, _save_held and _change_kept).
-HELD_MAX_BYTES = 1 << 26           # after the delete, what the held file holds is read whole, up to this much
+# What a note held in the instant of its delete goes back, whole: streamed from the held fd into a new file.
+HELD_MAX_BYTES = 1 << 26           # after the delete, the held file is compared with `born` up to this much only: a
+                                   # file that holds more is never `born`, so it is kept, never removed (no cap on it)
 
 
-def _held_bytes(handle: int) -> bytes | None:
-    """What the open file `handle` holds NOW, read from its start. None: more than HELD_MAX_BYTES. OSError: it could
-    not be read."""
+def _copy_held(handle: int, out: int) -> None:
+    """Stream ALL that the open file `handle` holds now, from its start, into the open file `out`, one piece at a time:
+    no cap, and never more than one piece in memory. OSError: a read or a write failed."""
     os.lseek(handle, 0, os.SEEK_SET)
-    pieces, size = [], 0
     while piece := os.read(handle, 65536):
-        size += len(piece)
-        if size > HELD_MAX_BYTES:
-            return None
-        pieces.append(piece)
-    return b"".join(pieces)
+        view = memoryview(piece)
+        while view:
+            view = view[os.write(out, view):]
 
 
-def _save_held(data: bytes, places: list) -> tuple[str | None, list[str]]:
-    """Save `data` (what the test note held in the instant of its delete) in the first place that takes it. A place is
-    (an open folder, or None for a name that is a whole path; the name; the mode; how that name is told). Every file is
-    NEW (O_EXCL, no link followed): never over a file. A place that refuses, or whose name is taken, gives the next
-    its turn. A copy that failed half way stays, and is told. (where it went, what failed before) or (None, all)."""
+def _save_held(handle: int, places: list) -> tuple[str | None, list[str]]:
+    """Save what the held test note `handle` holds (it changed in the instant of its delete) in the first place that
+    takes it, streamed whole (_copy_held). A place is (an open folder, or None for a name that is a whole path; the
+    name; the mode; how that name is told). Every file is NEW (O_EXCL, no link followed): never over a file. A place
+    that refuses, or whose name is taken, gives the next its turn, and the next copy starts again at the first byte. A
+    copy that failed half way stays, and is told. (where it went, what failed before) or (None, all)."""
     failed: list[str] = []
     for folder, name, mode, told in places:
         try:
@@ -797,9 +837,7 @@ def _save_held(data: bytes, places: list) -> tuple[str | None, list[str]]:
             continue
         broke = None
         try:
-            piece = memoryview(data)
-            while piece:
-                piece = piece[os.write(out, piece):]
+            _copy_held(handle, out)
         except OSError as error:
             broke = error
         try:
@@ -812,11 +850,10 @@ def _save_held(data: bytes, places: list) -> tuple[str | None, list[str]]:
     return None, failed
 
 
-def _change_kept(where: str, held: bytes | None, places: list) -> str:
-    """What CleanupUnsure says when the test note at `where` held other bytes in the instant of its delete (`held`;
-    None: too many to read): where they were saved (_save_held, `places` in order), or loudly that they were not."""
-    kept, failed = _save_held(held, places) if held is not None else (None, [
-        f"it holds more than {HELD_MAX_BYTES >> 20} MiB now"])
+def _change_kept(where: str, handle: int, places: list) -> str:
+    """What CleanupUnsure says when the test note at `where`, held open as `handle`, held other bytes in the instant
+    of its delete: where they were saved (_save_held, `places` in order), or loudly that they were not."""
+    kept, failed = _save_held(handle, places)
     if kept is None:
         return (f"the test note was changed in the instant before its delete and could not be saved (it was at {where}; "
                 f"{'; '.join(failed)}): the change made in that instant is lost")
@@ -836,10 +873,11 @@ def _folder_delete(root: Path, target: Path, born: str | None, between=None, las
        a note's bytes, read again through that fd, must still be `born` (an editor that saved in place after the first
        read shows here). Else it is put back, never over a file, and CleanupUnsure says where things are. 6. The
        hidden name is unlinked. 7. A note's bytes are read once more through the fd: POSIX cannot refuse a write of
-       a program that opened the file BEFORE the move, but a write in the instant before the unlink shows there.
-       Then what the note holds is written back, never over a file: at its name, else at a kept name beside it, at
-       the top of the notes folder, in the temp folder (_save_held). And CleanupUnsure names that place, or says
-       that it could not be saved. A read that fails there is no success either.
+       a program that opened the file BEFORE the move, but a write in the instant before the unlink shows there (a
+       note that holds more than HELD_MAX_BYTES by then is not `born`). Then all that the note holds is streamed back
+       from the fd, with no cap, never over a file: at its name, else at a kept name beside it, at the top of the
+       notes folder, in the temp folder (_save_held). And CleanupUnsure names that place, or says that it could not
+       be saved. A read that fails there is no success either.
     What remains: such a program can write into the file after the unlink, into a file that has no name any more, as
     after any delete. The same answers as _handle_delete, and "moved". `between`: a test runs it after the first
     check, right before the move; `last`: after the second check, right before the unlink."""
@@ -910,13 +948,13 @@ def _folder_delete(root: Path, target: Path, born: str | None, between=None, las
                 if born is None:                        # the picture: it has no bytes to compare
                     return True, ""
                 try:                                    # a write before the unlink shows in the file that is held
-                    held = _held_bytes(handle)
+                    os.lseek(handle, 0, os.SEEK_SET)
+                    if _bytes_are(lambda: os.read(handle, 65536), born, HELD_MAX_BYTES):
+                        return True, ""
                 except OSError as error:
                     raise CleanupUnsure(f"the test note at {where} was removed, but the note could not be read again "
                                         f"after the delete ({error.strerror or type(error).__name__}), so whether a "
                                         "write came in that instant is not known") from None
-                if held is not None and hashlib.sha256(held).hexdigest() == born:
-                    return True, ""
                 kept = f".{secrets.token_hex(16)}.drill-kept"
                 places = [(folder, name, stat.S_IMODE(opened.st_mode), where),
                           (folder, kept, 0o600, "/".join((*inner, kept)))]
@@ -927,7 +965,7 @@ def _folder_delete(root: Path, target: Path, born: str | None, between=None, las
                 except OSError:
                     spare = ""                          # no temp folder: os.open("") fails, and that is told
                 places.append((None, spare, 0o600, spare or "the temp folder"))
-                raise CleanupUnsure(_change_kept(where, held, places))
+                raise CleanupUnsure(_change_kept(where, handle, places))
         elif mine and same is False:
             trouble, advice = f"the file at {where} was changed right before the delete (it was saved meanwhile)", ""
         elif mine or now is None:

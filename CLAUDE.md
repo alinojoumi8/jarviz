@@ -299,24 +299,21 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
   `real_folders`), and its bytes are `born`. The trash copy that /forget names goes through the same checks. A
   fixture that is gone from its place is "cleanup not confirmed", never a success. An unanswered /forget still leads
   to that check, and preflight never stops without its summary.
-- A test fixture is deleted only through something that names the file itself: on Windows one handle (no link
-  followed, real path = the place in the vault, no reparse point, bytes = `born` read through that handle, then
-  delete through it); on POSIX every folder is opened from "/" with O_NOFOLLOW and `dir_fd`, the vault and each
-  folder below must keep the st_dev/st_ino that was checked, and the file is moved to a random hidden name and
-  unlinked there only when it is still the file whose bytes were read (`_folder_delete`), and whose bytes, read again
-  through the held fd after the move, are still `born`. After the unlink they are read once more, and a write that
-  came in that instant is written back, never over a file (`_save_held`, O_EXCL): at its name, else at a
-  `.preflight-kept` name beside it, at the top of the notes folder, in `tempfile.gettempdir()` (kept copies 0600),
-  as "cleanup not confirmed" that names the place. When no place takes it, the FAIL says "the test note was changed
-  in the instant before its delete and could not be saved". A read that fails after the unlink is "cleanup not
-  confirmed", never a success.
-  Anything else is put back only by a hard link, which never replaces a name (`_put_back`); without one it stays at
-  the hidden name, and that name is told. A put-back that restores the name but cannot remove the hidden name names
-  both. All of these are "cleanup not confirmed". On Windows no write reaches the file between the read and the
-  delete: the handle is shared-read only, so any other write handle or mapped view makes the open fail (a sharing
-  violation), and while it is held no open for writing, rename or replace works. A junction is read from the lstat
-  reparse tag (`WIN_JUNCTION_TAG`): no Python 3.12 is needed. Where neither way is possible, nothing is deleted and
-  preflight says "cleanup not confirmed" with the note's path in the notes folder (`delete_fixture_file`).
+- A test fixture is deleted only through something that names the file itself and shuts every writer out: on Windows
+  one handle (no link followed, real path = the place in the vault, no reparse point, bytes = `born` read through that
+  handle, then delete through it). No write reaches the file between the read and the delete: the handle is
+  shared-read only, so any other write handle or mapped view makes the open fail (a sharing violation), and while it
+  is held no open for writing, rename or replace works. A junction is read from the lstat reparse tag
+  (`WIN_JUNCTION_TAG`): no Python 3.12 is needed. On POSIX preflight never deletes the fixture by hand (fail closed,
+  `_posix_fixture_stays`): POSIX cannot refuse a write of a program that holds the file open, so any unlink can lose
+  an edit. It still checks the vault, the real folders and the `born` bytes (read through an fd opened with
+  O_NOFOLLOW), only to say precisely why it stays, and nothing is moved: it stays at its own name. A note still at its
+  own place (a /forget that did not confirm) is "cleanup not confirmed" with `POSIX_STAYS` and the note's path in the
+  notes folder, to remove by hand: a FAIL. The trash copy that /forget names stays the same way, in `captures/.trash`
+  where every forgotten note stays (the galaxy does not show it): that is a WARN that names its path (`trash_note` in
+  `check_remember`), and the check that the node count went back still runs. Where Windows gives no safe delete,
+  nothing is deleted and preflight says "cleanup not confirmed" with the note's path in the notes folder
+  (`delete_fixture_file`).
 - Every check in `main` runs through `run_check`: a check that stops is a FAIL that names only the type of its error,
   never its text, and preflight always ends with its summary. A request that gets no answer is "could not look"
   (`try_probe`), never a crash. The offline checks too: a check that stops names only the type of its error.
@@ -429,11 +426,13 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
   the very entry at the receipt's path: no link or junction on the way, none at its name (`delete_made_file` deletes
   through a handle on the entry on Windows, or in folders opened with no link followed on POSIX). A note goes only
   while it holds the receipt's `born` bytes, read through that same handle or fd: on POSIX once more after the move to
-  a hidden name, and put back if it changed, and once more after the unlink: a write that came in that instant goes
-  back as in preflight (`_save_held`, `.drill-kept` names), and the clean-up FAILs naming the place. Anything else
-  stays, and the clean-up FAILs. A path that cannot be looked
-  at is trouble for its receipt only. A notes folder that cannot be looked at removes nothing and is not confirmed.
-  `made_by` reads the notes from the births in every job state; the picture only from a done job's `result`.
+  a hidden name, and put back if it changed, and once more after the unlink (compared up to `HELD_MAX_BYTES`: a note
+  that holds more is not `born`): a write that came in that instant goes back whole, streamed from the held fd with no
+  cap (`_copy_held`, `_save_held`), never over a file (O_EXCL): at its name, else at a `.drill-kept` name beside it,
+  at the top of the notes folder, in the temp folder, and the clean-up FAILs naming the place. Anything else stays,
+  and the clean-up FAILs. A path that cannot be looked at is trouble for its receipt only. A notes folder that cannot
+  be looked at removes nothing and is not confirmed. `made_by` reads the notes from the births in every job state; the
+  picture only from a done job's `result`.
 - When the silence budget and the job's time run out together, `follow_job` sends the named cancel, then looks for
   the end as after any cancel (a new silence budget, until the wait after the cancel ends). Another job or no job ends
   the look at once, not confirmed.

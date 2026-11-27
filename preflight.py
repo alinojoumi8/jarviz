@@ -888,229 +888,45 @@ def _handle_delete(root: Path, target: Path, born: str, between=None) -> tuple[b
     return True, ""
 
 
-class CleanupUnsure(Exception):
-    """The delete stopped half way. The text says where things are now, by their paths in the notes folder."""
+POSIX_STAYS = "Jarviz cannot stop another program from writing to the test note on this system"
 
 
-def _put_back(folder: int, hidden: str, name: str) -> bool | None:
-    """Move what sits at `hidden` back to `name` (both in the open `folder`), never over another file. Only a hard link
-    does that in one step: it cannot replace a name. Where there is none (a folder, a file system without links), it
-    stays at the hidden name: a check that the name is free, then a rename, could still write over a file made in
-    between (os.rename replaces, and Python has no rename that refuses). True when it is back, None when it is back
-    but the hidden name could not be removed (one file under both names), False when it stays at the hidden name."""
+def _posix_fixture_stays(target: Path, born: str) -> tuple[bool | None, str]:
+    """POSIX: the fixture is never deleted by hand (fail closed). POSIX cannot refuse a write of a program that holds
+    the file open, so a write that came in the instant before an unlink, after the last read, would be lost with the
+    file. It is only looked at, to say precisely why it stays: opened with no link followed at its name (O_NOFOLLOW;
+    O_NONBLOCK: a pipe put there cannot hold the open), and its bytes read through that fd. Nothing is written, moved
+    or removed. (False, "not_plain" | "changed"), or (None, POSIX_STAYS): it is the fixture, and it stays."""
+    handle = os.open(target, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
     try:
-        os.link(hidden, name, src_dir_fd=folder, dst_dir_fd=folder, follow_symlinks=False)
-    except (OSError, NotImplementedError):
-        return False                                    # the name is taken, or no link here: it stays hidden
-    try:
-        os.unlink(hidden, dir_fd=folder)
-    except OSError:
-        return None
-    return True
-
-
-HELD_MAX_BYTES = 1 << 26           # after the delete, what the held file holds is read whole, up to this much
-
-
-def _held_bytes(handle: int) -> bytes | None:
-    """What the open file `handle` holds NOW, read from its start. None: more than HELD_MAX_BYTES. OSError: it could
-    not be read."""
-    os.lseek(handle, 0, os.SEEK_SET)
-    pieces, size = [], 0
-    while piece := os.read(handle, 65536):
-        size += len(piece)
-        if size > HELD_MAX_BYTES:
-            return None
-        pieces.append(piece)
-    return b"".join(pieces)
-
-
-def _save_held(data: bytes, places: list) -> tuple[str | None, list[str]]:
-    """Save `data` (what the test note held in the instant of its delete) in the first place that takes it. A place is
-    (an open folder, or None for a name that is a whole path; the name; the mode; how that name is told). Every file is
-    NEW (O_EXCL, no link followed): never over a file. A place that refuses, or whose name is taken, gives the next
-    its turn. A copy that failed half way stays, and is told. (where it went, what failed before) or (None, all)."""
-    failed: list[str] = []
-    for folder, name, mode, told in places:
-        try:
-            out = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode, dir_fd=folder)
-        except OSError as error:
-            failed.append(f"not at {told}: " + ("the name is taken" if isinstance(error, FileExistsError)
-                                                 else error.strerror or type(error).__name__))
-            continue
-        broke = None
-        try:
-            piece = memoryview(data)
-            while piece:
-                piece = piece[os.write(out, piece):]
-        except OSError as error:
-            broke = error
-        try:
-            os.close(out)
-        except OSError as error:
-            broke = broke or error
-        if broke is None:
-            return told, failed
-        failed.append(f"not at {told}: {broke.strerror or type(broke).__name__}, and an incomplete copy is there")
-    return None, failed
-
-
-def _change_kept(where: str, held: bytes | None, places: list) -> str:
-    """What CleanupUnsure says when the test note at `where` held other bytes in the instant of its delete (`held`;
-    None: too many to read): where they were saved (_save_held, `places` in order), or loudly that they were not."""
-    kept, failed = _save_held(held, places) if held is not None else (None, [
-        f"it holds more than {HELD_MAX_BYTES >> 20} MiB now"])
-    if kept is None:
-        return (f"the test note was changed in the instant before its delete and could not be saved (it was at {where}; "
-                f"{'; '.join(failed)}): the change made in that instant is lost")
-    return (f"the test note at {where} was changed in the instant before its delete, and what it held then was "
-            + (f"written back to {kept}" if kept == where else f"saved at {kept}")
-            + (f" ({'; '.join(failed)})" if failed else "") + ": look at it, and remove it by hand")
-
-
-def _folder_delete(root: Path, target: Path, born: str, between=None) -> tuple[bool | None, str]:
-    """POSIX: delete the fixture in folders that stay open.
-    1. The vault and each folder below it are checked (lstat: a real folder, no link) and their identity (st_dev,
-       st_ino) is kept.
-    2. Every folder from "/" down is opened with O_NOFOLLOW: no link ANYWHERE on the way is followed (a parent of the
-       vault swapped for a link raises ELOOP). The vault and each folder below must be the very one that was checked.
-    3. The file is opened in the last folder; its bytes must be `born`. That fd stays open to the end.
-    4. It is moved to a new random hidden name in the same folder, 5. what sits there now must be the file of that fd,
-       and its bytes, read again through that fd, must still be `born` (an edit in place keeps the inode). Else it is
-       put back and raises CleanupUnsure. 6. That hidden name is unlinked. 7. The bytes are read once more through
-       the fd: POSIX cannot refuse a write of a process that holds the file open, but a write that came in the
-       instant before the unlink shows there. Then what the file holds is written back, never over a file: at its
-       name, else at a kept name beside it, at the top of the notes folder, in the temp folder (_save_held). And
-       CleanupUnsure names that place, or says that it could not be saved. A read that fails there is no success
-       either: the delete is confirmed only for bytes that were `born` when the name went.
-    What remains: a process that watches the folder sees the hidden name after the move and could swap it in the
-    instant before the unlink. Nobody can guess the name before. And it is harmless: unlink(hidden, dir_fd=folder)
-    removes only that one name in the folder that was bound by its identity, never what a link points at, so it can
-    only remove what that process put there itself, never a file outside the notes folder. A process that held the
-    file open can still write into it after the unlink: into a file that has no name any more, as after any delete.
-    The same answers as _handle_delete, and "moved"."""
-    parts = target.relative_to(root).parts
-    inner, name = parts[:-1], parts[-1]
-    checked, step = [], root
-    for part in (None, *inner):
-        step = step if part is None else step / part
-        seen = step.lstat()
-        if stat.S_ISLNK(seen.st_mode) or not stat.S_ISDIR(seen.st_mode):
-            return False, "linked"
-        checked.append((seen.st_dev, seen.st_ino))
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-    fds = [os.open(root.anchor, os.O_RDONLY | os.O_DIRECTORY)]
-    try:
-        for part in root.parts[1:]:
-            fds.append(os.open(part, flags, dir_fd=fds[-1]))
-        vault_at = len(fds) - 1
-        for part in inner:
-            fds.append(os.open(part, flags, dir_fd=fds[-1]))
-        if [(found.st_dev, found.st_ino) for found in map(os.fstat, fds[vault_at:])] != checked:
-            return False, "moved"                       # another folder than the one checked
-        folder = fds[-1]
-        seen = os.stat(name, dir_fd=folder, follow_symlinks=False)
-        if not stat.S_ISREG(seen.st_mode):
+        if not stat.S_ISREG(os.fstat(handle).st_mode):
             return False, "not_plain"
-        fds.append(os.open(name, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0), dir_fd=folder))
-        handle = fds[-1]
-        opened = os.fstat(handle)
-
-        def bytes_now() -> bool | None:
-            """The bytes of the held file, read again from its start, are still `born`; None: they could not be read."""
-            try:
-                os.lseek(handle, 0, os.SEEK_SET)
-                return _fixture_bytes_ok(lambda: os.read(handle, 65536), born)
-            except OSError:
-                return None
-
-        if ((opened.st_dev, opened.st_ino) != (seen.st_dev, seen.st_ino) or not stat.S_ISREG(opened.st_mode)
-                or not _fixture_bytes_ok(lambda: os.read(handle, 65536), born)):
+        if not _fixture_bytes_ok(lambda: os.read(handle, 65536), born):
             return False, "changed"
-        if between:
-            between()
-        hidden = f".{secrets.token_hex(16)}.preflight-gone"     # new and random: nobody can have made it before
-        try:
-            os.stat(hidden, dir_fd=folder, follow_symlinks=False)
-            return None, "a new hidden name was taken"
-        except FileNotFoundError:
-            pass
-        os.rename(name, hidden, src_dir_fd=folder, dst_dir_fd=folder)
-        where, hidden_at = "/".join((*inner, name)), "/".join((*inner, hidden))
-        try:
-            now = os.stat(hidden, dir_fd=folder, follow_symlinks=False)
-        except OSError:
-            now = None          # WSL's /mnt drives show a moved file again only once it is closed: no check, no delete
-        mine = (now is not None and stat.S_ISREG(now.st_mode)
-                and (now.st_dev, now.st_ino) == (opened.st_dev, opened.st_ino))
-        again = bytes_now() if mine else None           # an edit in place keeps the inode: the bytes are read again
-        if again:
-            try:
-                os.unlink(hidden, dir_fd=folder)
-            except OSError as error:
-                trouble = (f"the test note at {where} could not be removed after it was moved for the delete "
-                           f"({error.strerror or type(error).__name__})")
-            else:
-                try:                                    # a write before the unlink shows in the file that is held
-                    held = _held_bytes(handle)
-                except OSError as error:
-                    raise CleanupUnsure(f"the test note at {where} was removed, but the note could not be read again "
-                                        f"after the delete ({error.strerror or type(error).__name__}), so whether a "
-                                        "write came in that instant is not known") from None
-                if held is not None and hashlib.sha256(held).hexdigest() == born:
-                    return True, ""
-                # A write came in the instant before the delete: what the note holds goes back, never over a file. Its
-                # own name first, then a kept name beside it, at the top of the notes folder, in the temp folder.
-                kept = f".{secrets.token_hex(16)}.preflight-kept"
-                places = [(folder, name, stat.S_IMODE(opened.st_mode), where),
-                          (folder, kept, 0o600, "/".join((*inner, kept)))]
-                if inner:
-                    places.append((fds[vault_at], kept, 0o600, f"{kept} at the top of the notes folder"))
-                try:
-                    spare = os.path.join(tempfile.gettempdir(), f"jarviz-{secrets.token_hex(16)}.preflight-kept")
-                except OSError:
-                    spare = ""                          # no temp folder: os.open("") fails, and that is told
-                places.append((None, spare, 0o600, spare or "the temp folder"))
-                raise CleanupUnsure(_change_kept(where, held, places))
-        elif again is False:
-            trouble = f"the test note at {where} was changed while it was being removed"
-        elif now is None or mine:                       # mine, but its bytes could not be read again
-            trouble = f"the test note at {where} could not be checked again after it was moved for the delete"
-        else:
-            trouble = f"another file took the place of the test note at {where} right before the delete"
-        os.close(fds.pop())                             # the file's fd: what sits at the hidden name goes back
-        try:
-            back = _put_back(folder, hidden, name)
-        except OSError:
-            back = False
-        raise CleanupUnsure(f"{trouble}, and " + ("it was put back there" if back else
-                                                  f"it was put back there, and it is at {hidden_at} too (one file "
-                                                  "under both names)" if back is None else f"it was left at {hidden_at}")
-                            + ("; where the test note went is not known" if now is not None and not mine
-                               else ": remove it by hand"))
     finally:
-        for fd in reversed(fds):
-            os.close(fd)
+        os.close(handle)
+    return None, POSIX_STAYS
 
 
 def delete_fixture_file(root: Path, target: Path, born: str, between=None) -> tuple[bool | None, str]:
-    """The delete that no swap of a folder can redirect: through a handle on the file (Windows) or inside folders
-    opened with no link followed (POSIX). Neither: (None, why), and nothing is deleted (fail closed)."""
+    """The delete that no swap of a folder can redirect and no write can reach: through ONE handle on the file
+    (Windows, _handle_delete: while it is held, nobody may write to it). POSIX has no such lock, so nothing is
+    deleted there (fail closed, _posix_fixture_stays): (None, POSIX_STAYS) for the fixture, or why it stays.
+    `between`: a test's hook on Windows, see _handle_delete."""
     if os.name == "nt":
         return _handle_delete(root, target, born, between)
-    if ({os.open, os.stat, os.unlink, os.rename} <= os.supports_dir_fd and os.stat in os.supports_follow_symlinks
-            and hasattr(os, "O_NOFOLLOW") and hasattr(os, "O_DIRECTORY")):
-        return _folder_delete(root, target, born, between)
-    return None, "this system has no delete tied to the file or to a checked folder"
+    return _posix_fixture_stays(target, born)
 
 
 def remove_fixture(notes_dir: Path, receipt: dict) -> tuple[bool | None, str]:
     """Remove a test note by hand. Only when it is CERTAINLY the fixture: made in THIS notes folder (the receipt's
     "vault"), a regular file at the receipt's path, reached through real folders only (real_folders), whose bytes have
-    the sha256 the receipt names ("born"). The delete itself is tied to the file or to the checked folders
-    (delete_fixture_file), so a folder swapped after the checks cannot redirect it. A file that changed stays. Nothing
-    else is ever removed. (True, ""), (False, why it stays), or (None, why) when nothing is there any more (that proves
-    nothing about where it went) or when there is no safe delete here (it stays: the user removes it)."""
+    the sha256 the receipt names ("born"). On Windows the delete goes through one handle on the file
+    (delete_fixture_file), so a folder swapped after the checks cannot redirect it and no write reaches the file
+    meanwhile. On POSIX it is never deleted: the same checks only say why it stays, and the answer names its path in
+    the notes folder. A file that changed stays. Nothing else is ever removed. (True, ""), (False, why it stays), or
+    (None, why) when nothing is there any more (that proves nothing about where it went) or when there is no safe
+    delete here (it stays: the user removes it)."""
     relative, born = receipt.get("file"), receipt.get("born")
     if not isinstance(relative, str) or not isinstance(born, str) or not re.fullmatch(r"[0-9a-f]{64}", born):
         return False, "the receipt does not name the test note fully, so nothing was removed"
@@ -1123,16 +939,13 @@ def remove_fixture(notes_dir: Path, receipt: dict) -> tuple[bool | None, str]:
     stays = {"linked": f"a folder on the way to {target} is a link or a junction (it can lead out of the notes "
                        "folder), so it stays",
              "not_plain": f"the test note at {target} is not a plain file any more, so it stays",
-             "changed": f"the test note at {target} was changed after it was made, so it stays",
-             "moved": f"a folder on the way to {target} was swapped for another after it was checked, so it stays"}
+             "changed": f"the test note at {target} was changed after it was made, so it stays"}
     try:
         if not real_folders(root, target.parent):
             return False, stays["linked"]
         if not stat.S_ISREG(target.lstat().st_mode):
             return False, stays["not_plain"]
         done, why = delete_fixture_file(root, target, born)
-    except CleanupUnsure as error:      # it says where things are now
-        return None, str(error)
     except FileNotFoundError:
         return None, f"the test note is not at {target} any more"
     except OSError as error:
@@ -1140,6 +953,8 @@ def remove_fixture(notes_dir: Path, receipt: dict) -> tuple[bool | None, str]:
             return False, stays["linked"]
         return False, f"the test note at {target} could not be removed ({error.strerror or type(error).__name__})"
     if done is None:                    # fail closed: nothing was deleted
+        if why == POSIX_STAYS:
+            return None, f"{POSIX_STAYS}, so it stays; remove {relative!r} in the notes folder by hand"
         return None, f"there is no safe delete here ({why}), so it stays: remove {relative!r} in the notes folder by hand"
     return done, stays.get(why, why)
 
@@ -1155,6 +970,7 @@ def check_remember(report: Report, ctx: dict) -> None:
     problems: list[str] = []
     brain_note = ""
     cleanup_note = ""
+    trash_note = ""             # a Mac or Linux: /forget moved it to the trash, and there it stays (no hand delete)
     sourced = ""
     receipt: dict = {}
     try:
@@ -1196,7 +1012,8 @@ def check_remember(report: Report, ctx: dict) -> None:
                 "born": receipt.get("born"), "session": ctx["session"]}))
             status, gone = got if kind == "answer" else (0, {})
             trash_name = (gone.get("action") or {}).get("trash")
-            if status == 200 and trash_name:        # in the trash now: it goes with the same checks as by hand
+            in_trash = status == 200 and bool(trash_name)
+            if in_trash:                            # in the trash now: it goes with the same checks as by hand
                 removed, why = remove_fixture(notes_dir, {**receipt, "file": trash_name})
                 said = f"/forget moved the test note to {short(str(trash_name), 120)!r}"
                 folders = ((notes_dir / str(trash_name)).parent, captures)
@@ -1221,6 +1038,12 @@ def check_remember(report: Report, ctx: dict) -> None:
                 for folder in folders:
                     if folder.is_dir() and not any(folder.iterdir()) and (folder != captures or not captures_was_there):
                         folder.rmdir()
+            elif in_trash and removed is None and why.startswith(POSIX_STAYS):
+                # A Mac or Linux deletes nothing by hand. /forget took the note out of the galaxy, and it stays where
+                # every forgotten note stays: a WARN that names it. A note still at its own place stays a FAIL.
+                trash_note = ("On a Mac or Linux preflight does not delete by hand: one test note stays in "
+                              f"{server.CAPTURES_DIR}/{server.TRASH_DIR} (where Jarviz keeps forgotten notes; the "
+                              f"galaxy does not show it): {short(str(trash_name), 120)!r}.")
             elif removed is None:           # gone from its place is no proof that it went to the trash
                 moved = kind == "no_answer" and not os.path.lexists(notes_dir / str(receipt.get("file")))
                 problems.append(f"CLEANUP NOT CONFIRMED: {said}, and {why}" + (
@@ -1231,9 +1054,13 @@ def check_remember(report: Report, ctx: dict) -> None:
             if not cleanup_note and len(build.read_graph().get("nodes", [])) != len(before):
                 problems.append("the node count did not go back after cleanup")
     if problems:
-        report.add(FAIL, name, "; ".join(problems + ([cleanup_note] if cleanup_note else [])))
+        report.add(FAIL, name, "; ".join(problems + [note for note in (cleanup_note, trash_note) if note]))
     elif cleanup_note:
         report.add(WARN, name, cleanup_note)
+    elif trash_note:
+        done = f"used by /chat ({sourced})" if sourced else "found by search"
+        report.add(WARN, name, " ".join(note for note in (f"File written, indexed, {done}, then forgotten.", trash_note,
+                                                         brain_note) if note))
     elif brain_note:
         report.add(WARN, name, "File written, indexed, found by search, then removed. " + brain_note)
     else:
