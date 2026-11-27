@@ -642,6 +642,22 @@
     $('answer').classList.toggle('trouble', Boolean(trouble));
   }
 
+  // The answer was given with Ali Memory (the user's own knowledge base; the server asks it for the Claude brain
+  // only): one plain line under the answer names the memories. Their titles are text from a stranger, so the line
+  // is made with textContent only. Never spoken. Nothing when no memory was used.
+  const MEMORY_TITLES = 3;
+  const MEMORY_TITLE_CHARS = 120;
+
+  function showMemory(memory) {
+    if (!memory || typeof memory !== 'object' || memory.used !== true || !Array.isArray(memory.titles)) return;
+    const titles = memory.titles.filter(title => typeof title === 'string')
+      .map(title => title.replace(/\s+/g, ' ').trim().slice(0, MEMORY_TITLE_CHARS))
+      .filter(Boolean).slice(0, MEMORY_TITLES);
+    if (!titles.length) return;
+    $('answer').append(el('span', 'memory-note', 'From Ali Memory: ' + titles.join(' · ')));
+    $('answer').hidden = false;
+  }
+
   // ------------------------------------------------------------ the voices
   // The browser voice, or a server voice (Deepgram, ElevenLabs): the server makes its audio, its key never leaves the
   // server.
@@ -885,6 +901,7 @@
     // the newer sentence replaced the switch, as it replaces a request still in the air.
     if (owner && reply.voice && reply.ok !== false) takeVoice(reply.voice);
     if (owner) say(reply.answer || '', reply.ok === false);   // also after a failed read: the save did happen
+    if (owner && reply.ok !== false) showMemory(reply.memory);    // after say: a new answer clears the old line
     // The job a /teardown/cancel answer is about (`job_id`). An older server names none.
     const about = typeof reply.job_id === 'string' && reply.job_id ? reply.job_id : null;
     if (owner && reply.error === 'failed') Teardown.failureTold(about);   // the cancel reply said why that job failed

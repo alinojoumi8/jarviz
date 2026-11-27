@@ -1819,6 +1819,74 @@ story('an old server without voices', {
     `${count(p.fetchLog, '/chat')} chats / ${count(p.fetchLog, '/voice')} voice posts`);
 });
 
+// The Ali Memory line under an answer (showMemory in app.js). The fake page does not clear the children of an element
+// when its text is set (a real page does), so each case that must show NO line has a fresh page.
+const memoryNotes = p => p.$('answer').children.filter(child => child.className === 'memory-note').map(child => child.textContent);
+const memoryReply = (answer, memory, rev = 5) => Object.assign(chatReply(answer, rev), { memory });
+
+story('an answer given with Ali Memory', {
+  line: 'an answer given with Ali Memory shows one plain line under it: "From Ali Memory:" and the titles, joined by " · "',
+  text: 'a title is text from a stranger: markup in it is shown as it is, and the page makes no HTML of it',
+  none: 'an answer with no memory (used false, no memory field, an old server) shows no Ali Memory line',
+  odd: 'odd memory fields are cut or refused: at most 3 titles of at most 120 characters, text only, one line each',
+  failed: 'a failed answer shows no Ali Memory line, also when it names memories',
+  late: 'a late answer shows no Ali Memory line: the newer answer owns the place',
+  silent: 'the Ali Memory line is never spoken: only the answer is',
+}, async (t, open) => {
+  const ask = async (p, text) => { await p.J().handleInput(text); await p.tick(0); };
+  const p = await speakingPage(open, { handlers: { '/chat': () => memoryReply('The kettle wants descaling on Fridays.',
+    { used: true, titles: ['Kettle descaling', 'Boiler <b>code</b>'] }) } });
+  await ask(p, 'when do I descale the kettle?');
+  t.check('line', JSON.stringify(memoryNotes(p)) === JSON.stringify(['From Ali Memory: Kettle descaling · Boiler <b>code</b>'])
+    && p.$('answer').textContent === 'The kettle wants descaling on Fridays.' && p.$('answer').hidden === false,
+    JSON.stringify(memoryNotes(p)));
+  const note = p.$('answer').children.find(child => child.className === 'memory-note');
+  t.check('text', Boolean(note) && note.tagName === 'SPAN' && !('innerHTML' in note) && note.children.length === 0,
+    note ? Object.keys(note).join(',') : 'no line');
+  t.check('silent', JSON.stringify(p.synth.said) === JSON.stringify(['The kettle wants descaling on Fridays.']),
+    JSON.stringify(p.synth.said));
+
+  const shows = async memory => {                   // a fresh page, one answer: the Ali Memory lines it shows
+    const fresh = await open({ handlers: { '/chat': () => (memory === undefined ? chatReply('Plain.', 5) : memoryReply('Plain.', memory)) } });
+    await ask(fresh, 'tell me about the boiler');
+    return memoryNotes(fresh);
+  };
+  const none = [];
+  for (const memory of [{ used: false, why: 'off_brain' }, { used: false, titles: ['Boiler'] }, undefined, null,
+                        { used: true, titles: [] }]) {
+    const got = await shows(memory);
+    if (got.length) none.push(`${JSON.stringify(memory)} -> ${JSON.stringify(got)}`);
+  }
+  t.check('none', !none.length, none.join('; '));
+  const odd = [];
+  for (const [memory, wanted] of [
+    [{ used: true, titles: 'Kettle' }, []], [{ used: 'yes', titles: ['Kettle'] }, []], [{ used: true }, []],
+    [{ used: true, titles: [7, null, {}, '   ', 'One\nTwo', 'x'.repeat(300), 'B', 'C', 'D'] },
+     ['From Ali Memory: One Two · ' + 'x'.repeat(120) + ' · B']]]) {
+    const got = await shows(memory);
+    if (JSON.stringify(got) !== JSON.stringify(wanted)) odd.push(`${JSON.stringify(memory).slice(0, 60)} -> ${JSON.stringify(got)}`);
+  }
+  t.check('odd', !odd.length, odd.join('; '));
+
+  const f = await open({ handlers: { '/chat': () => ({ ok: false, answer: 'It went wrong.', error: 'api_error', nodes: [],
+    graph: meta(5), memory: { used: true, titles: ['Kettle descaling'] } }) } });
+  await ask(f, 'when do I descale the kettle?');
+  t.check('failed', f.$('answer').textContent === 'It went wrong.' && memoryNotes(f).length === 0, JSON.stringify(memoryNotes(f)));
+
+  const read = deferred();                          // the first answer waits for a read of the galaxy; the second comes
+  const replies = [memoryReply('Old answer.', { used: true, titles: ['Old memory'] }, 7), chatReply('New answer.', 7)];
+  const q = await open({ handlers: { '/chat': () => replies.shift(), 'graph-data.js': () => read.promise } });
+  const first = q.J().handleInput('tell me about the kettle');
+  await q.tick(0);
+  const second = q.J().handleInput('tell me about the boiler');
+  await q.tick(0);
+  read.resolve(graphFile(galaxy(7, ['A', 'B', 'C'])));
+  await first; await second;
+  await q.tick(2000);
+  t.check('late', q.$('answer').textContent === 'New answer.' && memoryNotes(q).length === 0 && count(q.fetchLog, '/chat') === 2,
+    `${q.$('answer').textContent} / ${JSON.stringify(memoryNotes(q))}`);
+});
+
 story('the harness reports trouble', {
   thrown: 'a story that made all its checks and then threw is reported as a failure',
   falsy: 'a story that made all its checks and then threw null is reported as a failure too',

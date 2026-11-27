@@ -8,6 +8,7 @@ Rule: a job is done only when `python preflight.py` passes.
 - [x] **Anthropic API key.** It is in `config.json` and it works.
 - [ ] **Keys for the other brains (optional).** See "Brains" below.
 - [x] **Codex and Antigravity (no key).** Both tools are on this computer and you are signed in to both. See "Brains" below.
+- [x] **An Ali Memory key.** Jarviz has its own read-only token of your Ali Memory hub (the entry `jarviz:ro` in the hub's `.env`, and `ali_memory_api_key` in `config.json`), so the Claude brain can use your knowledge base. See "Ali Memory" below.
 - [ ] **Your own notes (optional).** Set `notes_dir` in `config.json` to the full path of your notes folder. Then run `python build.py`. Now Jarviz uses 30 sample notes about a coffee business in `notes/`.
 - [x] **A yes for REA (Part Two).** REA 6.7.0 is installed in `%USERPROFILE%\.jarvis-tools\rea`, outside the project.
 - [ ] **A newer Node.js (optional).** You have Node.js 24.15.0. The newest REA (6.10.1) needs 24.22.1 or later. So Jarviz is pinned to REA 6.7.0, the newest one that runs on your Node.js. See "Upgrade REA" below.
@@ -96,6 +97,19 @@ Jarviz can speak with three voices. The screen shows the one in use at the top (
 - [x] Deepgram with a real key: tested on 2026-11-27. `python preflight.py` sent tiny real requests. Real mp3 sound came back from Deepgram (`aura-2-draco-en`), also through `/voice/speak` in 1 and 2 pieces.
 - [x] ElevenLabs with a real key: tested on 2026-11-27. `python preflight.py` sent tiny real requests. Real mp3 sound came back from ElevenLabs (Eldrin, `eleven_flash_v2_5`), also through `/voice/speak` in 1 and 2 pieces.
 - [ ] The two server voices in the page: NOT tested. Nobody listened to them in a browser yet. The page rules are proved in Node with a fake page (`page_checks.js`).
+- **Your ElevenLabs voice now:** `wiF43F1vngB3iRFsbWhJ` (Nathaniel, a sharp British voice with a dry wit, made for AI assistants), on the line `elevenlabs_voice`. It has the style of a film AI butler. It is not a copy of an actor's voice.
+
+## Ali Memory
+
+Ali Memory is your own knowledge base: the hub on this computer, http://127.0.0.1:8791. When the brain is Claude, Jarviz asks it for the best 3 results of each question and gives them to Claude with the question. Jarviz only reads: it never saves anything in Ali Memory. With any other brain, Jarviz answers without Ali Memory.
+
+- **The key:** Jarviz has its own read-only token: the entry `jarviz:ro:...` in `CEREBRAS_MEMORY_HTTP_TOKENS` in the hub's `.env`, and the same secret on the line `"ali_memory_api_key"` in `config.json`. To take it away, remove both and restart the hub (the hub's README, "Recall for hooks"). A backup of the `.env` from before is in the hub's `backups` folder (`.env.bak-jarviz-...`).
+- **Another address:** only when the hub runs on another port, for example `"ali_memory_url": "http://127.0.0.1:8792",`. Only 127.0.0.1 and localhost are taken.
+- **On screen:** under an answer that used Ali Memory, one line names the memories: "From Ali Memory: ...". The start window says `Ali Memory: on (Claude only)`, or why it is off.
+- **What goes where.** Jarviz sends your question and the read-only token to the hub on this computer, and nothing else. The hub's results go to Claude (Anthropic) with the question: at most 3 snippets of 1,200 characters. The page gets the titles only. Another brain gets none of it, also not after a switch: the history it reads leaves out every answer that used Ali Memory.
+- **It waits at most 3 seconds.** A hub that is down, slow or still starting changes nothing: Jarviz answers without it, and says nothing.
+- [x] The token with the real hub: tested on 2026-11-27. One real recall with the test question "Jarviz" gave HTTP 200 and 3 results.
+- [ ] Ali Memory in the page: NOT tested in a browser. The page rule is proved in Node (`page_checks.js`).
 
 ## Part One: the foundation
 
@@ -131,7 +145,7 @@ Still to prove:
 
 Proven with the real brain and a real public site (igloo.inc):
 
-- [x] Last run: `PREFLIGHT: 44 pass, 1 fail, 0 warn` and `DRILL: 104 pass, 0 fail`. The one fail is the OpenAI account: it has no credit (see "Brains"). Preflight has 45 checks now.
+- [x] Last run: `PREFLIGHT: 48 pass, 1 fail, 0 warn` and `DRILL: 104 pass, 0 fail`. The one fail is the OpenAI account: it has no credit (see "Brains"). Preflight has 49 checks now.
 - [ ] The page in the test browser was not opened in the last run: the test browser lost its unlock. The page rules (`page_checks.js`, 108 rules) ran against the files that the server gives out.
 - [x] The drill passed with a hidden browser, and also with the Chrome window on screen (`python drill.py --visible`). The snapshot from the visible window is a real picture.
 - [x] A full teardown in about one minute: 96 files, 14.7 MB, Three.js r165, GSAP 3.12.5, postprocessing 6.35.5.
@@ -259,6 +273,9 @@ Not proven:
   - A teardown with a sign-in brain gives the text of a strange website to a coding agent. The lock is what stands between them. If you want the smallest risk, write teardowns with a key brain.
 - [ ] The sign-in brains on a Mac or Linux. The code has the paths for it, but it ran only on this Windows computer.
 - [ ] The ElevenLabs start voice on a free plan. Eldrin is a voice of the Voice Library, and ElevenLabs says that some voices there need a paid plan. Whether a free plan may use it through the API is not known. If ElevenLabs refuses it, Jarviz says that your plan does not allow that voice, and `python preflight.py` names the line to fix. Then copy the id of a voice from "My Voices" into `elevenlabs_voice`.
+- [ ] Ali Memory and the brain's own words. Jarviz tames memory text (no ready-made control tag, no forged block) and tells Claude that it is evidence, never instructions. A memory can still mislead Claude in what it says. It can never start an action: a tag runs only when your own sentence asks for it.
+- [ ] Ali Memory text that leaves the chat. In a chat that used Ali Memory, when you ask Jarviz to remember something or to tear down a site, Claude's words for that note or that teardown question can hold memory text. The note is then a note like any other, and every brain can read it. The teardown question goes to the brain that writes the teardown. The chat history of another brain leaves the answer out, but not the note.
+- [ ] The hub on port 8791. Jarviz cannot tell the real hub from another program that listens on that port while the hub is down. That program would get the read-only token and your question. Only programs on this computer can listen there.
 - [ ] A spoken line that holds a key. The server voices refuse such a line and send nothing. Then the browser voice says the line, and some Chrome voices are network voices (Google gets the text).
 - [ ] An REA install at the very moment of a teardown. `run_rea` checks the pinned REA version just before it starts REA. An install that someone runs at that moment can swap the files between the check and the start, and Node reads REA's files only as it runs. Jarviz never installs REA itself.
 - [ ] The removal of the test note on Mac and Linux. Preflight deletes it through folders opened without following links, checks that no folder was swapped, and moves the note to a random hidden name before it deletes it. That was tested in WSL on a native Linux folder (`/tmp`) and on a Windows drive (there it never deletes by hand: it puts the note back and names it). A real Mac was not tested. One gap remains: a program that watches the folder could see the hidden name and swap it in the instant before the delete. On Windows the delete goes through one handle on the file itself, and that was tested.

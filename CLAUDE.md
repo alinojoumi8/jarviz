@@ -24,6 +24,8 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
 - `voices.py` the voices behind one `speak()`: the browser's own voice (the server does nothing for it) and two
   server voices, Deepgram and ElevenLabs (text to speech over plain HTTPS, standard library only).
   `python voices.py` runs its offline checks.
+- `ali_memory.py` Ali Memory, standard library only: `recall()` asks the user's Ali Memory hub (`POST /api/recall`)
+  for the best results of one chat question, read-only. `python ali_memory.py` runs its offline checks.
 - `preflight.py` live end-to-end checks.
 - `teardown.py` the teardown bay (Part Two), standard library only. The server soft-imports it and starts without it.
 - `drill.py` the live teardown drill. `record()` and `put_back()` make a test leave no trace.
@@ -33,7 +35,8 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
 - `config.json` the active brain, a key and a model for each brain, the notes folder. Git ignores it.
   A sign-in brain has a model line only (empty: the tool's own default model). The voice lines are `voice` (the
   default voice), `deepgram_api_key`, `deepgram_voice`, `elevenlabs_api_key`, `elevenlabs_voice` and
-  `elevenlabs_model`.
+  `elevenlabs_model`. The Ali Memory lines are `ali_memory_api_key` (a read-only token of the hub) and
+  `ali_memory_url` (default `http://127.0.0.1:8791`).
 - `~/.jarvis-tools/brain-locks.json` the lock proofs of the sign-in brains: the tool version and the lock recipe
   that a real trap proved. It is outside the project. Jarviz writes it.
 - `~/.jarvis-tools/brain-locks.json.lock` the empty lock file beside the lock record. It holds nothing. One writer of
@@ -137,6 +140,38 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
 - Tests call the server through `preflight.call` (it signs the call). A call with `key=False` is an outsider.
 - One function speaks: `createSpeaker().speak` in `viewer/core.js`. `?mute=1` makes a tab silent. Open
   test tabs with `?mute=1`.
+- Ali Memory (the user's private knowledge base, a hub on this computer) is READ-ONLY and reaches ONLY the Claude
+  brain: `ALI_MEMORY_BRAINS` in `server.py`, defined once as `ali_memory.BRAINS`. With any other brain Jarviz never
+  asks the hub. In `chat_route`, ONE read of `config.json` decides which brain is asked and whether it may see Ali
+  Memory, and it goes to `ask_model(config=...)`: a brain switch in between never hands memory text to another
+  brain. Chat only: no teardown, capture or `/remember` asks Ali Memory.
+- The Ali Memory key is `ali_memory_api_key`. Its name ends in `_api_key` on purpose: every key scan and scrub
+  covers it (`voices.key_lines`, `voices.configured_keys`, preflight's `key_forms`). It travels only in the
+  `Authorization: Bearer` header of a loopback request. `ali_memory_url` must be `http://127.0.0.1:<port>` or
+  `http://localhost:<port>` (`ali_memory.parse_url`). The request always connects to 127.0.0.1
+  (`_LoopbackConnection`), never through a proxy (`ProxyHandler({})`), and never after a redirect (`_NoRedirect`).
+  The question goes in the JSON body only (`all_projects: true`, `limit: 3`), never in the address. A question that
+  holds a key of `config.json` is not sent.
+- A recall has ONE budget (`BUDGET_S`) for the connect, the request and the read, and a short connect
+  (`CONNECT_TIMEOUT_S`). `recall()` never raises: every outcome is a code of `ali_memory.STATUS`. On any failure the
+  chat answers without Ali Memory, and says nothing about it.
+- What Ali Memory sends back is data from a stranger. Types and lengths are checked: at most 3 results; title 120,
+  snippet 1,200, project 60, source 40 characters. Every text becomes one clean line (`_clean`), and every key of
+  `config.json` is taken out before and after the cut.
+- Memory text reaches the brain only in its own `<memories>` block (`memory_block`), after the notes and before the
+  question, with `MEMORY_RULES` added to the system prompt. Every text goes through `tame`, as note text does: no
+  ready-made control tag, no forged block. A memory has a label (`M1`), never a number: the SOURCES line names notes
+  only. A memory never orders an action: a tag runs only when the user's own sentence asks for it (`TAG_INTENT`).
+- A turn is marked when the brain was shown Ali Memory: the fourth element of a turn, set with `memory=` in
+  `Session.record` and `Session.draft`, also for the turn of a tag it led to. `Session.snapshot(with_memory=False)`
+  puts `MEMORY_LEFT_OUT` in place of the answer of each marked turn. Only a brain in `ALI_MEMORY_BRAINS` gets
+  `with_memory=True`. The user's own words and the receipts stay. Chat history stays plain text.
+- The `/chat` reply carries `memory`: `{"used": true, "titles": [...]}` (cleaned titles, at most 3) or
+  `{"used": false, "why": code}`. Never a snippet, never the key. The page shows one plain line under the answer
+  ("From Ali Memory: ..."), made with `textContent` only (`showMemory` in `viewer/app.js`). It is never spoken, it is
+  shown only for the answer the page owns, and never under one of `LINES`.
+- Preflight proves Ali Memory like a voice: one real recall with the fixed question `ali_memory.PROBE_QUERY`, only
+  when the key line holds a key (`check_ali_memory_key`). It never prints a title, a snippet or the key.
 - The key of a server voice (Deepgram, ElevenLabs) is a key like the others: only in `config.json`, never in the
   page. The page asks the server for audio (`POST /voice/speak`), the server asks the provider (`voices.speak`) and
   gives the bytes back. A voice call never follows a redirect, and an error text loses the key before it is cut
