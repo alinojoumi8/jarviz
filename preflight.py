@@ -909,23 +909,63 @@ def _put_back(folder: int, hidden: str, name: str) -> bool | None:
     return True
 
 
-def _write_back(folder: int, name: str, handle: int, mode: int) -> str:
-    """After the delete: what the open file `handle` holds NOW, written to a NEW file `name` in the open `folder`
-    (O_EXCL: never over a file), or when that name is taken, to a new random name beside it. Says where it went."""
-    for at in (name, f".{secrets.token_hex(16)}.preflight-kept"):
+HELD_MAX_BYTES = 1 << 26           # after the delete, what the held file holds is read whole, up to this much
+
+
+def _held_bytes(handle: int) -> bytes | None:
+    """What the open file `handle` holds NOW, read from its start. None: more than HELD_MAX_BYTES. OSError: it could
+    not be read."""
+    os.lseek(handle, 0, os.SEEK_SET)
+    pieces, size = [], 0
+    while piece := os.read(handle, 65536):
+        size += len(piece)
+        if size > HELD_MAX_BYTES:
+            return None
+        pieces.append(piece)
+    return b"".join(pieces)
+
+
+def _save_held(data: bytes, places: list) -> tuple[str | None, list[str]]:
+    """Save `data` (what the test note held in the instant of its delete) in the first place that takes it. A place is
+    (an open folder, or None for a name that is a whole path; the name; the mode; how that name is told). Every file is
+    NEW (O_EXCL, no link followed): never over a file. A place that refuses, or whose name is taken, gives the next
+    its turn. A copy that failed half way stays, and is told. (where it went, what failed before) or (None, all)."""
+    failed: list[str] = []
+    for folder, name, mode, told in places:
         try:
-            out = os.open(at, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode, dir_fd=folder)
-        except FileExistsError:
+            out = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode, dir_fd=folder)
+        except OSError as error:
+            failed.append(f"not at {told}: " + ("the name is taken" if isinstance(error, FileExistsError)
+                                                 else error.strerror or type(error).__name__))
             continue
+        broke = None
         try:
-            os.lseek(handle, 0, os.SEEK_SET)
-            while piece := memoryview(os.read(handle, 65536)):
-                while piece:
-                    piece = piece[os.write(out, piece):]
-        finally:
+            piece = memoryview(data)
+            while piece:
+                piece = piece[os.write(out, piece):]
+        except OSError as error:
+            broke = error
+        try:
             os.close(out)
-        return at
-    raise FileExistsError(errno.EEXIST, "both names are taken")
+        except OSError as error:
+            broke = broke or error
+        if broke is None:
+            return told, failed
+        failed.append(f"not at {told}: {broke.strerror or type(broke).__name__}, and an incomplete copy is there")
+    return None, failed
+
+
+def _change_kept(where: str, held: bytes | None, places: list) -> str:
+    """What CleanupUnsure says when the test note at `where` held other bytes in the instant of its delete (`held`;
+    None: too many to read): where they were saved (_save_held, `places` in order), or loudly that they were not."""
+    kept, failed = _save_held(held, places) if held is not None else (None, [
+        f"it holds more than {HELD_MAX_BYTES >> 20} MiB now"])
+    if kept is None:
+        return (f"the test note was changed in the instant before its delete and could not be saved (it was at {where}; "
+                f"{'; '.join(failed)}): the change made in that instant is lost")
+    return (f"the test note at {where} was changed in the instant before its delete, and what it held then was "
+            + (f"written back to {kept}" if kept == where else f"saved at {kept}")
+            + (f" ({'; '.join(failed)})" if failed else "") + ": look at it, and remove it by hand")
 
 
 def _folder_delete(root: Path, target: Path, born: str, between=None) -> tuple[bool | None, str]:
@@ -939,8 +979,10 @@ def _folder_delete(root: Path, target: Path, born: str, between=None) -> tuple[b
        and its bytes, read again through that fd, must still be `born` (an edit in place keeps the inode). Else it is
        put back and raises CleanupUnsure. 6. That hidden name is unlinked. 7. The bytes are read once more through
        the fd: POSIX cannot refuse a write of a process that holds the file open, but a write that came in the
-       instant before the unlink shows there. Then what the file holds is written back (never over a file) and
-       CleanupUnsure is raised: the delete is confirmed only for bytes that were `born` when the name went.
+       instant before the unlink shows there. Then what the file holds is written back, never over a file: at its
+       name, else at a kept name beside it, at the top of the notes folder, in the temp folder (_save_held). And
+       CleanupUnsure names that place, or says that it could not be saved. A read that fails there is no success
+       either: the delete is confirmed only for bytes that were `born` when the name went.
     What remains: a process that watches the folder sees the hidden name after the move and could swap it in the
     instant before the unlink. Nobody can guess the name before. And it is harmless: unlink(hidden, dir_fd=folder)
     removes only that one name in the folder that was bound by its identity, never what a link points at, so it can
@@ -1009,19 +1051,27 @@ def _folder_delete(root: Path, target: Path, born: str, between=None) -> tuple[b
                 trouble = (f"the test note at {where} could not be removed after it was moved for the delete "
                            f"({error.strerror or type(error).__name__})")
             else:
-                after = bytes_now()                     # a write before the unlink shows in the file that is held
-                if after:
-                    return True, ""
-                if after is None:
-                    raise CleanupUnsure(f"the test note at {where} was removed, but its bytes could not be read again "
-                                        "after the delete, so whether a write came in that instant is not known")
-                try:                                    # a write came in the instant before the delete: it goes back
-                    kept = "/".join((*inner, _write_back(folder, name, handle, stat.S_IMODE(opened.st_mode))))
+                try:                                    # a write before the unlink shows in the file that is held
+                    held = _held_bytes(handle)
                 except OSError as error:
-                    raise CleanupUnsure(f"the test note at {where} was changed in the instant it was removed, and what "
-                                        f"it held then could not be written back ({error.strerror or type(error).__name__})")
-                raise CleanupUnsure(f"the test note at {where} was changed in the instant it was removed, and what it "
-                                    f"held then was written back to {kept}: look at it, and remove it by hand")
+                    raise CleanupUnsure(f"the test note at {where} was removed, but the note could not be read again "
+                                        f"after the delete ({error.strerror or type(error).__name__}), so whether a "
+                                        "write came in that instant is not known") from None
+                if held is not None and hashlib.sha256(held).hexdigest() == born:
+                    return True, ""
+                # A write came in the instant before the delete: what the note holds goes back, never over a file. Its
+                # own name first, then a kept name beside it, at the top of the notes folder, in the temp folder.
+                kept = f".{secrets.token_hex(16)}.preflight-kept"
+                places = [(folder, name, stat.S_IMODE(opened.st_mode), where),
+                          (folder, kept, 0o600, "/".join((*inner, kept)))]
+                if inner:
+                    places.append((fds[vault_at], kept, 0o600, f"{kept} at the top of the notes folder"))
+                try:
+                    spare = os.path.join(tempfile.gettempdir(), f"jarviz-{secrets.token_hex(16)}.preflight-kept")
+                except OSError:
+                    spare = ""                          # no temp folder: os.open("") fails, and that is told
+                places.append((None, spare, 0o600, spare or "the temp folder"))
+                raise CleanupUnsure(_change_kept(where, held, places))
         elif again is False:
             trouble = f"the test note at {where} was changed while it was being removed"
         elif now is None or mine:                       # mine, but its bytes could not be read again
@@ -2602,9 +2652,13 @@ def check_memory_turns(report: Report) -> None:
     (1) A key across MAX_MESSAGE_CHARS is not sent to the hub, not even its first part: "query_has_key". (2) A
     follow-up after a memory turn, with an empty hub, is marked too: the reply says "no_results", and the next OpenAI
     brain reads neither answer. (3) REMEMBER in a memory turn: the brain's wording is refused (remember_own_words),
-    nothing is saved; the user's own words are saved; a turn that saw memory only in its history is refused too. (4)
-    TEARDOWN in a memory turn: the question is the user's own sentence; a subdomain or a path the user did not say is
-    refused (teardown_own_words), and the bay never starts. (5) /voice/speak with a key across MAX_SPEAK_CHARS, or a
+    nothing is saved; the user's own words are saved; a turn that saw memory only in its history is refused too; the
+    user's words are saved as the user said them, never with the brain's marks or case ("alice example com" never
+    becomes "alice@example.com"). (4)
+    TEARDOWN in a memory turn: the question is the user's own sentence; the address that opens is the one the user
+    said, as said ("www." and the scheme too), and the brain's tag only confirms it (a "/" at the end does not count);
+    a subdomain, a path or a dot or dash the user did not say is refused (teardown_own_words), and the bay never
+    starts. (5) /voice/speak with a key across MAX_SPEAK_CHARS, or a
     key that only the text as it came holds: "voice_text_has_key", and no request is sent. (6) A birth at the same
     path in another vault leaves the first vault's fingerprint: unbirth takes the note back, note_id names it. For the
     length of the check, build.write_graph is a recorder: nothing may call it."""
@@ -2715,22 +2769,52 @@ def check_memory_turns(report: Report) -> None:
             body = chat("Note that down please", sessions[2])
             if len(galaxy.notes) != count + 1 or body.get("answer") != server.LINES["remember_own_words"]:
                 trouble.append("(3) a turn that saw memory only in its history saved the brain's words")
-            # (4) TEARDOWN in a memory turn
-            for said, wanted, starts in (
+            # The brain's marks (@ . - :) and its case never reach the note: the part of the user's sentence that its
+            # words match is saved as the user said it, and the title comes from that.
+            for said, says, own in (("Remember alice example com", "alice@example.com", "alice example com"),
+                                    ("Remember the server is db internal", "the server is db.internal",
+                                     "the server is db internal"),
+                                    ("Remember the gate code is 4 7 1 9", "the gate code is 4-7-1-9",
+                                     "the gate code is 4 7 1 9"),
+                                    ("Remember meet Alice at 10 30", "meet Alice at 10:30", "meet Alice at 10 30"),
+                                    ("Remember Bob prefers tea", "BOB PREFERS TEA", "Bob prefers tea")):
+                hub([memory])
+                replies[:] = [f"[REMEMBER:{says}]"]
+                receipt = (chat(said, sessions[2]).get("action") or {}).get("receipt") or {}
+                text = (vault_a / receipt["file"]).read_text(encoding="utf-8") if receipt.get("file") else ""
+                if (server.tidy_fact(own) not in text or server.tidy_fact(says) in text
+                        or receipt.get("title") != server.make_title(server.tidy_fact(own))):
+                    trouble.append(f"(3) {said!r}: the note does not hold the user's own words as said, or it holds the "
+                                   f"brain's {says!r}")
+            # (4) TEARDOWN in a memory turn: what opens is the address the user said, as said (their marks, "www." and
+            # scheme); the brain's tag only confirms it (the same host and path; a "/" at the end does not count).
+            # Words with no dot said are no address: the brain's dots and dashes never choose the site.
+            for said, wanted, opens in (
                     ("Tear down stripe.com and tell me how billing works",
-                     "[TEARDOWN:stripe.com|how they bill Bob for 500 dollars]", True),
+                     "[TEARDOWN:stripe.com|how they bill Bob for 500 dollars]", "https://stripe.com/"),
                     ("Tear down stripe and tell me how it is built", "[TEARDOWN:bob-owes-500.stripe.com|how it is built]",
-                     False),
+                     None),
                     ("Tear down stripe dot com and tell me how it is built",
-                     "[TEARDOWN:stripe.com/pricing?who=bob|how it is built]", False)):
+                     "[TEARDOWN:stripe.com/pricing?who=bob|how it is built]", None),
+                    ("Tear down alice example com", "[TEARDOWN:alice.example.com|how it is built]", None),
+                    ("Tear down alice example com", "[TEARDOWN:alice-example.com|how it is built]", None),
+                    ("Tear down stripe com pricing", "[TEARDOWN:stripe-com.pricing|how it is built]", None),
+                    ("Tear down alice dot example dot com", "[TEARDOWN:alice.example.com|how it is built]",
+                     "https://alice.example.com/"),
+                    ("Tear down https://www.stripe.com/pricing", "[TEARDOWN:stripe.com/pricing|how it is built]",
+                     "https://www.stripe.com/pricing"),
+                    ("Tear down stripe.com/pricing", "[TEARDOWN:stripe.com/pricing/|how it is built]",
+                     "https://stripe.com/pricing")):
                 server.BAY, started[:] = Bay(), []
                 hub([memory])
                 replies[:] = [wanted]
                 body = chat(said, sessions[4])
-                if starts and (len(started) != 1 or started[0][1] != said):
-                    trouble.append(f"(4) a teardown in a memory turn did not take the user's own sentence: {started}")
-                if not starts and (started or body.get("answer") != server.LINES["teardown_own_words"]):
-                    trouble.append(f"(4) a teardown in a memory turn opened an address the user did not say: {started}")
+                if opens and (len(started) != 1 or started[0] != (opens, said)):
+                    trouble.append(f"(4) {said!r} + {wanted!r} in a memory turn did not open {opens} with the user's own "
+                                   f"sentence: {started}")
+                if not opens and (started or body.get("answer") != server.LINES["teardown_own_words"]):
+                    trouble.append(f"(4) {said!r} + {wanted!r} in a memory turn opened an address the user did not "
+                                   f"say: {started}")
             # (5) /voice/speak: a key in the text as it came
             voices._OPENER = VoiceOpener()
             current["config"] = {**base, "brain": "anthropic"}

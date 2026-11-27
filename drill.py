@@ -400,16 +400,59 @@ def link_checks(notes: Path, ours: str, place) -> list[tuple[str, bool, str]]:
             results.append((f"drill: an editor that saves {how} while the drill removes the note loses nothing",
                             fine and not hidden, f"save {saved}, trouble {trouble}, left {kept!r}, hidden {hidden}"))
             path.with_name("t4.saving").unlink(missing_ok=True)
+        # A program that held the note open writes in the instant between the second check and the unlink (`last`).
+        # Windows: the handle shuts every writer out, and the unchanged note goes. POSIX: the write goes through, the
+        # read after the unlink sees it, and what the note holds goes back to its name, or beside it when another
+        # file took the name in that instant, never over a file, and the clean-up is not confirmed.
+        late = b" and a write in the last instant"
+        for taken in (False,) if os.name == "nt" else (False, True):
+            named, born = place(f"{teardown.TEARDOWNS_DIR}/t7.md", text)
+            path, saved = notes / named, []
+            writer = None if os.name == "nt" else os.open(path, os.O_WRONLY | os.O_APPEND)
+
+            def write(path=path, writer=writer, taken=taken, saved=saved) -> None:
+                try:
+                    if writer is None:
+                        write_in_place(path, b"the user's edit")
+                    else:
+                        os.write(writer, late)
+                        if taken:
+                            path.write_bytes(b"another file")
+                    saved.append("saved")
+                except OSError:
+                    saved.append("refused")
+            try:
+                trouble = remove_made(notes, ours, [(named, ours, born)], last=write)
+            finally:
+                if writer is not None:
+                    os.close(writer)
+            kept = path.read_bytes() if path.exists() else None
+            beside = [entry for entry in path.parent.iterdir() if entry.name.endswith(".drill-kept")]
+            hidden = [entry.name for entry in path.parent.iterdir() if entry.name.endswith(".drill-gone")]
+            if os.name == "nt":
+                fine = saved == ["refused"] and not trouble and kept is None and not beside
+            elif taken:
+                fine = (saved == ["saved"] and len(trouble) == 1 and kept == b"another file" and len(beside) == 1
+                        and beside[0].read_bytes() == text.encode("utf-8") + late and beside[0].name in trouble[0])
+            else:
+                fine = (saved == ["saved"] and len(trouble) == 1 and f"written back to {named}" in trouble[0]
+                        and kept == text.encode("utf-8") + late and not beside)
+            results.append(("drill: a write in the instant before the delete is never lost"
+                            + (", also when another file took the name" if taken else ""),
+                            fine and not hidden, f"write {saved}, trouble {trouble}, left {kept!r}, kept {beside}"))
+            for entry in beside:
+                entry.unlink()
+            path.unlink(missing_ok=True)
         # One receipt whose path cannot be looked at is trouble for it alone; a notes folder that cannot be looked at
         # removes nothing, and the clean-up is not confirmed.
         first, first_born = place(f"{teardown.TEARDOWNS_DIR}/t5.md", text)
         later, later_born = place(f"{teardown.TEARDOWNS_DIR}/t6.md", "another test note")
         module, real = globals(), delete_made_file
 
-        def refusing(root, target, born, between=None):
+        def refusing(root, target, born, between=None, last=None):
             if target.name == "t5.md":
                 raise PermissionError(13, "Permission denied", str(target))
-            return real(root, target, born, between)
+            return real(root, target, born, between, last)
         module["delete_made_file"] = refusing
         try:
             trouble = remove_made(notes, ours, [(first, ours, first_born), (later, ours, later_born)])
@@ -638,14 +681,14 @@ def _bytes_are(read, born: str) -> bool:
     return digest.hexdigest() == born
 
 
-def _handle_delete(target: Path, born: str | None, between=None) -> tuple[bool | None, str]:
+def _handle_delete(target: Path, born: str | None, between=None, last=None) -> tuple[bool | None, str]:
     """Windows: delete a file of the test through ONE handle on the entry itself. It is opened with no link followed
     at the entry, and while it is held nobody may write, rename or delete the file: an editor that saves meanwhile is
     refused (its text stays in the editor), never deleted. Its real path must be `target` itself (a link or a junction
     on the way shows there), it must be no folder and no reparse point, and for a note its bytes, read through the
     handle, must be `born` (None: the picture, which has none). Then the delete goes through the same handle.
     (True, ""), (False, "linked" | "not_plain" | "changed"), or (None, why there is no safe delete); FileNotFoundError
-    when nothing is there. `between`: a test runs it after the checks, right before the delete."""
+    when nothing is there. `between`, then `last`: a test runs them after the checks, right before the delete."""
     try:
         import ctypes
         from ctypes import wintypes
@@ -700,8 +743,9 @@ def _handle_delete(target: Path, born: str | None, between=None) -> tuple[bool |
                 return None, f"its bytes could not be read (WinError {failed[0]})"
             if not same:
                 return False, "changed"
-        if between:
-            between()
+        for hook in (between, last):
+            if hook:
+                hook()
         delete = ctypes.c_ubyte(1)                      # FILE_DISPOSITION_INFO: DeleteFile = TRUE
         if not kernel.SetFileInformationByHandle(handle, WIN_DISPOSITION_INFO, ctypes.byref(delete), 1):
             return None, f"the delete was refused (WinError {ctypes.get_last_error()})"
@@ -721,7 +765,67 @@ def _put_back(folder: int, hidden: str, name: str) -> bool:
     return True
 
 
-def _folder_delete(root: Path, target: Path, born: str | None, between=None) -> tuple[bool | None, str]:
+# What a note held in the instant of its delete goes back (as preflight's _held_bytes, _save_held and _change_kept).
+HELD_MAX_BYTES = 1 << 26           # after the delete, what the held file holds is read whole, up to this much
+
+
+def _held_bytes(handle: int) -> bytes | None:
+    """What the open file `handle` holds NOW, read from its start. None: more than HELD_MAX_BYTES. OSError: it could
+    not be read."""
+    os.lseek(handle, 0, os.SEEK_SET)
+    pieces, size = [], 0
+    while piece := os.read(handle, 65536):
+        size += len(piece)
+        if size > HELD_MAX_BYTES:
+            return None
+        pieces.append(piece)
+    return b"".join(pieces)
+
+
+def _save_held(data: bytes, places: list) -> tuple[str | None, list[str]]:
+    """Save `data` (what the test note held in the instant of its delete) in the first place that takes it. A place is
+    (an open folder, or None for a name that is a whole path; the name; the mode; how that name is told). Every file is
+    NEW (O_EXCL, no link followed): never over a file. A place that refuses, or whose name is taken, gives the next
+    its turn. A copy that failed half way stays, and is told. (where it went, what failed before) or (None, all)."""
+    failed: list[str] = []
+    for folder, name, mode, told in places:
+        try:
+            out = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode, dir_fd=folder)
+        except OSError as error:
+            failed.append(f"not at {told}: " + ("the name is taken" if isinstance(error, FileExistsError)
+                                                 else error.strerror or type(error).__name__))
+            continue
+        broke = None
+        try:
+            piece = memoryview(data)
+            while piece:
+                piece = piece[os.write(out, piece):]
+        except OSError as error:
+            broke = error
+        try:
+            os.close(out)
+        except OSError as error:
+            broke = broke or error
+        if broke is None:
+            return told, failed
+        failed.append(f"not at {told}: {broke.strerror or type(broke).__name__}, and an incomplete copy is there")
+    return None, failed
+
+
+def _change_kept(where: str, held: bytes | None, places: list) -> str:
+    """What CleanupUnsure says when the test note at `where` held other bytes in the instant of its delete (`held`;
+    None: too many to read): where they were saved (_save_held, `places` in order), or loudly that they were not."""
+    kept, failed = _save_held(held, places) if held is not None else (None, [
+        f"it holds more than {HELD_MAX_BYTES >> 20} MiB now"])
+    if kept is None:
+        return (f"the test note was changed in the instant before its delete and could not be saved (it was at {where}; "
+                f"{'; '.join(failed)}): the change made in that instant is lost")
+    return (f"the test note at {where} was changed in the instant before its delete, and what it held then was "
+            + (f"written back to {kept}" if kept == where else f"saved at {kept}")
+            + (f" ({'; '.join(failed)})" if failed else "") + ": look at it, and remove it by hand")
+
+
+def _folder_delete(root: Path, target: Path, born: str | None, between=None, last=None) -> tuple[bool | None, str]:
     """POSIX: delete a file of the test in folders that stay open.
     1. The vault and each folder below it are checked (lstat: a real folder, no link); their identity is kept.
     2. Every folder from "/" down is opened with O_NOFOLLOW: no link anywhere on the way is followed. The vault and
@@ -731,10 +835,14 @@ def _folder_delete(root: Path, target: Path, born: str | None, between=None) -> 
     4. It is moved to a new random hidden name in the same folder. 5. What sits there must be the file of that fd, and
        a note's bytes, read again through that fd, must still be `born` (an editor that saved in place after the first
        read shows here). Else it is put back, never over a file, and CleanupUnsure says where things are. 6. The
-       hidden name is unlinked.
-    What remains: a program that opened the file BEFORE the move and writes to it in the instant between the second
-    read and the unlink. POSIX has no delete tied to a check of the bytes; after the move nobody can open the file by
-    its name. The same answers as _handle_delete, and "moved"."""
+       hidden name is unlinked. 7. A note's bytes are read once more through the fd: POSIX cannot refuse a write of
+       a program that opened the file BEFORE the move, but a write in the instant before the unlink shows there.
+       Then what the note holds is written back, never over a file: at its name, else at a kept name beside it, at
+       the top of the notes folder, in the temp folder (_save_held). And CleanupUnsure names that place, or says
+       that it could not be saved. A read that fails there is no success either.
+    What remains: such a program can write into the file after the unlink, into a file that has no name any more, as
+    after any delete. The same answers as _handle_delete, and "moved". `between`: a test runs it after the first
+    check, right before the move; `last`: after the second check, right before the unlink."""
     parts = target.relative_to(root).parts
     inner, name = parts[:-1], parts[-1]
     checked, step = [], root
@@ -791,12 +899,35 @@ def _folder_delete(root: Path, target: Path, born: str | None, between=None) -> 
         except OSError:
             same = None                                 # it could not be read again: it is not deleted
         if same:
+            if last:
+                last()
             try:
                 os.unlink(hidden, dir_fd=folder)
-                return True, ""
             except OSError as error:
                 trouble, advice = (f"the file at {where} could not be removed after it was moved for the delete "
                                    f"({error.strerror or type(error).__name__})"), "remove it by hand"
+            else:
+                if born is None:                        # the picture: it has no bytes to compare
+                    return True, ""
+                try:                                    # a write before the unlink shows in the file that is held
+                    held = _held_bytes(handle)
+                except OSError as error:
+                    raise CleanupUnsure(f"the test note at {where} was removed, but the note could not be read again "
+                                        f"after the delete ({error.strerror or type(error).__name__}), so whether a "
+                                        "write came in that instant is not known") from None
+                if held is not None and hashlib.sha256(held).hexdigest() == born:
+                    return True, ""
+                kept = f".{secrets.token_hex(16)}.drill-kept"
+                places = [(folder, name, stat.S_IMODE(opened.st_mode), where),
+                          (folder, kept, 0o600, "/".join((*inner, kept)))]
+                if inner:
+                    places.append((fds[vault_at], kept, 0o600, f"{kept} at the top of the notes folder"))
+                try:
+                    spare = os.path.join(tempfile.gettempdir(), f"jarviz-{secrets.token_hex(16)}.drill-kept")
+                except OSError:
+                    spare = ""                          # no temp folder: os.open("") fails, and that is told
+                places.append((None, spare, 0o600, spare or "the temp folder"))
+                raise CleanupUnsure(_change_kept(where, held, places))
         elif mine and same is False:
             trouble, advice = f"the file at {where} was changed right before the delete (it was saved meanwhile)", ""
         elif mine or now is None:
@@ -818,19 +949,20 @@ def _folder_delete(root: Path, target: Path, born: str | None, between=None) -> 
             os.close(fd)
 
 
-def delete_made_file(root: Path, target: Path, born: str | None, between=None) -> tuple[bool | None, str]:
+def delete_made_file(root: Path, target: Path, born: str | None, between=None, last=None) -> tuple[bool | None, str]:
     """The delete that no link and no swap of a folder can redirect, and that checks the bytes of the very file it
     removes: through a handle on the file (Windows) or inside folders opened with no link followed (POSIX). Neither:
     (None, why), and nothing is deleted (fail closed)."""
     if os.name == "nt":
-        return _handle_delete(target, born, between)
+        return _handle_delete(target, born, between, last)
     if ({os.open, os.stat, os.unlink, os.rename} <= os.supports_dir_fd and os.stat in os.supports_follow_symlinks
             and hasattr(os, "O_NOFOLLOW") and hasattr(os, "O_DIRECTORY")):
-        return _folder_delete(root, target, born, between)
+        return _folder_delete(root, target, born, between, last)
     return None, "this system has no delete tied to the file or to a checked folder"
 
 
-def remove_made(notes_dir: Path, vault: str, made: list[tuple[str, str, str]], between=None) -> list[str]:
+def remove_made(notes_dir: Path, vault: str, made: list[tuple[str, str, str]], between=None,
+                last=None) -> list[str]:
     """Remove the test's own files from the notes folder of the drill (`vault`: its fingerprint). A file goes only
     when its receipt names THAT folder, it is the very entry at the receipt's path (no link or junction on the way and
     none at its name: delete_made_file ties the delete to the entry it checked), and a note only while it holds the
@@ -838,7 +970,7 @@ def remove_made(notes_dir: Path, vault: str, made: list[tuple[str, str, str]], b
     made in another folder (the galaxy moved during the drill) cannot be found from its fingerprint, and a file of the
     same name here is not the test's. A path that cannot be looked at is trouble for its receipt, and the others go
     on; a notes folder that cannot be looked at removes nothing, and the clean-up is not confirmed. Returns the
-    trouble; it never raises. `between`: a test runs it right before each delete."""
+    trouble; it never raises. `between` and `last`: the hooks of a test, see _folder_delete."""
     if not made:
         return []
     try:
@@ -862,7 +994,7 @@ def remove_made(notes_dir: Path, vault: str, made: list[tuple[str, str, str]], b
             if "\0" in relative or target == root or not target.is_relative_to(root):
                 trouble.append(f"{relative} is not inside the notes folder, so it was left alone")
                 continue
-            done, why = delete_made_file(root, target, born if note else None, between)
+            done, why = delete_made_file(root, target, born if note else None, between, last)
         except FileNotFoundError:
             continue                                    # already gone
         except CleanupUnsure as error:                  # it says where things are now

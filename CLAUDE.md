@@ -182,9 +182,13 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
   puts `MEMORY_LEFT_OUT` in place of the answer of each marked turn. Only a brain in `ALI_MEMORY_BRAINS` gets
   `with_memory=True`. The user's own words and the receipts stay. Chat history stays plain text.
 - In a turn with Ali Memory (fresh, or in the history), a tag carries only the user's own words. A REMEMBER fact must
-  stand in the user's sentence (`said_by_user`), else `remember_own_words` and nothing is saved. A TEARDOWN address
-  must be the user's whole address (`address_said`: every host label, the port, the path and the query), else
-  `teardown_own_words` and nothing opens. The teardown question is the user's sentence, never the brain's. The page's
+  stand in the user's sentence, and what is saved is the user's own part of it as said (`said_span`: the user's
+  marks and case, never the brain's), else `remember_own_words` and nothing is saved. A TEARDOWN opens only an
+  address that the user said, as said (`user_address`: the sentence through `teardown.spoken_to_address`, each word
+  without its marks as `bareWord` in `viewer/core.js`, read by `parse_site`; the user's dots, "www." and
+  "http(s)://"). The brain's tag only confirms it (`_site_key`: the same host and path, a final "/" ignored). Else
+  `teardown_own_words`, which asks for the dots, and nothing opens. Words with no dot said ("alice example com") are
+  no address. The teardown question is the user's sentence, never the brain's. The page's
   own routes (`/remember`, `/teardown/start`) take the user's words directly. This is a word match, not an
   understanding.
 - The `/chat` reply carries `memory`: `{"used": true, "titles": [...]}` (cleaned titles, at most 3) or
@@ -301,7 +305,11 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
   folder below must keep the st_dev/st_ino that was checked, and the file is moved to a random hidden name and
   unlinked there only when it is still the file whose bytes were read (`_folder_delete`), and whose bytes, read again
   through the held fd after the move, are still `born`. After the unlink they are read once more, and a write that
-  came in that instant is written back (`_write_back`: O_EXCL, never over a file) as "cleanup not confirmed".
+  came in that instant is written back, never over a file (`_save_held`, O_EXCL): at its name, else at a
+  `.preflight-kept` name beside it, at the top of the notes folder, in `tempfile.gettempdir()` (kept copies 0600),
+  as "cleanup not confirmed" that names the place. When no place takes it, the FAIL says "the test note was changed
+  in the instant before its delete and could not be saved". A read that fails after the unlink is "cleanup not
+  confirmed", never a success.
   Anything else is put back only by a hard link, which never replaces a name (`_put_back`); without one it stays at
   the hidden name, and that name is told. A put-back that restores the name but cannot remove the hidden name names
   both. All of these are "cleanup not confirmed". On Windows no write reaches the file between the read and the
@@ -421,7 +429,9 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
   the very entry at the receipt's path: no link or junction on the way, none at its name (`delete_made_file` deletes
   through a handle on the entry on Windows, or in folders opened with no link followed on POSIX). A note goes only
   while it holds the receipt's `born` bytes, read through that same handle or fd: on POSIX once more after the move to
-  a hidden name, and put back if it changed. Anything else stays, and the clean-up FAILs. A path that cannot be looked
+  a hidden name, and put back if it changed, and once more after the unlink: a write that came in that instant goes
+  back as in preflight (`_save_held`, `.drill-kept` names), and the clean-up FAILs naming the place. Anything else
+  stays, and the clean-up FAILs. A path that cannot be looked
   at is trouble for its receipt only. A notes folder that cannot be looked at removes nothing and is not confirmed.
   `made_by` reads the notes from the births in every job state; the picture only from a done job's `result`.
 - When the silence budget and the job's time run out together, `follow_job` sends the named cancel, then looks for

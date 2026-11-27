@@ -127,7 +127,8 @@ LINES = {
     "remember_own_words": "Ali Memory had a hand in that answer, sir, so I write down only your own words. Say "
                           "“remember that” and the fact itself, and I shall.",
     "teardown_own_words": "Ali Memory had a hand in that answer, sir, so I open only an address you give me yourself. "
-                          "Say “tear down” and the address, and I shall.",
+                          "Say “tear down” and the address with its dots, as in “tear down stripe dot com”, and I "
+                          "shall.",
     "teardown_started": (
         "Taking {host} apart now, sir.",
         "Very good, sir. {host} goes on the bench.",
@@ -1210,18 +1211,34 @@ def asks_for_teardown(sentence: str) -> bool:
 TAG_INTENT = {"REMEMBER": asks_to_remember, "TEARDOWN": asks_for_teardown}     # tag -> (the user's sentence) -> bool
 
 
+WORD_RE = re.compile(r"[^\W_]+")                # a word: letters and digits
+
+
 def words_of(text) -> str:
     """A text as its words only (letters and digits), in lower case, one space between them."""
-    return " ".join(re.findall(r"[^\W_]+", str(text).casefold()))
+    return " ".join(WORD_RE.findall(str(text).casefold()))
+
+
+def said_span(text: str, sentence: str) -> str | None:
+    """The part of the user's sentence, as the user said it, whose words are the words of `text` (what the brain put
+    in a tag): side by side and in that order. Case, marks and spaces do not count, other words do. None: the sentence
+    does not hold them. The part runs from its first word to its last, so every mark in it is the user's own."""
+    wanted = words_of(text).split()
+    sentence = str(sentence)
+    said = [(word, found.start(), found.end()) for found in WORD_RE.finditer(sentence)
+            for word in words_of(found.group()).split()]
+    words = [word for word, _, _ in said]
+    for at in range(len(words) - len(wanted) + 1) if wanted else ():
+        if words[at:at + len(wanted)] == wanted:
+            return sentence[said[at][1]:said[at + len(wanted) - 1][2]]
+    return None
 
 
 def said_by_user(text: str, sentence: str) -> bool:
-    """True when `text` (what the brain put in a tag) is the user's own words: its words stand in the user's sentence,
-    side by side and in that order. Case, marks and spaces do not count, other words do. A turn with Ali Memory in it
-    keeps memory text out of a note (tag_remember) and out of a teardown (tag_teardown) this way: the brain may move
-    the user's words into a tag, never add its own."""
-    wanted = words_of(text)
-    return bool(wanted) and f" {wanted} " in f" {words_of(sentence)} "
+    """True when `text` (what the brain put in a tag) is the user's own words (said_span). A turn with Ali Memory in it
+    keeps memory text out of a note (tag_remember: it saves the user's part itself, never the brain's version) and out
+    of a teardown (tag_teardown) this way: the brain may move the user's words into a tag, never add its own."""
+    return said_span(text, sentence) is not None
 
 
 NOTE_TAG_RE = re.compile(r"\[(?=\s*[A-Z][A-Z_]{2,}\s*:)")
@@ -1591,12 +1608,15 @@ def tag_remember(argument: str, question: str, session: Session, payload: dict,
                  memory: bool = False) -> tuple[int, dict]:
     """The brain asked to save a note. Its text is tidied and cut to size like any other input. `memory`: the brain
     was shown Ali Memory for this answer (fresh, or in an answer of its history). Then the note holds only the user's
-    own words (said_by_user): a note is ordinary text that every brain can read later, and Ali Memory reaches only
-    Claude. Other text is not saved, and the line tells the user to say the fact themselves ("remember that ...":
-    the page saves that directly, /remember)."""
+    own words, as the user said them: the part of the user's sentence that the brain's words match (said_span), never
+    the brain's version (its marks, its case: "alice example com" stays that, never "alice@example.com"). A note is
+    ordinary text that every brain can read later, and Ali Memory reaches only Claude. Other text is not saved, and the
+    line tells the user to say the fact themselves ("remember that ...": the page saves that directly, /remember)."""
     fact = clean_text(argument, MAX_MESSAGE_CHARS)
-    if memory and not said_by_user(fact, question):
-        return 200, reply(LINES["remember_own_words"], error="own_words", memory=memory_view([], "not_in_answer"))
+    if memory:
+        fact = said_span(fact, question)
+        if fact is None:
+            return 200, reply(LINES["remember_own_words"], error="own_words", memory=memory_view([], "not_in_answer"))
     return do_remember(fact, question, session, SOURCE_BRAIN, memory=memory)
 
 
@@ -1849,33 +1869,52 @@ def tag_site_named(site_text: str, sentence: str) -> bool:
     return any(named_in(clause) for clause in kept)
 
 
-def address_said(site_text: str, sentence: str) -> bool:
-    """True when the user's sentence holds the WHOLE address of a [TEARDOWN:...] tag, as the job opens it: every label
-    of its host (not only the name that named_by_user looks for; "www." is no word of anyone), its port, its path and
-    its query (said_by_user). "stripe dot com slash pricing" says stripe.com/pricing. A text that is no address is
-    left to start_teardown, which refuses it."""
-    site = teardown.parse_site(site_text) if teardown is not None else None
-    if site is None:
-        return True
-    path = site.url.split("://", 1)[1].partition("/")[2]
-    return said_by_user(f"{site.host}/{path}", teardown.spoken_to_address(sentence))
+BARE_WORD_RE = re.compile(r"^[\"'(]+|[\"').,;!?]+$")     # the marks around a word (bareWord in viewer/core.js)
+
+
+def _site_key(site) -> tuple[str, str]:
+    """What a tag must agree on: the host the site opens (no "www.", with its port) and its path with its query, a "/"
+    at the end left out."""
+    return site.host, site.url.split("://", 1)[1].partition("/")[2].rstrip("/")
+
+
+def user_address(site_text: str, sentence: str) -> str | None:
+    """The address that a [TEARDOWN:...] tag may open in a turn with Ali Memory: one that the USER said, as the user
+    said it, found as the page finds one (findAddress in viewer/core.js): the sentence through
+    teardown.spoken_to_address ("stripe dot com slash pricing" is stripe.com/pricing), then each word without the
+    marks around it, read by teardown.parse_site. Its marks, its "www." and its "http(s)://" are the user's own. The
+    tag only confirms it: the tag's site must be that one (_site_key: the same host and path once both are parsed).
+    None: the tag is no address, or the user said no such address ("alice example com" is none: no dot was said), and
+    nothing opens. Every mark of the brain's (a dot, a dash, a slash) could hold memory text, and it goes to DNS."""
+    wanted = teardown.parse_site(site_text) if teardown is not None else None
+    if wanted is None:
+        return None
+    for word in teardown.spoken_to_address(sentence).split(" "):
+        said = re.sub(r"['’]s$", "", BARE_WORD_RE.sub("", word))
+        site = teardown.parse_site(said) if said else None
+        if site is not None and _site_key(site) == _site_key(wanted):
+            return said
+    return None
 
 
 def tag_teardown(argument: str, question: str, session: Session, payload: dict,
                  memory: bool = False) -> tuple[int, dict]:
     """The brain asked for a teardown. It runs only for a site the user's own sentence asks for. `memory`: the brain
     was shown Ali Memory for this answer (fresh, or in an answer of its history). Then the tag carries nothing of the
-    brain's own: the address must be the user's whole address (address_said: a label or a path of the brain's could
-    hold memory text, and it goes to the website and to DNS), and the question is the user's sentence (the brain's
-    goes to the teardown brain and into the note, an ordinary note that every brain can read)."""
+    brain's own: the address that opens is the one the user said, as the user said it (user_address: a label, a mark
+    or a path of the brain's could hold memory text, and it goes to the website and to DNS), the tag only confirms
+    it, and the question is the user's sentence (the brain's goes to the teardown brain and into the note, an
+    ordinary note that every brain can read)."""
     site_text, _, asked = argument.partition("|")
     site_text = clean_text(site_text, 300)
     if not tag_site_named(site_text, question):
         return 200, reply(LINES["teardown_not_named"], error="not_named")
     if not site_text or site_text.lower() in THIS_SITE:
         site_text = "this"
-    elif memory and not address_said(site_text, question):
-        return 200, reply(LINES["teardown_own_words"], error="own_words", memory=memory_view([], "not_in_answer"))
+    elif memory:
+        site_text = user_address(site_text, question)
+        if site_text is None:
+            return 200, reply(LINES["teardown_own_words"], error="own_words", memory=memory_view([], "not_in_answer"))
     if memory:      # the question goes to the teardown brain and into the note: the user's own sentence only
         asked = ""
     return start_teardown(site_text, clean_text(asked, 300) or question, session, question,
