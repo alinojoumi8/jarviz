@@ -1219,7 +1219,10 @@ story('a cancel answer names its job', {
 const voiceOffer = (fallback = 'browser', hasKey = true) => ({ default: fallback, voices: [
   { name: 'browser', label: 'browser', model: '', has_key: true },
   { name: 'deepgram', label: 'Deepgram', model: 'aura-2-draco-en', has_key: hasKey },
+  { name: 'elevenlabs', label: 'ElevenLabs', model: '6WwXjDDEMyNmFG95zycZ', has_key: hasKey },
 ] });
+const elevenInfo = { name: 'elevenlabs', label: 'ElevenLabs', model: '6WwXjDDEMyNmFG95zycZ', has_key: true };
+const deepgramInfo = { name: 'deepgram', label: 'Deepgram', model: 'aura-2-draco-en', has_key: true };
 const statusWith = voice => () => ({ ok: true, active: { label: 'Claude', model: 'm', has_key: true }, lines: {}, graph: meta(5), voice });
 const speakAsks = p => p.fetchLog.filter(entry => entry.key === '/voice/speak').map(entry => entry.body);
 const voiceNotes = p => p.$('answer').children.filter(child => child.className === 'voice-note').map(child => child.textContent);
@@ -1246,15 +1249,21 @@ story('a voice switch by voice', {
     ['switch voice to deepgram', 'deepgram'], ['change your voice to Deepgram', 'Deepgram'], ['switch to the deepgram voice', 'deepgram'],
     ['use the browser voice', 'browser'], ['Jarvis, use the Deepgram voice please', 'Deepgram'], ['speak with deepgram', 'deepgram'],
     ['talk with the browser voice', 'browser'], ['speak in the normal voice', 'normal'], ['Switch voice to Deep Gram.', 'Deep Gram'],
+    ['switch to elevenlabs', 'elevenlabs'], ['switch voice to eleven labs', 'eleven labs'], ['speak with eleven labs', 'eleven labs'],
+    ['switch voice to 11 labs', '11 labs'], ['use the ElevenLabs voice', 'ElevenLabs'], ['switch to 11labs', '11labs'],
+    ['talk using the Eleven Labs voice', 'Eleven Labs'], ['switch back to the eleven labs voice', 'eleven labs'],
   ];
   const wrong = voiceCases.filter(([sentence, name]) => matchVoiceSwitch(sentence) !== name)
     .map(([sentence, name]) => `"${sentence}" gave ${JSON.stringify(matchVoiceSwitch(sentence))}, not ${JSON.stringify(name)}`);
   t.check('voice', !wrong.length, wrong.join('; '));
   const notVoice = ['switch brain to deepseek', 'switch to codex', 'what is your voice like', 'use your voice to read this',
-    'my voice is tired', 'speak with the manager', 'use your voice'].filter(sentence => matchVoiceSwitch(sentence) !== null);
+    'my voice is tired', 'speak with the manager', 'use your voice', 'switch to eleven', 'switch to labs', 'speak with eleven',
+    'tell me about elevenlabs', 'is eleven labs any good', 'switch to elevenlabs now', 'speak with 11 labs about pricing']
+    .filter(sentence => matchVoiceSwitch(sentence) !== null);
   t.check('notVoice', !notVoice.length, notVoice.join(' / '));
   const brainSentences = ['Switch brain to Deep Seek.', 'Jarvis, use the OpenAI brain', 'switch to claude', 'switch to codex',
-    'switch brain to the deepgram voice', 'use the deepgram voice brain', 'switch to the browser brain', 'change brain to voice'];
+    'switch brain to the deepgram voice', 'use the deepgram voice brain', 'switch to the browser brain', 'change brain to voice',
+    'switch brain to eleven labs', 'use the elevenlabs brain', 'switch to the 11 labs brain'];
   const voiceSentences = voiceCases.map(([sentence]) => sentence).concat(['switch voice to the claude brain', 'use the brain voice']);
   const both = brainSentences.concat(voiceSentences).filter(sentence => matchBrainSwitch(sentence) && matchVoiceSwitch(sentence));
   const brainTaken = brainSentences.filter(sentence => !matchBrainSwitch(sentence) || matchVoiceSwitch(sentence));
@@ -1305,12 +1314,83 @@ story('the voice switch', {
     && r.$('voice').textContent === 'voice: browser', `${r.$('answer').textContent} / ${r.$('voice').textContent}`);
 });
 
+story('the ElevenLabs voice switch', {
+  route: '"switch voice to eleven labs" posts /voice once, with the name that was said, and nothing goes to the brain',
+  taken: 'the ElevenLabs answer is kept in localStorage as jarviz_voice = "elevenlabs" and shown on the chip',
+  named: 'the answer line asks /voice/speak with { text, part, voice: "elevenlabs" }, and nothing else',
+  back: '"switch voice to deepgram" after it keeps "deepgram", and its line asks with voice: "deepgram"',
+  browser: '"switch voice to browser" asks for no audio any more',
+}, async (t, open) => {
+  let answer = { ok: true, answer: 'ElevenLabs it is.', nodes: [], graph: meta(5), voice: elevenInfo };
+  const p = await speakingPage(open, { handlers: {
+    '/status': statusWith(voiceOffer('browser')),
+    '/voice': () => answer,
+    '/voice/speak': () => audioResponse(1),
+  } });
+  await p.J().handleInput('switch voice to eleven labs');
+  await p.tick(0);
+  const posts = p.fetchLog.filter(entry => entry.key === '/voice');
+  t.check('route', posts.length === 1 && posts[0].body.name === 'eleven labs' && count(p.fetchLog, '/chat') === 0, JSON.stringify(posts));
+  t.check('taken', p.stored.jarviz_voice === 'elevenlabs' && p.$('voice').textContent === 'voice: ElevenLabs · 6WwXjDDEMyNmFG95zycZ',
+    `${JSON.stringify(p.stored)} / ${p.$('voice').textContent}`);
+  let asked = speakAsks(p);
+  t.check('named', asked.length === 1 && JSON.stringify(asked[0]) === JSON.stringify({ text: 'ElevenLabs it is.', part: 0, voice: 'elevenlabs' })
+    && !p.synth.said.includes('ElevenLabs it is.'), `${JSON.stringify(asked)} / browser said ${JSON.stringify(p.synth.said)}`);
+  p.audios[p.audios.length - 1].end();
+  await p.tick(0);
+  answer = { ok: true, answer: 'Deepgram it is.', nodes: [], graph: meta(5), voice: deepgramInfo };
+  await p.J().handleInput('switch voice to deepgram');
+  await p.tick(0);
+  asked = speakAsks(p);
+  t.check('back', p.stored.jarviz_voice === 'deepgram' && asked.length === 2 && asked[1].voice === 'deepgram'
+    && asked[1].text === 'Deepgram it is.' && p.$('voice').textContent === 'voice: Deepgram · aura-2-draco-en',
+    `${JSON.stringify(p.stored)} / ${JSON.stringify(asked)} / ${p.$('voice').textContent}`);
+  p.audios[p.audios.length - 1].end();
+  await p.tick(0);
+  answer = { ok: true, answer: 'The browser it is.', nodes: [], graph: meta(5),
+             voice: { name: 'browser', label: 'browser', model: '', has_key: true } };
+  await p.J().handleInput('switch voice to browser');
+  await p.tick(0);
+  t.check('browser', speakAsks(p).length === 2 && p.synth.said.includes('The browser it is.') && p.stored.jarviz_voice === 'browser'
+    && p.$('voice').textContent === 'voice: browser', `${speakAsks(p).length} asks / ${JSON.stringify(p.synth.said)}`);
+});
+
+story('a line keeps the voice it started with', {
+  start: 'a line that starts in the Deepgram voice asks for its parts with voice: "deepgram"',
+  kept: 'a switch to ElevenLabs while the line plays does not change the voice of the parts still to come',
+  next: 'the next line asks with the new voice: "elevenlabs"',
+}, async (t, open) => {
+  const p = await speakingPage(open, { handlers: {
+    '/status': statusWith(voiceOffer('deepgram')),
+    '/voice/speak': (url, init) => audioResponse(3, 'part' + partOf(init)),
+  } });
+  p.J().speaker.speak('One. Two. Three.');
+  await p.tick(0);
+  const early = speakAsks(p).map(ask => ask.voice);
+  t.check('start', early.length === 2 && early.every(voice => voice === 'deepgram'), JSON.stringify(early));
+  p.J().speaker.setVoice('elevenlabs');               // the switch, in the middle of the line
+  p.audios[0].end();
+  await p.tick(0);
+  p.audios[1].end();
+  await p.tick(0);
+  p.audios[2].end();
+  await p.tick(0);
+  const line = speakAsks(p);
+  t.check('kept', line.length === 3 && line.map(ask => ask.part).join() === '0,1,2' && line.every(ask => ask.voice === 'deepgram')
+    && p.audios.length === 3, `${JSON.stringify(line)} / ${p.audios.length} audios`);
+  p.J().speaker.speak('Next.');
+  await p.tick(0);
+  const next = speakAsks(p).slice(3);
+  t.check('next', next.length >= 1 && next[0].text === 'Next.' && next.every(ask => ask.voice === 'elevenlabs'), JSON.stringify(next));
+});
+
 story('the server voice says a line in its parts', {
   first: 'with the server voice a line asks /voice/speak for part 0, with the whole text',
   ahead: 'part 1 is asked for while part 0 plays, with the same whole text (the header said 2 parts)',
   order: 'the parts play in order: part 1 starts only after part 0 ended, and no part 2 is asked for',
   ended: 'the "speaking ended" signal comes once, after the last part',
   urls: 'every object URL is given back at the end',
+  shape: 'every ask is { text, part, voice } and names the voice of the line ("deepgram"), and nothing else',
 }, async (t, open) => {
   const p = await speakingPage(open, { handlers: {
     '/status': statusWith(voiceOffer('deepgram')),
@@ -1320,6 +1400,8 @@ story('the server voice says a line in its parts', {
   await p.tick(0);
   const asked = speakAsks(p);
   t.check('first', asked.length >= 1 && asked[0].part === 0 && asked[0].text === 'One sentence. Another sentence.', JSON.stringify(asked));
+  t.check('shape', asked.length === 2 && asked.every(ask => Object.keys(ask).join() === 'text,part,voice' && ask.voice === 'deepgram'),
+    JSON.stringify(asked));
   const first = p.audios[0];
   t.check('ahead', asked.length === 2 && asked[1].part === 1 && asked[1].text === asked[0].text && p.audios.length === 1
     && first.played && !first.paused && p.J().status() === 'speaking', `${JSON.stringify(asked)} / ${p.audios.length} audios`);
@@ -1417,8 +1499,79 @@ story('three server voice failures in a row', {
     `${asks.length} asks / ${p.$('voice').textContent}`);
 });
 
+story('a line of an earlier voice choice counts only for that choice', {
+  oldLine: 'a Deepgram line whose part fails after "switch voice to ElevenLabs" is still said, by the browser voice',
+  notCounted: 'that failure does not count for ElevenLabs: after two ElevenLabs failures it is not given up yet',
+  ownNote: 'the first ElevenLabs failure still shows its own line',
+  third: 'the third ElevenLabs failure in a row gives ElevenLabs up, as before',
+}, async (t, open) => {
+  const late = deferred();
+  const refused = who => refusal(503, { ok: false, error: 'voice_error', answer: who + ' failed.' });
+  const p = await speakingPage(open, { handlers: {
+    '/status': statusWith(voiceOffer('deepgram')),
+    '/voice/speak': (url, init) => {
+      const ask = JSON.parse(init.body);
+      if (ask.voice === 'elevenlabs') return refused('ElevenLabs');
+      return ask.part === 0 ? audioResponse(2, 'part0') : late.promise;
+    },
+  } });
+  p.J().speaker.speak('Old line. Its end.');
+  await p.tick(0);
+  p.J().speaker.setVoice('elevenlabs');               // the switch, while part 1 of the old line is on its way
+  p.audios[0].end();
+  late.resolve(refused('Deepgram'));
+  await p.tick(0);
+  t.check('oldLine', p.synth.said.includes('Old line. Its end.'), JSON.stringify(p.synth.said));
+  p.synth.finish();
+  await p.tick(0);
+  const notesBefore = voiceNotes(p).length;
+  for (const line of ['E1.', 'E2.']) {
+    p.J().speaker.speak(line);
+    await p.tick(0);
+    p.synth.finish();
+    await p.tick(0);
+  }
+  const state = p.J().speaker.voiceState();
+  t.check('notCounted', state.name === 'elevenlabs' && state.gaveUp === false, JSON.stringify(state));
+  t.check('ownNote', voiceNotes(p).length === notesBefore + 1 && voiceNotes(p)[notesBefore] === 'ElevenLabs failed.',
+    JSON.stringify(voiceNotes(p)));
+  p.J().speaker.speak('E3.');
+  await p.tick(0);
+  p.synth.finish();
+  await p.tick(0);
+  const asks = speakAsks(p).filter(ask => ask.voice === 'elevenlabs');
+  t.check('third', p.J().speaker.voiceState().gaveUp === true && asks.length === 3, `${asks.length} asks / ${JSON.stringify(p.J().speaker.voiceState())}`);
+});
+
+story('a good part of an earlier voice choice does not speak for the new one', {
+  played: 'a Deepgram part that plays well after "switch voice to ElevenLabs" still plays, and its line ends once',
+  counted: 'ElevenLabs then fails three lines in a row and is given up at the third, as if the old part never played',
+}, async (t, open) => {
+  const p = await speakingPage(open, { handlers: {
+    '/status': statusWith(voiceOffer('deepgram')),
+    '/voice/speak': (url, init) => (JSON.parse(init.body).voice === 'elevenlabs'
+      ? refusal(503, { ok: false, error: 'voice_error', answer: 'ElevenLabs failed.' }) : audioResponse(1, 'old')),
+  } });
+  p.J().speaker.speak('Old line.');
+  await p.tick(0);
+  p.J().speaker.setVoice('elevenlabs');
+  p.audios[0].end();                                  // the old part played well, after the switch
+  await p.tick(0);
+  t.check('played', p.audios.length === 1 && speakingEnds(p) === 1 && p.liveUrls.size === 0, `${speakingEnds(p)} ends`);
+  const given = [];
+  for (const line of ['E1.', 'E2.', 'E3.']) {
+    p.J().speaker.speak(line);
+    await p.tick(0);
+    p.synth.finish();
+    await p.tick(0);
+    given.push(p.J().speaker.voiceState().gaveUp);
+  }
+  t.check('counted', given.join() === 'false,false,true', given.join());
+});
+
 story('a muted tab asks for no audio', {
   muted: 'a ?mute=1 tab with the server voice sends no request to /voice/speak, for any line',
+  mutedEleven: 'a ?mute=1 tab with the ElevenLabs voice sends no request to /voice/speak either, also after "switch voice to eleven labs"',
   control: 'the same page without ?mute=1 asks for the audio of its line',
 }, async (t, open) => {
   const handlers = { '/status': statusWith(voiceOffer('deepgram')), '/voice/speak': () => audioResponse(1), '/chat': () => chatReply('An answer', 5) };
@@ -1429,6 +1582,17 @@ story('a muted tab asks for no audio', {
   await p.tick(1000);
   t.check('muted', speakAsks(p).length === 0 && p.$('voice').textContent === 'voice: Deepgram · aura-2-draco-en',
     `${speakAsks(p).length} asks / ${p.$('voice').textContent}`);
+  const e = await open({ search: '?mute=1', synth: true, handlers: Object.assign({}, handlers, {
+    '/status': statusWith(voiceOffer('elevenlabs')),
+    '/voice': () => ({ ok: true, answer: 'ElevenLabs it is.', nodes: [], graph: meta(5), voice: elevenInfo }),
+  }) });
+  e.J().speaker.unlock();
+  e.J().speaker.speak('A line.');
+  await e.J().handleInput('a question');
+  await e.J().handleInput('switch voice to eleven labs');
+  await e.tick(1000);
+  t.check('mutedEleven', speakAsks(e).length === 0 && e.synth.said.length === 0
+    && e.$('voice').textContent === 'voice: ElevenLabs · 6WwXjDDEMyNmFG95zycZ', `${speakAsks(e).length} asks / ${e.$('voice').textContent}`);
   const q = await speakingPage(open, { handlers });
   q.J().speaker.speak('A line.');
   await q.tick(0);
@@ -1495,6 +1659,7 @@ story('the voice at start', {
   noKey: 'a kept choice without a key any more falls back to the browser voice, without a word',
   blocked: 'with localStorage blocked the page starts with the server\'s default',
   keptBrowser: 'a kept "browser" wins over a server default',
+  keptEleven: 'a kept "elevenlabs" wins over a Deepgram default, and its first line asks with voice: "elevenlabs"',
 }, async (t, open) => {
   const start = async (storage, offer) => {
     const p = await speakingPage(open, { storage, handlers: { '/status': statusWith(offer), '/voice/speak': () => audioResponse(1) } });
@@ -1512,6 +1677,9 @@ story('the voice at start', {
   t.check('blocked', p.$('voice').textContent === 'voice: Deepgram · aura-2-draco-en' && speakAsks(p).length === 1, p.$('voice').textContent);
   p = await start({ jarviz_voice: 'browser' }, voiceOffer('deepgram', true));
   t.check('keptBrowser', p.$('voice').textContent === 'voice: browser' && speakAsks(p).length === 0, p.$('voice').textContent);
+  p = await start({ jarviz_voice: 'elevenlabs' }, voiceOffer('deepgram', true));
+  t.check('keptEleven', p.$('voice').textContent === 'voice: ElevenLabs · 6WwXjDDEMyNmFG95zycZ' && speakAsks(p).length === 1
+    && speakAsks(p)[0].voice === 'elevenlabs', `${p.$('voice').textContent} / ${JSON.stringify(speakAsks(p))}`);
 });
 
 story('an old server without voices', {

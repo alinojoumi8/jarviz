@@ -21,8 +21,9 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
   Claude uses the `anthropic` package, the others plain HTTPS from the standard library. Two use a sign-in
   (Codex, Antigravity): Jarviz starts the user's own tool (`codex`, `agy`), and the tool uses its own sign-in.
   `python brains.py` runs the offline checks of the sign-in brains.
-- `voices.py` the voices behind one `speak()`: the browser's own voice (the server does nothing for it) and
-  Deepgram (text to speech over plain HTTPS, standard library only). `python voices.py` runs its offline checks.
+- `voices.py` the voices behind one `speak()`: the browser's own voice (the server does nothing for it) and two
+  server voices, Deepgram and ElevenLabs (text to speech over plain HTTPS, standard library only).
+  `python voices.py` runs its offline checks.
 - `preflight.py` live end-to-end checks.
 - `teardown.py` the teardown bay (Part Two), standard library only. The server soft-imports it and starts without it.
 - `drill.py` the live teardown drill. `record()` and `put_back()` make a test leave no trace.
@@ -31,7 +32,8 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
   A change in `viewer/app.js` gets a story there. It is in the project root: the server serves only `viewer/`.
 - `config.json` the active brain, a key and a model for each brain, the notes folder. Git ignores it.
   A sign-in brain has a model line only (empty: the tool's own default model). The voice lines are `voice` (the
-  default voice), `deepgram_api_key` and `deepgram_voice`.
+  default voice), `deepgram_api_key`, `deepgram_voice`, `elevenlabs_api_key`, `elevenlabs_voice` and
+  `elevenlabs_model`.
 - `~/.jarvis-tools/brain-locks.json` the lock proofs of the sign-in brains: the tool version and the lock recipe
   that a real trap proved. It is outside the project. Jarviz writes it.
 - `~/.jarvis-tools/page-key` the page key (the lock). It is outside the project. The server makes it at the first start.
@@ -42,6 +44,11 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
   change is done. When something breaks, add a check for it.
 - Every API key lives only in `config.json` in the project root. Never in `viewer/`, never in a response,
   never in a log. Never ask the user to paste a key into a chat. They type it into the file.
+- Jarviz reads only the lines named in `server.DEFAULT_CONFIG`. Preflight warns about any other name and about a
+  name that is there twice (`check_config_lines`). It reads the NAMES only: a value is never printed, logged or kept.
+  A name is printed only when it looks like a config word and holds no key (`shown_name`). The names and the keys
+  to hide come from ONE read (`config_lines`): every value of a line whose name has "key" in it counts, also one that
+  a later line overwrote.
 - The server writes to `config.json` in two places only. `write_starter_config` (from `main()`) makes the file
   when there is none, and never writes over one. `save_brain_choice` changes the text of the `"brain"` entry
   and keeps every other character; it reads the new text back before it replaces the file. `load_config` never
@@ -116,18 +123,37 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
 - Tests call the server through `preflight.call` (it signs the call). A call with `key=False` is an outsider.
 - One function speaks: `createSpeaker().speak` in `viewer/core.js`. `?mute=1` makes a tab silent. Open
   test tabs with `?mute=1`.
-- The Deepgram key is a key like the others: only in `config.json`, never in the page. The page asks the server
-  for audio (`POST /voice/speak`), the server asks Deepgram (`voices.speak`) and gives the bytes back. A voice call
-  never follows a redirect, and an error text loses the key before it is cut (`voices.scrub_key`).
+- The key of a server voice (Deepgram, ElevenLabs) is a key like the others: only in `config.json`, never in the
+  page. The page asks the server for audio (`POST /voice/speak`), the server asks the provider (`voices.speak`) and
+  gives the bytes back. A voice call never follows a redirect, and an error text loses the key before it is cut
+  (`voices.scrub_key`). What can travel on (`describe`, a `VoiceError`, a probe text) loses EVERY key of
+  `config.json` (`voices.configured_keys`, every `..._api_key` line), not only the voice's own.
+- A voice key is sent only when it is a header-safe text (`KEY_TEXT_RE`: printable ASCII, no space) and when it
+  equals, holds or is held by no key of another line (`voice_key_copied`): never a key of another provider. Else
+  no request is sent, and the refusal names the lines, never a value. No exception text from building or sending a
+  request travels on: only its name (`voice_not_sent`).
+- A new server voice is one entry in `VOICES` (`voices.py`), its key line and voice line(s) in `config.json`, and
+  its own call (`_CALLS`).
+- ElevenLabs: the key is `elevenlabs_api_key`, and it travels in the `xi-api-key` header only. An ElevenLabs request
+  never carries `Authorization`, a Deepgram request never `xi-api-key`. The voice id (`elevenlabs_voice`) goes into
+  the address PATH: it must pass `VOICE_ID_RE` and hold no key of any line, else no request is sent (the same
+  for `deepgram_voice`). The model id (`elevenlabs_model`) must pass `ENGINE_ID_RE` the same way. The refusal
+  names the line, never the key. Every request names its model and asks for
+  `ELEVENLABS_FORMAT`. A code word of ElevenLabs decides before the HTTP status (`ELEVENLABS_CODES`).
+- The default ElevenLabs voice is an Infinity voice (Eldrin), because the Default voices expire on 2026-12-31.
+- `/voice/speak` needs `voice`: the name of a server voice (`voices.SERVER_VOICES`). Anything else is
+  `bad_speak_request`, and no provider is asked. A line keeps the voice it started with (`job.voice` in
+  `createSpeaker`): every part of it is asked for with that voice, also after a switch. It keeps its generation
+  too (`job.generation`): after a `setVoice` it counts no failure and no good part for the new choice.
 - The voice choice lives in the browser (`localStorage`, `jarviz_voice`). `POST /voice` only judges a wish and
   answers with a line. The server never writes the choice into `config.json`: it writes that file in two places
   only. The `"voice"` line there is the default voice, and only the user types it.
-- `createSpeaker().speak` plays the Deepgram audio part by part, or uses the browser voice. A muted tab asks for NO
-  audio: every request to Deepgram costs money. When a part fails, the browser voice says the rest, so no line is
-  lost. `/voice/speak` takes at most `MAX_SPEAK_CHARS`, and `voices.split_text` cuts the text (one Deepgram
-  request takes at most 2000 characters).
-- Preflight proves the Deepgram voice like a brain: one very small real request on the same path as `speak()`
-  (`voices.probe`), and only when there is a key. Without a key the route must refuse cleanly.
+- `createSpeaker().speak` plays the audio of a server voice part by part, or uses the browser voice. A muted tab asks
+  for NO audio: every request to a server voice costs money. When a part fails, the browser voice says the whole line
+  again from its start (the page does not know where the server cut it), so no line is lost. `/voice/speak` takes at most `MAX_SPEAK_CHARS`, and `voices.split_text` cuts the text (one request
+  takes at most `MAX_TEXT_CHARS`: under Deepgram's 2000 characters and under every ElevenLabs model).
+- Preflight proves each server voice like a brain: one very small real request on the same path as `speak()`
+  (`voices.probe`), and only when that voice has a key. Without a key the route must refuse cleanly.
 - One owner for focus: only `Focus` in `viewer/app.js` moves the camera or changes which stars are lit.
 - One door for new notes: `Galaxy.birth_note` in `server.py` and `addNote` in `viewer/app.js`.
 - Every node id equals its index in `GRAPH.nodes`.

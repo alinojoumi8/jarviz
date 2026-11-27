@@ -7,7 +7,9 @@ Real calls against the running system. No mocks. The exit code is 0 only when no
 """
 from __future__ import annotations
 
+import collections
 import contextlib
+import difflib
 import email.message
 import hashlib
 import io
@@ -122,7 +124,8 @@ console.log(JSON.stringify({
            Core.matchBrainSwitch('switch to decaf')],
   // null: the served core.js has no voice-switch route (check_voice_rules says "not checked", and fails).
   voices: typeof Core.matchVoiceSwitch === 'function'
-    ? ['switch voice to deepgram', 'use the browser voice', 'switch brain to deepseek', 'what is your voice like']
+    ? ['switch voice to deepgram', 'use the browser voice', 'switch voice to eleven labs', 'switch brain to deepseek',
+       'what is your voice like']
         .map(s => { const hit = Core.matchVoiceSwitch(s); return hit === undefined ? null : hit; })
     : null,
   teardowns: ['reverse engineer igloo dot inc', 'tear down linear.app', 'how does stripe.com do that', 'what is example.com built with',
@@ -413,7 +416,8 @@ def check_brains_offline(report: Report) -> None:
 
 
 def check_voices_offline(report: Report) -> None:
-    name = "The voice offline checks pass (the Deepgram request, its errors, no redirect, the key removed, the split)"
+    name = ("The voice offline checks pass (the Deepgram and ElevenLabs requests, their errors, no redirect, the key "
+            "removed, the split)")
     try:
         results = voices.offline_checks()
     except Exception as error:          # noqa: BLE001 - a check that stops says so, it never crashes preflight
@@ -430,34 +434,37 @@ def voice_keys(config: dict) -> list[bytes]:
 
 
 def check_voice_key(report: Report, ctx: dict) -> None:
-    """The Deepgram voice, when config.json has its key: one real, very small request on the same path as /voice/speak
-    (voices.probe), for the key and for the voice id. No key: a note only."""
-    deepgram = voices.describe(ctx["config"], "deepgram")
-    if not deepgram["has_key"]:
-        print("   note  The Deepgram key was not checked: config.json has none yet.", flush=True)
-        return
-    key_name = "The Deepgram key in config.json is valid (one real call)"
-    voice_name = "The Deepgram voice id in config.json is one the key can use"
-    try:
-        result = voices.probe(ctx["config"])
-    except Exception as error:          # noqa: BLE001 - a check that stops says so, it never crashes preflight
-        report.add(FAIL, key_name, f"NOT VERIFIED: the check stopped ({type(error).__name__})")
-        return
-    (key_ok, key_detail), (voice_ok, voice_detail) = result["key"], result["voice"]
-    report.add(PASS if key_ok else FAIL, key_name, short(key_detail, 240))     # None ("not proven") is no pass
-    if voice_ok is None:
-        report.add(WARN, voice_name, f"Not checked: it needs a valid key first. The voice id is {deepgram['model']!r}.")
-    else:
-        report.add(PASS if voice_ok else FAIL, voice_name, short(voice_detail, 400))
+    """Each server voice (Deepgram, ElevenLabs) whose key is in config.json: one real, very small request on the same
+    path as /voice/speak (voices.probe), for the key and for the voice lines. A voice with no key: a note only."""
+    for name in voices.SERVER_VOICES:
+        spec, seen = voices.VOICES[name], voices.describe(ctx["config"], name)
+        label = spec["label"]
+        if not seen["has_key"]:
+            print(f"   note  The {label} key was not checked: config.json has none yet.", flush=True)
+            continue
+        key_name = f"The {label} key in config.json is valid (one real call)"
+        voice_name = (f"The {label} voice id and model id in config.json are ones the key can use"
+                      if "engine_key" in spec else f"The {label} voice id in config.json is one the key can use")
+        try:
+            result = voices.probe(ctx["config"], name)
+        except Exception as error:      # noqa: BLE001 - a check that stops says so, it never crashes preflight
+            report.add(FAIL, key_name, f"NOT VERIFIED: the check stopped ({type(error).__name__})")
+            continue
+        (key_ok, key_detail), (voice_ok, voice_detail) = result["key"], result["voice"]
+        report.add(PASS if key_ok else FAIL, key_name, short(key_detail, 240))     # None ("not proven") is no pass
+        if voice_ok is None:
+            report.add(WARN, voice_name, f"Not checked: it needs a valid key first. The voice id is {seen['model']!r}.")
+        else:
+            report.add(PASS if voice_ok else FAIL, voice_name, short(voice_detail, 400))
 
 
 def check_voice_routes(report: Report, ctx: dict) -> None:
     """The voice routes through the live server: /status names the voices, /voice judges a wish and saves nothing,
-    /voice/speak gives mp3 bytes (with a key) or a clean JSON refusal (without one), and never shows a key. A bad
-    request is refused before any call to Deepgram, so those checks cost nothing."""
+    /voice/speak gives mp3 bytes (with a key) or a clean JSON refusal (without one) for each server voice, and never
+    shows a key. A bad request is refused before any provider is asked, so those checks cost nothing."""
     name = "The voice routes answer: /status, /voice and /voice/speak"
     config = ctx["config"]
-    deepgram = voices.describe(config, "deepgram")
+    served = {voice: voices.describe(config, voice) for voice in voices.SERVER_VOICES}
     keys, trouble, answers = voice_keys(config), [], []
 
     def post(path: str, body: dict, timeout: float = 60) -> tuple[int, dict, bytes, dict]:
@@ -492,9 +499,10 @@ def check_voice_routes(report: Report, ctx: dict) -> None:
                        f"{short(json.dumps(block), 160)}")
 
     # /voice: it judges the wish
-    refused("/voice", {"name": "eleven labs"}, 400, "unknown_voice")
-    for said, wanted in (("the browser voice", "browser"), ("Deepgram", "deepgram")):
-        if wanted == "deepgram" and not deepgram["has_key"]:
+    refused("/voice", {"name": "kazoo"}, 400, "unknown_voice")
+    for said, wanted in (("the browser voice", "browser"), ("Deepgram", "deepgram"), ("ElevenLabs", "elevenlabs"),
+                         ("eleven labs", "elevenlabs")):
+        if wanted != "browser" and not served[wanted]["has_key"]:
             refused("/voice", {"name": said}, 409, "voice_no_key")
             continue
         got, _, _, parsed = post("/voice", {"name": said})
@@ -502,37 +510,50 @@ def check_voice_routes(report: Report, ctx: dict) -> None:
                     or not isinstance(parsed.get("answer"), str) or not parsed["answer"].strip()):
             trouble.append(f"POST /voice {said!r} gave HTTP {got} {parsed.get('error')!r}, not the {wanted} voice")
 
-    # /voice/speak: a bad request is refused before Deepgram is asked (no key needed, no cost)
-    for body in ({"text": ""}, {"text": "   "}, {"text": 42}, {"text": "OK.", "part": 1}, {"text": "OK.", "part": -1},
-                 {"text": "OK.", "part": "0"}, {"text": "OK.", "part": 1.5}, {"text": "OK.", "part": True},
-                 {"text": "OK.", "part": None}):
+    # /voice/speak: a bad request is refused before any provider is asked (no key needed, no cost). The voice is
+    # required, and it must be a server voice.
+    for body in ({"text": "OK."}, {"text": "OK.", "voice": None}, {"text": "OK.", "voice": 5},
+                 {"text": "OK.", "voice": ["deepgram"]}, {"text": "OK.", "voice": ""}, {"text": "OK.", "voice": "browser"},
+                 {"text": "OK.", "voice": "kazoo"}):
         refused("/voice/speak", body, 400, "bad_speak_request")
+    for voice in voices.SERVER_VOICES:
+        for body in ({"text": ""}, {"text": "   "}, {"text": 42}, {"text": "OK.", "part": 1}, {"text": "OK.", "part": -1},
+                     {"text": "OK.", "part": "0"}, {"text": "OK.", "part": 1.5}, {"text": "OK.", "part": True},
+                     {"text": "OK.", "part": None}):
+            refused("/voice/speak", {**body, "voice": voice}, 400, "bad_speak_request")
     two = "OK. " + "x" * voices.MAX_TEXT_CHARS        # two pieces: "OK." and a long word that is never sent
     if len(voices.split_text(server.clean_text(two, server.MAX_SPEAK_CHARS))) != 2:
         trouble.append("the test text for two pieces does not split into two")
-    if not deepgram["has_key"]:
-        refused("/voice/speak", {"text": "OK."}, 503, "voice_key_missing")
-        refused("/voice/speak", {"text": two, "part": 5}, 400, "bad_speak_request")
-    else:                               # two real requests of "OK." each: the smallest text that can prove the path
-        for body, parts in (({"text": "OK."}, "1"), ({"text": two, "part": 0}, "2")):
+    said = []
+    for voice, seen in served.items():
+        label = voices.VOICES[voice]["label"]
+        if not seen["has_key"]:
+            refused("/voice/speak", {"text": "OK.", "voice": voice}, 503, "voice_key_missing")
+            refused("/voice/speak", {"text": two, "part": 5, "voice": voice}, 400, "bad_speak_request")
+            said.append(f"{label}: no key, the route refuses cleanly (voice_key_missing)")
+            continue
+        # two real requests of "OK." each: the smallest text that can prove the path
+        for body, parts in (({"text": "OK.", "voice": voice}, "1"), ({"text": two, "part": 0, "voice": voice}, "2")):
             got, headers, raw, parsed = post("/voice/speak", body)
             if got and (got != 200 or headers.get("content-type") != "audio/mpeg" or not voices.looks_like_mp3(raw)
                         or headers.get("x-jarviz-parts") != parts or headers.get("cache-control") != "no-store"):
                 trouble.append(f"POST /voice/speak {short(json.dumps(body), 40)} gave HTTP {got} "
                                f"{headers.get('content-type')!r}, parts {headers.get('x-jarviz-parts')!r}"
                                + (f": {short(parsed.get('answer') or '', 160)}" if parsed else ""))
-        refused("/voice/speak", {"text": two, "part": 5}, 400, "bad_speak_request")
+        refused("/voice/speak", {"text": two, "part": 5, "voice": voice}, 400, "bad_speak_request")
+        said.append(f"{label}: mp3 ({seen['model']}), 1 and 2 pieces")
     if any(key in raw for key in keys for raw in answers):
-        trouble.append("AN ANSWER SHOWS THE DEEPGRAM KEY")
+        trouble.append("AN ANSWER SHOWS A VOICE KEY")
     if trouble:
         report.add(FAIL, name, short("; ".join(trouble), 600))
-    elif not deepgram["has_key"]:
-        report.add(PASS, name, "no Deepgram key: the route refuses cleanly (voice_key_missing). /status and /voice "
-                               "answer, and a bad request is refused before Deepgram is asked.")
-        print('   note  To use the Deepgram voice, type its key into "deepgram_api_key" in config.json, then say '
-              '"switch voice to Deepgram".', flush=True)
-    else:
-        report.add(PASS, name, f"mp3 from Deepgram ({deepgram['model']}), 1 and 2 pieces; bad requests refused")
+        return
+    report.add(PASS, name, "; ".join(said) + ". /status and /voice answer, and a bad request is refused before any "
+                                            "provider is asked.")
+    for voice, seen in served.items():
+        if not seen["has_key"]:
+            spec = voices.VOICES[voice]
+            print(f'   note  To use the {spec["label"]} voice, type its key into "{spec["key"]}" in config.json, then '
+                  f'say "switch voice to {spec["label"]}".', flush=True)
 
 
 def remove_fixture(notes_dir: Path, receipt: dict) -> tuple[bool, str]:
@@ -1861,6 +1882,121 @@ def probe_refused(probe: str, status: int, body: bytes) -> bool:
     return probe.partition("?")[0] == "/" and status == 200 and b"<title>Jarviz</title>" in body
 
 
+# A line name is shown only when it looks like a config word: letters and "_" only (no line of DEFAULT_CONFIG has a
+# digit: check_config_lines proves it every run), at most 40 characters, no part between two "_" longer than 20. A
+# key pasted as a name (hex, "sk_...") is not shown, and neither is a name that holds a key of config.json.
+CONFIG_WORD_RE = re.compile(r"[A-Za-z_]{1,40}")
+CONFIG_WORD_PART = 20
+NOT_PLAIN = "a line whose name is not a plain name"
+
+
+def config_lines(text: str) -> tuple[list, list[str]] | None:
+    """From ONE read of a config text: the names of its top-level lines, in file order, each time it is there
+    (json.loads keeps only the last of two lines with the same name, so the first is lost without a word), and the
+    texts that a shown name must not hold. Those are every text value of a line whose name has "key" in it, each time
+    it is there (a value that a later line overwrote, or the value of a misspelt key line, is a key too), and the
+    keys that load_config would see (voices.configured_keys). The values stay in memory: never printed or logged.
+    None for a text that is not one JSON object."""
+    class Lines(list):
+        pass
+    try:
+        top = json.loads(text, object_pairs_hook=Lines)
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(top, Lines):
+        return None
+    secret = {value.strip() for name, value in top if isinstance(name, str) and "key" in name.lower()
+              and isinstance(value, str) and value.strip() and value.strip() != voices.KEY_PLACEHOLDER}
+    secret.update(voices.configured_keys(dict(top)))           # the last line of a name wins, as in load_config
+    return [name for name, _ in top], sorted(secret, key=len, reverse=True)
+
+
+def shown_name(name, keys) -> str | None:
+    """The line name as it may be printed, or None: a name that is no config word, or that equals or holds one of
+    `keys` (the keys of config.json), may be a pasted key."""
+    if not isinstance(name, str) or not CONFIG_WORD_RE.fullmatch(name):
+        return None
+    if any(len(part) > CONFIG_WORD_PART for part in name.split("_")):
+        return None
+    if any(key and key in name for key in keys):
+        return None
+    return name
+
+
+def config_name_trouble(names: list, known, keys=()) -> list[str]:
+    """What is wrong with the line names of config.json: a name that Jarviz does not read (with the known name it is
+    close to), and a name that is there more than once (the last line wins). A name of Jarviz is shown as it is; any
+    other name only through shown_name, and only a shown name gets a "did you mean". [] when every line is fine."""
+    known = sorted(known)
+    counts = collections.Counter(names)
+    problems = []
+    for name in dict.fromkeys(names):                   # file order, each name once
+        ours = name in known                            # a name from the code: no secret
+        plain = name if ours else shown_name(name, keys)
+        shown = f'"{plain}"' if plain is not None else NOT_PLAIN
+        if counts[name] > 1:
+            problems.append(f"{shown} is there {counts[name]} times: only the last one counts")
+        if not ours:
+            close = difflib.get_close_matches(plain, known, n=1) if plain is not None else []
+            problems.append(f"{shown} is not a line that Jarviz reads, so it is ignored"
+                            + (f' (did you mean "{close[0]}"?)' if close else ""))
+    return problems
+
+
+def config_name_rule_trouble(known) -> list[str]:
+    """The name rule, proved on made-up names: [] when it holds. Every name of Jarviz must pass it (else a misspelt
+    one would be hidden), and no name that may be a key may ever be printed."""
+    trouble = [f"the name rule hides {name!r}, a line that Jarviz reads" for name in known if shown_name(name, ()) != name]
+    letters = "qwertyzxcvasdfgh"                         # a made-up key of letters only: only the key rule hides it
+    hexed, shaped = "0123456789abcdef" * 2 + "01234567", "sk_" + "0123456789abcdef" * 3
+    split = "key_0123456789_abcdef0123"                  # short parts: only the digit rule hides it
+    for name in (letters, f"deepgram_{letters}_voice", hexed, shaped, split, "ab_" * 14, "a_" + "b" * 21):
+        said = "; ".join(config_name_trouble([name, name], known, (letters,)))
+        if name in said or letters in said or said.count(NOT_PLAIN) != 2 or "did you mean" in said:
+            trouble.append("the name rule shows a name that may be a key")
+            break
+    for name, close in (("elevenlabs_labs_api_key", "elevenlabs_api_key"), ("deepgramvoice", "deepgram_voice"),
+                        ("Model", "model")):
+        if config_name_trouble([name], known, (letters,)) != [
+                f'"{name}" is not a line that Jarviz reads, so it is ignored (did you mean "{close}"?)']:
+            trouble.append(f"the name rule does not name {name!r} with its close name")
+    return trouble
+
+
+def check_config_lines(report: Report, ctx: dict) -> None:
+    """config.json has only lines that Jarviz reads, each name once. load_config copies only the names of
+    server.DEFAULT_CONFIG (build.py reads "notes_dir", which is one of them), so a misspelt name is ignored without a
+    word, and of a name that is there two times only the last line counts. Only NAMES come out of the file here: a
+    value is never printed, logged or kept, and a name that may be a key is never printed (shown_name). The names and
+    the texts to hide come from ONE read of the file (config_lines). The name rule is proved first, every run
+    (config_name_rule_trouble). A file that cannot be read is the brain check's to report."""
+    name = "config.json has only lines that Jarviz reads, each name once"
+    if ctx["config"].get("_error"):
+        return                          # check_key_and_model says that the file cannot be read: no second fail
+    try:
+        text = server.CONFIG_PATH.read_text(encoding="utf-8-sig")
+    except FileNotFoundError:
+        report.add(PASS, name, "there is no config.json yet: Jarviz runs on its defaults")
+        return
+    except (OSError, ValueError) as error:          # ValueError: a byte that is not UTF-8
+        report.add(WARN, name, f"Not checked: config.json could not be read now ({type(error).__name__})")
+        return
+    lines = config_lines(text)                     # the names and the texts to hide come from this ONE read
+    if lines is None:
+        report.add(WARN, name, "Not checked: config.json is not one JSON object now (it changed during the run?)")
+        return
+    names, secret = lines
+    rule = config_name_rule_trouble(server.DEFAULT_CONFIG)
+    if rule:                            # a rule that is broken proves nothing, and might print a key: no names
+        report.add(FAIL, name, "; ".join(rule))
+        return
+    problems = config_name_trouble(names, server.DEFAULT_CONFIG, secret)
+    if problems:
+        report.add(WARN, name, short("; ".join(problems), 500))
+    else:
+        report.add(PASS, name, f"{len(names)} lines, each one Jarviz reads, each name once")
+
+
 def check_config_hidden(report: Report, ctx: dict) -> None:
     name = "config.json is NOT reachable from the browser"
     config = ctx["config"]
@@ -1923,7 +2059,7 @@ def check_other_sites(report: Report) -> None:
         "a teardown cancelled by another website": lambda: call("POST", "/teardown/cancel", {"job": "preflight-no-such-job"},
                                                                 extra_headers={"Sec-Fetch-Site": "cross-site"}),
         "a teardown note read by another website": lambda: call("GET", "/teardown/last", extra_headers={"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Dest": "empty"}),
-        # An empty text: it can never reach Deepgram, even if the guard were broken.
+        # An empty text: it can never reach a server voice, even if the guard were broken.
         "a spoken line asked by another website": lambda: call("POST", "/voice/speak", {"text": ""}, extra_headers={"Origin": evil}),
     }
     let_in, silent, unsent = [], [], []
@@ -2364,7 +2500,7 @@ def check_voice_rules(report: Report, ctx: dict) -> None:
     said_voices = result.get("voices")
     if said_voices is None:             # a route that is not there is not checked, and that is no pass
         rules.append("the \"switch voice\" route was not checked: the served core.js has no Core.matchVoiceSwitch")
-    elif said_voices != ["deepgram", "browser", None, None]:
+    elif said_voices != ["deepgram", "browser", "eleven labs", None, None]:
         rules.append(f"the \"switch voice\" route matched the wrong sentences: {said_voices}")
     routes = []
     if result.get("teardowns") != ["igloo.inc", "linear.app", "stripe.com", "example.com", "this", None, None, None,
@@ -2478,6 +2614,7 @@ def main() -> int:
         check_graph(report, ctx)
         check_brains_offline(report)
         check_voices_offline(report)
+        check_config_lines(report, ctx)
         check_brain_locks(report, ctx)          # before the first question goes through the server
         check_chat(report, ctx)
         check_key_and_model(report, ctx)

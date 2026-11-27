@@ -71,22 +71,31 @@ Jarviz has seven brains. One is active. The screen shows it at the top (`brain: 
 
 ## Voice
 
-Jarviz can speak with two voices. The screen shows the one in use at the top (`voice: ...`).
+Jarviz can speak with three voices. The screen shows the one in use at the top (`voice: ...`).
 
 | Voice | What it is | What it needs |
 | --- | --- | --- |
 | browser | The voice of your browser. It is free. | Nothing. |
 | Deepgram | A recorded-quality voice from Deepgram. The start voice is `aura-2-draco-en` (a man, British, calm). | A Deepgram key in `config.json`. |
+| ElevenLabs | A recorded-quality voice from ElevenLabs. The start voice is `6WwXjDDEMyNmFG95zycZ` (Eldrin, a crisp British baritone). The start model is `eleven_flash_v2_5` (fast). | An ElevenLabs key in `config.json`. |
 
-- **Add the key:** make a key at Deepgram (a new account gets free credit). Open `config.json`. Add this line right after the first `{`, with your key between the quotes: `"deepgram_api_key": "YOUR-KEY-HERE",`. Save. No restart.
-- **Switch:** say or type "switch voice to Deepgram". To go back: "switch voice to browser".
-- **The choice stays in that browser.** Another browser starts with the default voice. To make Deepgram the default, add the line `"voice": "deepgram",` to `config.json`.
-- **Another Deepgram voice:** add the line `"deepgram_voice": "aura-2-pandora-en",` (a woman, British, calm). Other names: `aura-2-odysseus-en`, `aura-2-thalia-en`.
-- **Your key stays on your computer.** The page asks Jarviz for the sound. Jarviz asks Deepgram.
-- **It costs money per letter.** Deepgram counts the letters that Jarviz says (about 3 cents for 1,000 letters). A muted test tab asks for no sound, so it costs nothing.
-- **If Deepgram does not answer,** the browser voice says the line. After three failures in a row Jarviz stops asking Deepgram until you switch again.
+- **One line for each name in `config.json`.** When the line is there already (for example with `PUT-YOUR-KEY-HERE`), change only the text between its quotes. Add a line only when it is not there. When a name is there two times, the last line wins: then Jarviz can miss your key. This is true for every line below.
+- **Add the Deepgram key:** make a key at Deepgram (a new account gets free credit). Open `config.json`. Find the line `"deepgram_api_key"` and put your key between its quotes, in place of `PUT-YOUR-KEY-HERE`. No such line? Add this line right after the first `{`, with your key between the quotes: `"deepgram_api_key": "YOUR-KEY-HERE",`. Keep the comma at its end only when another line follows it (a file that holds only `{}` gets the line without the comma). Save. No restart.
+- **Add the ElevenLabs key:** make a key at ElevenLabs. A restricted key needs the permission for Text to Speech. Open `config.json`. Find the line `"elevenlabs_api_key"` and put your key between its quotes, in place of `PUT-YOUR-KEY-HERE`. No such line? Add this line right after the first `{`, with your key between the quotes: `"elevenlabs_api_key": "YOUR-KEY-HERE",`. Keep the comma at its end only when another line follows it (a file that holds only `{}` gets the line without the comma). Save. No restart.
+- **The names must be exact.** `elevenlabs_api_key`, not `elevenlabs_labs_api_key` or `eleven labs api key`. A line with another name is not read. Every line but the last one ends with a comma.
+- **Switch:** say or type "switch voice to Deepgram" or "switch voice to ElevenLabs" ("eleven labs" and "use the ElevenLabs voice" work too). To go back: "switch voice to browser".
+- **The choice stays in that browser.** Another browser starts with the default voice. To make Deepgram the default, set the line `"voice": "deepgram",` in `config.json` (for ElevenLabs: `"voice": "elevenlabs",`).
+- **Another Deepgram voice:** set the line `"deepgram_voice": "aura-2-pandora-en",` (a woman, British, calm). Other names: `aura-2-odysseus-en`, `aura-2-thalia-en`.
+- **Another ElevenLabs voice:** set the line `"elevenlabs_voice": "fnYMz3F5gMEDGMWcH1ex",` (Finley). Other ids: `gOupLcAkjEnguROwi4oS` (Darian), `jSuBIjxMKhqIfb0wCK1F` (Baxter). Or copy the id of a voice from "My Voices" in ElevenLabs. Without the line Jarviz uses Eldrin.
+- **Another ElevenLabs model:** set the line `"elevenlabs_model": "eleven_multilingual_v2",`. Other ids: `eleven_v3`, `eleven_v4`. Without the line Jarviz uses `eleven_flash_v2_5`.
+- **Why Eldrin and not George:** ElevenLabs ends its Default voices (George is one) on 31 December 2026. Eldrin is an Infinity voice: it has no end date.
+- **What goes where.** The page never gets your key. The page asks Jarviz for the sound. Jarviz sends two things to the voice you chose (Deepgram or ElevenLabs), over HTTPS: your key for that voice, and the text to speak. The other voice gets nothing.
+- **It costs money per letter.** Deepgram counts the letters that Jarviz says (about 3 cents for 1,000 letters). ElevenLabs counts them against the credits of your plan. A muted test tab asks for no sound, so it costs nothing.
+- **If the server voice does not answer,** the browser voice says the line. After three failures in a row Jarviz stops asking it until you switch again.
 - **Listening is still the browser's job** (Chrome and Edge only). Deepgram can also listen. That is not built.
-- [ ] Deepgram with a real key: NOT tested. There is no key in `config.json` yet. All Deepgram answers in the tests are made-up ones. After you add the key, run `python preflight.py`: it sends one tiny real request and checks that real sound comes back.
+- [x] Deepgram with a real key: tested on 2026-11-27. `python preflight.py` sent tiny real requests. Real mp3 sound came back from Deepgram (`aura-2-draco-en`), also through `/voice/speak` in 1 and 2 pieces.
+- [x] ElevenLabs with a real key: tested on 2026-11-27. `python preflight.py` sent tiny real requests. Real mp3 sound came back from ElevenLabs (Eldrin, `eleven_flash_v2_5`), also through `/voice/speak` in 1 and 2 pieces.
+- [ ] The two server voices in the page: NOT tested. Nobody listened to them in a browser yet. The page rules are proved in Node with a fake page (`page_checks.js`).
 
 ## Part One: the foundation
 
@@ -122,7 +131,7 @@ Still to prove:
 
 Proven with the real brain and a real public site (igloo.inc):
 
-- [x] Last run: `PREFLIGHT: 39 pass, 1 fail, 0 warn` and `DRILL: 97 pass, 0 fail`. The one fail is the OpenAI account: it has no credit (see "Brains"). Preflight has 40 checks now.
+- [x] Last run: `PREFLIGHT: 44 pass, 1 fail, 0 warn` and `DRILL: 97 pass, 0 fail`. The one fail is the OpenAI account: it has no credit (see "Brains"). Preflight has 45 checks now.
 - [ ] The page in the test browser was not opened in the last run: the test browser lost its unlock. The page rules (`page_checks.js`, 108 rules) ran against the files that the server gives out.
 - [x] The drill passed with a hidden browser, and also with the Chrome window on screen (`python drill.py --visible`). The snapshot from the visible window is a real picture.
 - [x] A full teardown in about one minute: 96 files, 14.7 MB, Three.js r165, GSAP 3.12.5, postprocessing 6.35.5.
@@ -249,6 +258,7 @@ Not proven:
   - Codex and `agy` update themselves. Jarviz proves the lock again for each new version. Between an update and that proof no question is answered. But a new version can add a tool that the trap does not know.
   - A teardown with a sign-in brain gives the text of a strange website to a coding agent. The lock is what stands between them. If you want the smallest risk, write teardowns with a key brain.
 - [ ] The sign-in brains on a Mac or Linux. The code has the paths for it, but it ran only on this Windows computer.
+- [ ] The ElevenLabs start voice on a free plan. Eldrin is a voice of the Voice Library, and ElevenLabs says that some voices there need a paid plan. Whether a free plan may use it through the API is not known. If ElevenLabs refuses it, Jarviz says that your plan does not allow that voice, and `python preflight.py` names the line to fix. Then copy the id of a voice from "My Voices" into `elevenlabs_voice`.
 - [ ] The clean Chrome and your private network. Jarviz checks the address of the PAGE. It does not see the connections that Chrome makes. There are two cases:
   - The page itself moves to a private address. Jarviz sees that and stops the job. But Chrome has already sent the request that went there. Jarviz reads nothing from that page.
   - The page stays on its public address and asks for things on your home network (a picture, a script, a data call). Jarviz does not see these requests at all, and the job goes on. The same is true when a public name points at a private address only for Chrome.

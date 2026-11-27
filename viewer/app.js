@@ -635,7 +635,8 @@
   }
 
   // ------------------------------------------------------------ the voices
-  // The browser voice, or a server voice (Deepgram): the server makes its audio, its key never leaves the server.
+  // The browser voice, or a server voice (Deepgram, ElevenLabs): the server makes its audio, its key never leaves the
+  // server.
   // The page keeps the choice (localStorage, one key). An old server sends no `voice` in /status: then the page
   // has the browser voice only, no chip, and no voice route.
 
@@ -697,10 +698,11 @@
     if (trouble.gaveUp) showVoice();
   }
 
-  // One part of the audio of a text. The server cuts the text: the same whole text goes with every part.
-  async function fetchAudio(text, part) {
+  // One part of the audio of a text, in the server voice that the line started with (the speaker names it). The
+  // server cuts the text: the same whole text goes with every part.
+  async function fetchAudio(text, part, voice) {
     const response = await fetch('/voice/speak', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text, part }),
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text, part, voice }),
     });
     const type = (response.headers && response.headers.get('Content-Type')) || '';
     if (!response.ok || !/^audio\//i.test(type)) {

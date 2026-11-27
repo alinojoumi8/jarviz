@@ -143,11 +143,19 @@ LINES = {
     "locked": "This page has lost its key, sir. Close it and start me again with start-jarviz.bat.",
     # The voice Jarviz speaks with (voices.py). The page keeps the choice; the server only judges it.
     "voice_switched": "Very good, sir. I shall speak with the {voice} voice.",
-    "no_such_voice": "I know no voice by that name, sir. I have the browser voice and the Deepgram voice.",
+    "no_such_voice": "I know no voice by that name, sir. I have the browser voice, the Deepgram voice and the "
+                     "ElevenLabs voice.",
     "voice_no_key": "The {voice} voice has no key yet, sir. Type it into config.json, on the line \"{key_line}\".",
     "voice_bad_key": "The {voice} key in config.json was refused, sir. Please check it.",
+    "voice_key_text": "The {voice} key in config.json holds a character that cannot be sent, sir: a space, a line "
+                      "break, a tab or a letter outside plain ASCII. Please type it again on the line \"{key_line}\".",
+    "voice_key_copied": "The {voice} key in config.json is the key of another line, sir, so I sent nothing. {reason}",
+    "voice_not_sent": "I could not send the request to the {voice} voice, sir. {reason}",
     "voice_no_credit": "The {voice} account has no credit left, sir.",
     "voice_no_model": "The voice named in config.json, {model}, is not one {voice} knows, sir.",
+    "voice_not_allowed": "Your {voice} plan does not allow that voice or model, sir. {reason}",
+    "voice_no_engine": "The {voice} model named in config.json, {engine}, is not one I can use, sir. Kindly check "
+                       "the line \"{model_line}\".",
     "voice_busy": "The {voice} voice is busy, sir. Give it a moment.",
     "voice_offline": "I cannot reach the {voice} voice, sir. The internet connection may be down.",
     "voice_error": "The {voice} voice returned an error, sir. {reason}",
@@ -205,8 +213,9 @@ VIEWER_ROOT = build.VIEWER_DIR.resolve()
 CONFIG_PATH = build.CONFIG_PATH
 KEY_PLACEHOLDER = brains.KEY_PLACEHOLDER
 # config.json: the active brain, a key and a model for every brain (see brains.py; a sign-in brain has a model line
-# only, empty for the tool's own default), the voice with a key and a voice id for Deepgram (see voices.py), the notes
-# folder. An old config.json without the voice lines gets their defaults.
+# only, empty for the tool's own default), the voice with a key and a voice id for each server voice (Deepgram,
+# ElevenLabs; ElevenLabs also a model id: see voices.py), the notes folder. An old config.json without the voice lines
+# gets their defaults.
 DEFAULT_CONFIG = {**brains.default_config(), **voices.default_config(), "notes_dir": build.DEFAULT_NOTES_DIR}
 CONFIG_LOCK = threading.Lock()
 # Which spoken line goes with which brain problem (the codes come from brains.BrainError).
@@ -223,9 +232,10 @@ BRAIN_LINES = {
 VOICE_LINES = {
     "voice_key_missing": "voice_no_key", "voice_key_invalid": "voice_bad_key", "voice_no_access": "voice_bad_key",
     "voice_no_credit": "voice_no_credit", "voice_not_found": "voice_no_model", "voice_busy": "voice_busy",
-    "voice_unreachable": "voice_offline",
+    "voice_unreachable": "voice_offline", "voice_not_allowed": "voice_not_allowed",
+    "voice_model_not_found": "voice_no_engine", "voice_key_bad_text": "voice_key_text",
+    "voice_key_copied": "voice_key_copied", "voice_not_sent": "voice_not_sent",
 }
-SERVER_VOICE = "deepgram"       # the one voice the server speaks with (/voice/speak). The browser voice is the page's.
 MAX_SPEAK_CHARS = 6000          # a cost guard: /voice/speak cuts a longer text here, before it splits it into requests
 
 RETRIEVE_TOP = 6                # notes handed to the brain with each question
@@ -1352,8 +1362,9 @@ def brain_route(payload: dict) -> tuple[int, dict]:
 
 
 def voice_route(payload: dict) -> tuple[int, dict]:
-    """Judge a wish for another voice: {"name": "deepgram"}. The page keeps the choice in the browser. The server
-    saves nothing: it writes config.json in two places only (write_starter_config, save_brain_choice)."""
+    """Judge a wish for another voice: {"name": "eleven labs"} (voices.resolve_name). The page keeps the choice in the
+    browser. The server saves nothing: it writes config.json in two places only (write_starter_config,
+    save_brain_choice)."""
     wanted = voices.resolve_name(clean_text(payload.get("name"), 60))
     if wanted is None:
         return 400, reply(LINES["no_such_voice"], ok=False, error="unknown_voice")
@@ -1365,26 +1376,33 @@ def voice_route(payload: dict) -> tuple[int, dict]:
 
 
 def voice_speak_route(payload: dict) -> tuple:
-    """{"text": ..., "part": 0}: the mp3 of piece number `part` of the text, in the Deepgram voice of config.json. The
-    text is cut into pieces that each fit one request (voices.split_text). The header X-Jarviz-Parts says how many
-    there are, so the page can ask for the next one. A refusal is JSON with a line, and never holds the key."""
+    """{"text": ..., "part": 0, "voice": "elevenlabs"}: the mp3 of piece number `part` of the text, in the server voice
+    that `voice` names (voices.SERVER_VOICES), with its lines of config.json. `voice` is required: the page names the
+    voice its line started with. The text is cut into pieces that each fit one request (voices.split_text). The
+    header X-Jarviz-Parts says how many there are, so the page can ask for the next one. A refusal is JSON with a
+    line, and never holds the key. A bad request is refused before any provider is asked."""
+    name = payload.get("voice")
     text = clean_text(payload.get("text"), MAX_SPEAK_CHARS)        # one line: the sentence marks stay
     part = payload.get("part", 0)
     pieces = voices.split_text(text)
-    if isinstance(part, bool) or not isinstance(part, int) or not 0 <= part < len(pieces):
+    if (not isinstance(name, str) or name not in voices.SERVER_VOICES
+            or isinstance(part, bool) or not isinstance(part, int) or not 0 <= part < len(pieces)):
         return 400, reply(LINES["speak_bad_request"], ok=False, error="bad_speak_request")
     try:
-        audio, kind = voices.speak(load_config(), pieces[part], SERVER_VOICE)
+        audio, kind = voices.speak(load_config(), pieces[part], name)
     except voices.VoiceError as error:              # 503 like a brain that cannot answer (chat_route)
         return 503, reply(voice_line(error), ok=False, error=error.code, detail=error.detail)
     return 200, audio, kind, (("X-Jarviz-Parts", str(len(pieces))),)
 
 
 def voice_line(error: voices.VoiceError) -> str:
-    """What Jarviz says about a voice problem. The detail lost the key in voices.VoiceError already."""
+    """What Jarviz says about a voice problem. It names the config.json lines of the voice that failed (error.name).
+    The detail, the voice id and the model id lost the key in voices.VoiceError already."""
     reason = (error.detail or "No details were given").rstrip(".") + "."
+    spec = voices.VOICES.get(error.name, {})
     return LINES[VOICE_LINES.get(error.code, "voice_error")].format(
-        voice=error.label, model=error.model, reason=reason, key_line=voices.VOICES[SERVER_VOICE]["key"])
+        voice=error.label, model=error.model, engine=error.engine, reason=reason,
+        key_line=spec.get("key", ""), model_line=spec.get("engine_key", ""))
 
 
 def search_route(query: dict) -> tuple[int, dict]:

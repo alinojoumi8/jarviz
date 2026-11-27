@@ -44,10 +44,11 @@
   const MAX_PARTS = 64;     // a guard against a strange X-Jarviz-Parts header
 
   /* The speaker. env = { synth, Utterance, getSearch, pickVoice, onStart, onEnd,
-                          fetchAudio(text, part) -> Promise<{ blob, parts }>, Audio, createObjectURL, revokeObjectURL,
-                          onTrouble({ answer, tell, gaveUp }) }
-     Two voices behind one speak(): "browser" (speechSynthesis) and a server voice ("deepgram"): the server turns the
-     text into audio, part by part, and the page plays the parts in order. */
+                          fetchAudio(text, part, voice) -> Promise<{ blob, parts }>, Audio, createObjectURL,
+                          revokeObjectURL, onTrouble({ answer, tell, gaveUp }) }
+     Two kinds of voice behind one speak(): "browser" (speechSynthesis) and a server voice ("deepgram", "elevenlabs"):
+     the server turns the text into audio, part by part, and the page plays the parts in order. A line keeps the voice
+     it started with: every part of it is asked for with that voice, also after a switch in the middle of the line. */
   function createSpeaker(env) {
     let unlocked = false;
     let waiting = null;     // a line asked for before the first click
@@ -56,6 +57,7 @@
     let failures = 0;       // server-voice lines that failed in a row
     let told = false;       // the trouble line was shown since the last part that played well
     let gaveUp = false;     // VOICE_GIVE_UP failures in a row: the server voice is not asked until setVoice
+    let generation = 0;     // a new number for every setVoice: a job counts only for the choice it started with
 
     const serverVoice = () => voice !== 'browser' && !gaveUp && Boolean(env.fetchAudio && env.Audio && env.createObjectURL);
 
@@ -90,9 +92,11 @@
       return true;
     }
 
-    // The server voice: part 0 first. While a part plays, the next one is asked for, so there is no gap.
+    // The server voice: part 0 first. While a part plays, the next one is asked for, so there is no gap. The job
+    // keeps the voice of this moment (job.voice): a later setVoice does not change the parts of this line. It keeps
+    // its generation too: after a setVoice its parts no longer count for the failures of the new choice.
     function speakAudio(line) {
-      const job = { audioJob: true, line, parts: 1, started: false, audio: null, url: null, ahead: null };
+      const job = { audioJob: true, line, voice, generation, parts: 1, started: false, audio: null, url: null, ahead: null };
       current = job;
       fetchPart(job, 0).then(outcome => playPart(job, 0, outcome));
       return true;
@@ -101,7 +105,11 @@
     // One part's audio as an outcome that never fails: { ok: { blob, parts } } or { error }.
     function fetchPart(job, part) {
       let asked;
-      try { asked = Promise.resolve(env.fetchAudio(job.line, part)); } catch (error) { asked = Promise.reject(error); }
+      try {
+        asked = Promise.resolve(env.fetchAudio(job.line, part, job.voice));
+      } catch (error) {
+        asked = Promise.reject(error);
+      }
       return asked.then(ok => ({ ok }), error => ({ error }));
     }
 
@@ -127,8 +135,10 @@
       audio.onended = () => {
         if (!mine()) return;
         release(job);
-        failures = 0;                                     // a part that played well
-        told = false;
+        if (job.generation === generation) {              // a part that played well, of the voice chosen now
+          failures = 0;
+          told = false;
+        }
         if (part + 1 >= job.parts) return finish(job);
         askAhead();
         job.ahead.outcome.then(next => playPart(job, part + 1, next));
@@ -162,13 +172,20 @@
 
     // A part could not be fetched or played: the browser voice says the line at once, so nothing is lost. The page
     // does not know where the server cut the text, so after a part that played, the line is said from its start.
+    // A job of an earlier choice (setVoice came after it started) still hands its line to the browser voice and
+    // shows its line, but it counts no failure for the voice chosen now, and it never gives that voice up.
     function fail(job, error) {
       release(job);
-      failures += 1;
-      const gaveUpNow = failures >= VOICE_GIVE_UP && !gaveUp;
-      if (gaveUpNow) gaveUp = true;
-      const tell = !told;
-      told = true;
+      const ours = job.generation === generation;
+      let gaveUpNow = false;
+      let tell = true;
+      if (ours) {
+        failures += 1;
+        gaveUpNow = failures >= VOICE_GIVE_UP && !gaveUp;
+        if (gaveUpNow) gaveUp = true;
+        tell = !told;
+        told = true;
+      }
       if ((tell || gaveUpNow) && env.onTrouble) {
         env.onTrouble({ answer: error && typeof error.answer === 'string' ? error.answer : '', tell, gaveUp: gaveUpNow });
       }
@@ -183,8 +200,9 @@
       if (env.synth && (env.synth.speaking || env.synth.pending)) env.synth.cancel();
     }
 
-    function setVoice(name) {                             // "browser", or a server voice such as "deepgram"
+    function setVoice(name) {                             // "browser", or a server voice: "deepgram", "elevenlabs"
       voice = typeof name === 'string' && name && name !== 'browser' ? name : 'browser';
+      generation += 1;
       failures = 0;
       told = false;
       gaveUp = false;
@@ -318,16 +336,16 @@
     return null;
   }
 
-  // "Switch voice to Deepgram", "use the browser voice", "speak with Deepgram" -> the name that was said.
-  // With the word "voice" any name is taken. Without it only the names in VOICE_NAMES, and the sentence must end
-  // there. A sentence that matchBrainSwitch takes is never a voice switch. The server resolves the name.
-  const VOICE_NAMES = '(deep\\s?gram(?:\\s+aura)?|aura|browser(?:[\'’]s)?|built[\\s-]?in|normal|default|system|chrome)';
+  // "Switch voice to Deepgram", "use the browser voice", "speak with Deepgram", "switch to ElevenLabs" -> the name that
+  // was said. With the word "voice" any name is taken. Without it only the names in VOICE_NAMES, and the sentence must
+  // end there. A sentence that matchBrainSwitch takes is never a voice switch. The server resolves the name.
+  const VOICE_NAMES = '(deep\\s?gram(?:\\s+aura)?|aura|eleven\\s?labs|11\\s?labs|browser(?:[\'’]s)?|built[\\s-]?in|normal|default|system|chrome)';
   const VOICE_SWITCH = [
     /^(?:switch|change|swap|set)\s+(?:the\s+|your\s+|my\s+)?voices?\s+(?:back\s+)?to\s+(?:the\s+)?(.+?)(?:\s+voice)?$/i,
     /^(?:switch|change|swap)\s+(?:back\s+)?to\s+(?:the\s+|your\s+)?(.+?)\s+voice$/i,
     /^use\s+(?:the\s+|your\s+)?(.+?)\s+voice$/i,
     new RegExp('^(?:speak|talk)\\s+(?:with|in|using)\\s+(?:the\\s+|your\\s+|a\\s+)?' + VOICE_NAMES + '(?:\\s+voice)?$', 'i'),
-    /^(?:switch|change|swap)\s+(?:back\s+)?to\s+(?:the\s+)?(deep\s?gram(?:\s+aura)?|aura)$/i,
+    /^(?:switch|change|swap)\s+(?:back\s+)?to\s+(?:the\s+)?(deep\s?gram(?:\s+aura)?|aura|eleven\s?labs|11\s?labs)$/i,
   ];
   const NO_VOICE_NAME = /^(?:the|your|my|a|an|own|his|her|its|our|their|this|that|same|new|other)$/i;   // "use your voice"
 
