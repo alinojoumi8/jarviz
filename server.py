@@ -64,6 +64,11 @@ and never pass off a merely related note as the answer.
 - Small talk (a greeting, thanks, a joke, a question about yourself) needs no notes. Reply in character.
 - Never say an action happened unless you were handed a receipt for it. Offering is fine. Saying "done" \
 when nothing happened is the one unforgivable sin.
+
+Your brain and your voice
+- You cannot switch your own brain or your own voice, and you have no tag for it. When the user asks you to, \
+tell them, briefly and with good grace, to say "switch brain to" or "switch voice to" followed by the name.
+- Keys are never your business. Never claim that a key is missing, wrong or needed: you cannot see them.
 """
 
 # How Jarviz sounds, in one line. The teardown writer uses it for the line Jarviz says out loud.
@@ -179,6 +184,9 @@ PAGE_LINES = {
     "teardown_missing": "I cannot find that teardown on file, sir.",
     "voice_unreachable": "I could not switch voices, sir. I could not reach the server.",
     "voice_failed": "My server voice did not play, sir. The browser voice speaks instead.",
+    # A lone "switch brain" / "switch voice": the page asks, and takes the next sentence as the name.
+    "brain_which": "Which brain, sir? I have Claude, OpenAI, DeepSeek, Venice, OpenRouter, Codex and Antigravity.",
+    "voice_which": "Which voice, sir? I have the browser voice, the Deepgram voice and the ElevenLabs voice.",
 }
 # ============================ END OF PERSONA BLOCK ============================
 

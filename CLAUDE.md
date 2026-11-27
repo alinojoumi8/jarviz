@@ -224,6 +224,25 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
   The lines that the page says by itself are `PAGE_LINES` in that block. The page gets them with `/status`.
   `viewer/` holds no butler words: `lines` in `viewer/app.js` has plain words for the time before the first answer.
 - Voice routes are checked before the brain. Add a command with `router.add`, do not edit the core.
+- A spoken switch is read in ONE plain form first: `switchText` in `viewer/core.js`. It drops the wake word, a polite
+  start ("can you", "could you", "would you", "will you", "I want you to", "please") and a polite end ("please",
+  "now", "thanks", "thank you", "for me"). Marks inside are spaces, and "2", "two" and "too" stand for "to".
+- Without the word "brain" or "voice", a switch takes only the names in `BRAIN_NAMES` / `VOICE_NAMES`. "switch to"
+  also takes `BRAIN_HEARD` / `VOICE_HEARD`, and "speak with" takes `BROWSER_NAMES`. "use X" takes `BRAIN_NAMES` only:
+  never "use the cloud". `python brains.py` and `python voices.py` prove that the server resolves every name in those
+  lists.
+- A misheard name is an alias in `brains.ALIASES` / `voices.ALIASES`. The server judges the name, never the page.
+  Only a sound-alike that cannot mean another brain or voice may be added. "labs" alone stays unknown.
+- `FINISH_MS` (900) is the one pause that ends a sentence. A switch that still needs its name (`awaitsName`: "switch
+  brain to", "change your voice to", a bare "switch to") waits `HOLD_MS` instead. Nothing else waits longer, and an
+  interrupt word still skips the buffer.
+- A lone "switch brain" / "switch voice" (`matchSwitchAlone`, route `switch-alone`) is answered with `PAGE_LINES`
+  `brain_which` / `voice_which`. Only the NEXT sentence, within `NAME_WAIT_MS`, may answer it, and only with a known
+  name alone (`matchSwitchAnswer`, route `switch-answer`). Any other sentence closes the question and goes its own way.
+- `SPOKEN_SWITCHES` in `preflight.py` and `SPOKEN_BRAIN` / `SPOKEN_VOICE` / `NOT_A_SWITCH` in `page_checks.js` hold the
+  same sentences. A new mishearing that is seen goes into both, and into the aliases.
+- The brain cannot switch itself and has no tag for it. The persona sends the user to "switch brain to ..." /
+  "switch voice to ...", and tells the brain that keys are not its business. That is words, not a lock.
 - A control tag runs only when the user's own sentence asks for that action. Every tag in
   `TAG_HANDLERS` needs an entry in `TAG_INTENT` (`server.py`). Text inside a note can never order an action.
   A sentence that only mentions a website does not ask for a teardown. A sentence about a teardown that is there

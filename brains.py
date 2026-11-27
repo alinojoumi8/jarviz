@@ -115,7 +115,10 @@ ALIASES = {"claude": "anthropic", "anthropic": "anthropic", "opus": "anthropic",
            "openai": "openai", "gpt": "openai", "chatgpt": "openai",
            "deepseek": "deepseek", "venice": "venice", "openrouter": "openrouter",
            "codex": "codex", "codexcli": "codex", "openaicodex": "codex",
-           "antigravity": "antigravity", "antigravitycli": "antigravity", "agy": "antigravity"}
+           "antigravity": "antigravity", "antigravitycli": "antigravity", "agy": "antigravity",
+           # What speech recognition writes for a name ("switch brain to cloud"). Only a sound-alike that cannot mean
+           # another brain: resolve_name is used for a brain switch only.
+           "cloud": "anthropic", "clawed": "anthropic", "clod": "anthropic", "deepsea": "deepseek", "codecs": "codex"}
 
 THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 # A sign-in brain with no model in config.json uses the tool's own default model. describe() then says this word.
@@ -1710,6 +1713,24 @@ def _agy_says(text: str, *steps: str) -> str:
                                                   "duration_seconds": 7.4, "num_turns": 1}})]) + "\n"
 
 
+def _page_names(*lists: str) -> tuple[list[str] | None, str]:
+    """The name lists of viewer/core.js (BRAIN_NAMES, BRAIN_HEARD), read as text: the names that the page's short
+    forms take ("switch to cloud"). None and the reason when the file or a list could not be read: a check that
+    cannot look says so. A list holds quoted texts only."""
+    try:
+        text = Path(__file__).with_name("viewer").joinpath("core.js").read_text("utf-8")
+    except (OSError, ValueError) as error:
+        return None, f"could not look: viewer/core.js could not be read ({type(error).__name__})"
+    names: list[str] = []
+    for name in lists:
+        found = re.search(rf"^\s*const {name} = \[([^\]]*)\];", text, re.MULTILINE)
+        quoted = r"'([^'\\]*)'|\"([^\"\\]*)\""
+        if not found or re.sub(quoted, "", found.group(1)).replace(",", "").strip():
+            return None, f"could not look: viewer/core.js has no plain list {name}"
+        names += [single or double for single, double in re.findall(quoted, found.group(1))]
+    return names, ""
+
+
 def offline_checks() -> list[tuple[str, bool, str]]:
     """Fast checks with fake tools: no real tool starts, no network, the real lock record is never written. They
     prove the logic of the code. The real tools are proved by prove_lock (preflight)."""
@@ -2826,6 +2847,18 @@ def offline_checks() -> list[tuple[str, bool, str]]:
     check("the spoken names reach the sign-in brains",
           [resolve_name(spoken) for spoken in ("Codex", "codex cli", "OpenAI Codex", "Anti Gravity", "agy", "the antigravity brain")]
           == ["codex", "codex", "codex", "antigravity", "antigravity", "antigravity"], "")
+    heard = {"cloud": "anthropic", "Clawed": "anthropic", "clod": "anthropic", "the cloud brain": "anthropic",
+             "deep sea": "deepseek", "Deep Sea": "deepseek", "codecs": "codex",
+             "clouds": None, "cloudy": None, "sea": None, "deep": None, "codec": None, "labs": None, "the": None,
+             "brain": None, "": None}
+    got = {spoken: resolve_name(spoken) for spoken in heard}
+    check("resolve_name: what speech recognition writes for a brain name",
+          got == heard, str({spoken: name for spoken, name in got.items() if heard[spoken] != name}))
+    names, why = _page_names("BRAIN_NAMES", "BRAIN_HEARD")
+    unknown = [name for name in names or [] if resolve_name(name) is None]
+    check("every brain name that the page takes without the word \"brain\" is one the server knows",
+          names is not None and len(names) >= len(PROVIDERS) and not unknown,
+          why or f"{len(names or [])} names, unknown here: {unknown}")
     return results
 
 

@@ -13,6 +13,14 @@
   // too high and it feels slow. Tune it after a day of real use, never in one sitting.
   const FINISH_MS = 900;
 
+  // A command that still needs its name ("switch brain to", "change your voice to", "switch to") waits this long for
+  // the rest: people pause before a name, and speech recognition ends the phrase at that pause. Nothing else waits it.
+  const HOLD_MS = 2500;
+
+  // A lone "switch brain" is answered with "which brain?". Only the next sentence, and only this soon, may answer it
+  // with a name alone ("Claude"). The time covers the question being said aloud.
+  const NAME_WAIT_MS = 15000;
+
   // Words that skip the finish window and act at once.
   const INTERRUPT_WORDS = ['stop', 'wait', 'cancel', 'quiet', 'hold on', 'never mind', 'shut up'];
 
@@ -255,16 +263,19 @@
 
   /* The finish window. Speech recognition ends a phrase at every pause, and people pause in the
      middle of sentences. So a final phrase is held, and only the pause that truly ends the thought
-     sends the whole sentence.  options = { finishMs, onSentence, onInterrupt, setTimer, clearTimer } */
+     sends the whole sentence. A switch that still needs its name ("switch brain to") is held longer
+     (holdMs): the name may follow after a pause.
+     options = { finishMs, holdMs, onSentence, onInterrupt, setTimer, clearTimer } */
   function createFinishBuffer(options) {
     const finishMs = options.finishMs == null ? FINISH_MS : options.finishMs;
+    const holdMs = options.holdMs == null ? HOLD_MS : options.holdMs;
     const setTimer = options.setTimer || setTimeout;
     const clearTimer = options.clearTimer || clearTimeout;
     let parts = [];
     let timer = null;
 
     function disarm() { if (timer !== null) { clearTimer(timer); timer = null; } }
-    function arm() { disarm(); timer = setTimer(flush, finishMs); }
+    function arm() { disarm(); timer = setTimer(flush, awaitsName(parts.join(' ')) ? holdMs : finishMs); }
 
     function flush() {
       disarm();
@@ -321,52 +332,124 @@
     return null;
   }
 
-  // "Switch brain to DeepSeek", "use the OpenAI brain", "switch to Claude", "switch to Codex" -> the name that was said.
-  // With the word "brain" any name is taken. The short form without it ("switch to agy") takes only the
-  // names in the last pattern: Claude, OpenAI, DeepSeek, Venice, OpenRouter, Codex (CLI) and Antigravity (CLI).
-  // The server resolves the name.
+  /* A switch, the way speech recognition writes it. The switch routes read a sentence in ONE plain form (switchText):
+     no wake word ("Jarvis,"), no polite start ("can you", "could you", "would you", "will you", "I want you to",
+     "please"), no polite end ("please", "now", "thanks", "thank you", "for me"), and no marks inside: "switch-brain"
+     and "switch, brain" are "switch brain". Speech writes "to" as "2", "two" or "too" too (TO). This is a pattern, not
+     an understanding of English: the server judges every name (brains.resolve_name, voices.resolve_name). */
+  const TO = '(?:to|2|two|too)';
+  const WAKE_RE = /^(?:(?:hey|ok|okay)\s+)?(?:jarviz|jarvis)\s+/i;
+  const POLITE_START_RE = /^(?:please|(?:can|could|would|will)\s+you|i\s+want\s+you\s+to|i(?:'d|\s+would)\s+like\s+you\s+to)\s+/i;
+  const POLITE_END_RE = /\s+(?:please|now|thanks|thank\s+you|for\s+me|jarviz|jarvis)$/i;
+
+  function switchText(sentence) {
+    let text = String(sentence || '').replace(/’/g, "'")
+      .replace(/[,;:!?"()\u2013\u2014-]/g, ' ')       // marks are spaces: "switch-brain", "anti-gravity"
+      .replace(/\.(?=\s|$)/g, ' ')                     // a period after a word: "Jarvis. Switch", "Claude."
+      .replace(/\s+/g, ' ').trim();
+    for (let before = null; before !== text;) {       // "Jarvis, can you please ... now, thanks"
+      before = text;
+      text = text.replace(WAKE_RE, '').replace(POLITE_START_RE, '').replace(POLITE_END_RE, '').trim();
+    }
+    return text;
+  }
+
+  // Names as people say them, one entry per way of writing: "deep seek" and "deepseek". A space stands for any space.
+  const anyName = names => names.slice().sort((a, b) => b.length - a.length)
+    .map(name => name.split(' ').map(word => word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('\\s+')).join('|');
+
+  // The brains that the short forms take without the word "brain" ("switch to Claude", "use DeepSeek"). brains.py
+  // checks that the server knows every name in BRAIN_NAMES and BRAIN_HEARD.
+  const BRAIN_NAMES = ['claude', 'anthropic', 'openai', 'open ai', 'chatgpt', 'chat gpt', 'gpt', 'deepseek', 'deep seek',
+    'venice', 'openrouter', 'open router', 'codex', 'codex cli', 'openai codex', 'open ai codex', 'antigravity',
+    'anti gravity', 'antigravity cli', 'anti gravity cli', 'agy'];
+  // What speech recognition writes for some of them. "switch to cloud" takes these, "use the cloud" does not.
+  const BRAIN_HEARD = ['cloud', 'clawed', 'clod', 'deep sea', 'codecs'];
+
+  // "Switch brain to DeepSeek", "switch my brain 2 Claude", "switch to brain DeepSeek", "use the OpenAI brain",
+  // "switch to Claude", "use Claude" -> the name that was said. With the word "brain" any name is taken. The short
+  // forms without it take only the names above, and the sentence must end there: never "use the force".
   const BRAIN_SWITCH = [
-    /^(?:switch|change|swap)\s+(?:the\s+|your\s+)?brains?\s+to\s+(?:the\s+)?(.+)$/i,
-    /^(?:switch|change|swap)\s+to\s+(?:the\s+)?(.+?)\s+brain$/i,
+    new RegExp('^(?:switch|change|swap)\\s+(?:the\\s+|your\\s+|my\\s+)?brains?\\s+' + TO + '\\s+(?:the\\s+)?(.+)$', 'i'),
+    new RegExp('^(?:switch|change|swap)\\s+' + TO + '\\s+(?:the\\s+)?brain\\s+(.+)$', 'i'),
+    new RegExp('^(?:switch|change|swap)\\s+' + TO + '\\s+(?:the\\s+)?(.+?)\\s+brain$', 'i'),
     /^use\s+(?:the\s+)?(.+?)\s+brain$/i,
-    /^(?:switch|change|swap)\s+to\s+(?:the\s+)?(claude|anthropic|open\s?ai\s+codex|open\s?ai|chat\s?gpt|gpt|deep\s?seek|venice|open\s?router|codex(?:\s+cli)?|anti\s?gravity(?:\s+cli)?|agy)$/i,
+    new RegExp('^(?:switch|change|swap)\\s+' + TO + '\\s+(?:the\\s+)?(' + anyName(BRAIN_NAMES.concat(BRAIN_HEARD)) + ')$', 'i'),
+    new RegExp('^use\\s+(?:the\\s+)?(' + anyName(BRAIN_NAMES) + ')$', 'i'),
   ];
+  const NO_BRAIN_NAME = /^(?:the|a|an)$/i;            // "switch brain to the": the name has not come yet
 
   function matchBrainSwitch(sentence) {
-    const text = String(sentence || '').trim().replace(/[.!?]+$/, '')
-      .replace(/^(?:(?:hey|ok|okay)\s+)?(?:jarviz|jarvis)[,.!]?\s+/i, '')
-      .replace(/^please\s+/i, '');
+    const text = switchText(sentence);
     for (const pattern of BRAIN_SWITCH) {
       const match = text.match(pattern);
-      if (match) return match[1].trim();
+      const name = match ? match[1].trim() : '';
+      if (name && !NO_BRAIN_NAME.test(name)) return name;
     }
     return null;
   }
 
+  // The server voices without the word "voice" ("switch to ElevenLabs"), and what speech writes for them. voices.py
+  // checks that the server knows every name in VOICE_NAMES, VOICE_HEARD and BROWSER_NAMES.
+  const VOICE_NAMES = ['deepgram', 'deep gram', 'deepgram aura', 'deep gram aura', 'aura', 'elevenlabs', 'eleven labs',
+    '11labs', '11 labs'];
+  const VOICE_HEARD = ['eleven lab', '11 lab', 'level labs'];
+  // The browser's own voice. Without the word "voice" only "speak with ..." takes these names.
+  const BROWSER_NAMES = ['browser', "browser's", 'built in', 'builtin', 'normal', 'default', 'system', 'chrome'];
+
   // "Switch voice to Deepgram", "use the browser voice", "speak with Deepgram", "switch to ElevenLabs" -> the name that
-  // was said. With the word "voice" any name is taken. Without it only the names in VOICE_NAMES, and the sentence must
-  // end there. A sentence that matchBrainSwitch takes is never a voice switch. The server resolves the name.
-  const VOICE_NAMES = '(deep\\s?gram(?:\\s+aura)?|aura|eleven\\s?labs|11\\s?labs|browser(?:[\'’]s)?|built[\\s-]?in|normal|default|system|chrome)';
+  // was said. With the word "voice" any name is taken. Without it only the names above, and the sentence must end
+  // there. A sentence that matchBrainSwitch takes is never a voice switch. The server resolves the name.
   const VOICE_SWITCH = [
-    /^(?:switch|change|swap|set)\s+(?:the\s+|your\s+|my\s+)?voices?\s+(?:back\s+)?to\s+(?:the\s+)?(.+?)(?:\s+voice)?$/i,
-    /^(?:switch|change|swap)\s+(?:back\s+)?to\s+(?:the\s+|your\s+)?(.+?)\s+voice$/i,
+    new RegExp('^(?:switch|change|swap|set)\\s+(?:the\\s+|your\\s+|my\\s+)?voices?\\s+(?:back\\s+)?' + TO
+      + '\\s+(?:the\\s+)?(.+?)(?:\\s+voice)?$', 'i'),
+    new RegExp('^(?:switch|change|swap)\\s+(?:back\\s+)?' + TO + '\\s+(?:the\\s+|your\\s+)?(.+?)\\s+voice$', 'i'),
     /^use\s+(?:the\s+|your\s+)?(.+?)\s+voice$/i,
-    new RegExp('^(?:speak|talk)\\s+(?:with|in|using)\\s+(?:the\\s+|your\\s+|a\\s+)?' + VOICE_NAMES + '(?:\\s+voice)?$', 'i'),
-    /^(?:switch|change|swap)\s+(?:back\s+)?to\s+(?:the\s+)?(deep\s?gram(?:\s+aura)?|aura|eleven\s?labs|11\s?labs)$/i,
+    new RegExp('^(?:speak|talk)\\s+(?:with|in|using)\\s+(?:the\\s+|your\\s+|a\\s+)?('
+      + anyName(VOICE_NAMES.concat(VOICE_HEARD, BROWSER_NAMES)) + ')(?:\\s+voice)?$', 'i'),
+    new RegExp('^(?:switch|change|swap)\\s+(?:back\\s+)?' + TO + '\\s+(?:the\\s+)?(' + anyName(VOICE_NAMES.concat(VOICE_HEARD)) + ')$', 'i'),
   ];
   const NO_VOICE_NAME = /^(?:the|your|my|a|an|own|his|her|its|our|their|this|that|same|new|other)$/i;   // "use your voice"
 
   function matchVoiceSwitch(sentence) {
     if (matchBrainSwitch(sentence)) return null;        // a brain switch first: the two never take the same sentence
-    const text = String(sentence || '').trim().replace(/[.!?]+$/, '')
-      .replace(/^(?:(?:hey|ok|okay)\s+)?(?:jarviz|jarvis)[,.!]?\s+/i, '')
-      .replace(/^please\s+/i, '').replace(/,?\s+please$/i, '');
+    const text = switchText(sentence);
     for (const pattern of VOICE_SWITCH) {
       const match = text.match(pattern);
       const name = match ? match[1].trim() : '';
       if (name && !NO_VOICE_NAME.test(name)) return name;
     }
     return null;
+  }
+
+  // A switch that has not said its name yet. "switch brain", "change your voice", "switch voice to": the page asks
+  // which one (matchSwitchAlone). Those and a bare "switch to" are held by the finish buffer for HOLD_MS (awaitsName),
+  // because the name often follows after a pause.
+  const BRAIN_ALONE = new RegExp('^(?:switch|change|swap)\\s+(?:the\\s+|your\\s+|my\\s+)?brains?(?:\\s+' + TO + '(?:\\s+the)?)?$', 'i');
+  const VOICE_ALONE = new RegExp('^(?:switch|change|swap|set)\\s+(?:the\\s+|your\\s+|my\\s+)?voices?(?:\\s+(?:back\\s+)?'
+    + TO + '(?:\\s+the)?)?$', 'i');
+  const SWITCH_TO_ALONE = new RegExp('^(?:switch|change|swap)\\s+(?:back\\s+)?' + TO + '(?:\\s+the)?(?:\\s+brain)?$', 'i');
+
+  function matchSwitchAlone(sentence) {                // -> 'brain', 'voice' or null
+    const text = switchText(sentence);
+    return BRAIN_ALONE.test(text) ? 'brain' : VOICE_ALONE.test(text) ? 'voice' : null;
+  }
+
+  function awaitsName(sentence) {
+    const text = switchText(sentence);
+    return BRAIN_ALONE.test(text) || VOICE_ALONE.test(text) || SWITCH_TO_ALONE.test(text);
+  }
+
+  // The answer to "which brain?" or "which voice?": a known name alone ("Claude", "to DeepSeek", "the Eleven Labs
+  // voice", "Claude please"). Anything else (a question, "hello") is no answer: it goes its own way.
+  const BRAIN_ANSWER = new RegExp('^(?:' + TO + '\\s+)?(?:the\\s+)?(' + anyName(BRAIN_NAMES.concat(BRAIN_HEARD)) + ')(?:\\s+brain)?$', 'i');
+  const VOICE_ANSWER = new RegExp('^(?:' + TO + '\\s+)?(?:the\\s+)?(' + anyName(VOICE_NAMES.concat(VOICE_HEARD, BROWSER_NAMES))
+    + ')(?:\\s+voice)?$', 'i');
+
+  function matchSwitchAnswer(sentence, kind) {         // -> { kind, name } or null
+    const pattern = kind === 'brain' ? BRAIN_ANSWER : kind === 'voice' ? VOICE_ANSWER : null;
+    const match = pattern ? switchText(sentence).match(pattern) : null;
+    return match ? { kind, name: match[1].trim() } : null;
   }
 
   /* Teardowns. A sentence starts one ONLY when it names a site: "reverse engineer igloo dot inc",
@@ -484,9 +567,10 @@
   }
 
   return {
-    FINISH_MS, INTERRUPT_WORDS, REMEMBER_TRIGGERS, CLUSTER_MIN,
+    FINISH_MS, HOLD_MS, NAME_WAIT_MS, INTERRUPT_WORDS, REMEMBER_TRIGGERS, CLUSTER_MIN,
     isMuted, pickVoice, createSpeaker, interruptWord, createFinishBuffer,
-    createRouter, matchRemember, matchBrainSwitch, matchVoiceSwitch, planFocus, escapeHtml,
+    createRouter, matchRemember, matchBrainSwitch, matchVoiceSwitch, switchText, matchSwitchAlone, awaitsName,
+    matchSwitchAnswer, planFocus, escapeHtml,
     TEARDOWN_COMMANDS, spokenToAddress, findAddress, matchTeardown,
   };
 });

@@ -92,7 +92,10 @@ SERVER_VOICES = tuple(name for name, spec in VOICES.items() if spec["kind"] != "
 ALIASES = {"deepgram": "deepgram", "deepgramaura": "deepgram", "aura": "deepgram",
            "elevenlabs": "elevenlabs", "eleven": "elevenlabs",
            "browser": "browser", "browsers": "browser", "builtin": "browser", "normal": "browser",
-           "default": "browser", "system": "browser", "chrome": "browser"}
+           "default": "browser", "system": "browser", "chrome": "browser",
+           # What speech recognition writes for a name ("switch voice to eleven lab", "level labs"). Only a sound-alike
+           # that cannot mean another voice: resolve_name is used for a voice switch only. "labs" alone stays unknown.
+           "elevenlab": "elevenlabs", "levellabs": "elevenlabs"}
 
 
 class Opener(Protocol):
@@ -753,9 +756,27 @@ class _ClosingBody(io.BytesIO):
         super().close()
 
 
+def _page_names(*lists: str) -> tuple[list[str] | None, str]:
+    """The name lists of viewer/core.js (VOICE_NAMES, VOICE_HEARD, BROWSER_NAMES), read as text: the names that the
+    page's short forms take ("switch to eleven lab"). None and the reason when the file or a list could not be read: a
+    check that cannot look says so. A list holds quoted texts only. (brains.py has the same reader for its lists.)"""
+    try:
+        text = Path(__file__).with_name("viewer").joinpath("core.js").read_text("utf-8")
+    except (OSError, ValueError) as error:
+        return None, f"could not look: viewer/core.js could not be read ({type(error).__name__})"
+    names: list[str] = []
+    for name in lists:
+        found = re.search(rf"^\s*const {name} = \[([^\]]*)\];", text, re.MULTILINE)
+        quoted = r"'([^'\\]*)'|\"([^\"\\]*)\""
+        if not found or re.sub(quoted, "", found.group(1)).replace(",", "").strip():
+            return None, f"could not look: viewer/core.js has no plain list {name}"
+        names += [single or double for single, double in re.findall(quoted, found.group(1))]
+    return names, ""
+
+
 def offline_checks() -> list[tuple[str, bool, str]]:
-    """Fast checks with a fake opener: no network, no file. They prove the logic of the code. The real Deepgram is
-    proved by probe() (preflight)."""
+    """Fast checks with a fake opener: no network. They prove the logic of the code. The real Deepgram is proved by
+    probe() (preflight). The files they read: brains.py and viewer/core.js, as text."""
     results: list[tuple[str, bool, str]] = []
 
     def check(label: str, passed, detail: str = "") -> None:
@@ -845,12 +866,22 @@ def offline_checks() -> list[tuple[str, bool, str]]:
               "ElevenLabs": "elevenlabs", "Eleven Labs": "elevenlabs", "eleven labs": "elevenlabs",
               "eleven labs voice": "elevenlabs", "the ElevenLabs voice": "elevenlabs", "11 Labs": "elevenlabs",
               "11labs": "elevenlabs", "the 11 labs voice": "elevenlabs", "Eleven": "elevenlabs",
+              # what speech recognition writes for ElevenLabs
+              "eleven lab": "elevenlabs", "Eleven Lab": "elevenlabs", "11 lab": "elevenlabs", "level labs": "elevenlabs",
+              "Level Labs voice": "elevenlabs", "level": None, "lab": None, "the lab": None,
               "labs": None, "the labs voice": None, "111 labs": None, "eleven brains": None, "kazoo": None,
               "": None, "voice": None, "the": None, "None": None}
     heard = {words: resolve_name(words) for words in spoken}
     check("resolve_name: the spoken names", heard == spoken, str({w: h for w, h in heard.items() if spoken[w] != h}))
     check("resolve_name: something that is not text is no voice",
           resolve_name(None) is None and resolve_name(42) is None, "")
+    served, why = _page_names("VOICE_NAMES", "VOICE_HEARD")
+    own, why_own = _page_names("BROWSER_NAMES")
+    wrong = [name for name in served or [] if resolve_name(name) not in SERVER_VOICES]
+    wrong += [name for name in own or [] if resolve_name(name) != "browser"]
+    check("every voice name that the page takes without the word \"voice\" is one the server knows",
+          served is not None and own is not None and len(served) >= len(SERVER_VOICES) and own and not wrong,
+          why or why_own or f"not known here, or another voice: {wrong}")
     actives = [active_name(c) for c in ({"voice": "deepgram"}, {"voice": " Deepgram "}, {"voice": "ElevenLabs"},
                                         {"voice": "nonsense"}, {}, {"voice": None}, {"voice": 5})]
     check("active_name: a known voice, else the browser",

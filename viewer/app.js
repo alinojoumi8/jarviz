@@ -620,6 +620,8 @@
     teardown_missing: 'I cannot find that teardown on file.',
     voice_unreachable: 'I could not switch voices. I could not reach the server.',
     voice_failed: 'The server voice did not play. The browser voice speaks instead.',
+    brain_which: 'Which brain? Claude, OpenAI, DeepSeek, Venice, OpenRouter, Codex or Antigravity.',
+    voice_which: 'Which voice? The browser voice, Deepgram or ElevenLabs.',
   };
 
   async function readStatus() {
@@ -766,7 +768,8 @@
   const mic = { on: false, rec: null, deafUntil: 0, failures: 0 };
   const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
 
-  // FINISH_MS (top of core.js) is the pause that ends a spoken sentence.
+  // FINISH_MS (top of core.js) is the pause that ends a spoken sentence. A switch that still needs its name ("switch
+  // brain to") waits HOLD_MS for it.
   const buffer = Core.createFinishBuffer({
     onSentence: sentence => handleInput(sentence),
     onInterrupt: () => interrupt(),
@@ -947,6 +950,16 @@
 
   // The server judges the name and answers with the voice; the page keeps it (takeVoice in handleReply).
   const switchVoice = name => send('/voice', { name }, lines.voice_unreachable);
+
+  // A lone "switch brain" or "switch voice": the page asks which one. Only the NEXT sentence, within NAME_WAIT_MS
+  // (core.js), may answer it with a name alone ("Claude"); any other sentence closes the question and goes its way.
+  let askedName = null;         // { kind: 'brain' | 'voice', until }
+  let answering = null;         // the question that the sentence in handleInput may answer (set for one match)
+
+  function askWhich(kind) {
+    askedName = { kind, until: performance.now() + Core.NAME_WAIT_MS };
+    say(kind === 'brain' ? lines.brain_which : lines.voice_which);
+  }
 
   async function whichBrain() {
     try {
@@ -1226,6 +1239,12 @@
     .add('switch-brain', text => Core.matchBrainSwitch(text), name => switchBrain(name))
     // only with a server that has voices: else the sentence goes to the brain, as before
     .add('switch-voice', text => (voiceOffer ? Core.matchVoiceSwitch(text) : null), name => switchVoice(name))
+    // the answer to "which brain?" / "which voice?": a known name alone, in the next sentence only
+    .add('switch-answer', text => (answering ? Core.matchSwitchAnswer(text, answering.kind) : null),
+      hit => (hit.kind === 'brain' ? switchBrain(hit.name) : switchVoice(hit.name)))
+    // "switch brain" with no name, also after the longer hold of the finish buffer: the page asks which one
+    .add('switch-alone', text => { const kind = Core.matchSwitchAlone(text); return kind === 'voice' && !voiceOffer ? null : kind; },
+      kind => askWhich(kind))
     .add('which-brain', /^(?:which|what)\s+brain\b/i, () => whichBrain())
     .add('forget-last', /^(?:forget|undo|scratch|delete)\s+(?:that|the last (?:note|one|capture))[.!]?$/i, () => forgetLast())
     .add('close-panel', /^(?:close|hide)\s+(?:the\s+)?(?:panel|note)[.!]?$/i, () => Focus.clear())
@@ -1240,7 +1259,10 @@
     if (!text) return null;
     touched = true;
     showHeard(text);
-    const route = router.match(text);
+    answering = askedName && performance.now() <= askedName.until ? askedName : null;   // this sentence only, in time
+    askedName = null;
+    let route;
+    try { route = router.match(text); } finally { answering = null; }
     return route ? route.handler(route.hit, text) : askBrain(text);
   }
 

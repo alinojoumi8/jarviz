@@ -114,10 +114,16 @@ function finishWindow() {
   buffer.push('what did we agree'); advance(600); buffer.touch(); advance(800);
   buffer.push('with the hotel'); advance(5000);
   buffer.push('tell me about'); advance(5300); buffer.push('stop'); advance(9000);
+  // a switch that still needs its name waits longer: the name after a pause of 1.5 s joins it, a lone one goes alone
+  buffer.push('switch brain to'); advance(10500); buffer.push('Claude'); advance(15000);
+  buffer.push('switch voice to'); advance(25000);
   return { sentences, stops };
 }
 console.log(JSON.stringify({
-  finishMs: Core.FINISH_MS,
+  finishMs: Core.FINISH_MS, holdMs: Core.HOLD_MS === undefined ? null : Core.HOLD_MS,
+  // the acceptance set of spoken switches (SPOKEN_SWITCHES): [brain route, voice route] for each sentence
+  spoken: __SPOKEN__.map(s => [Core.matchBrainSwitch(s),
+    typeof Core.matchVoiceSwitch === 'function' ? Core.matchVoiceSwitch(s) : null]),
   muted: spoken('?mute=1'), mutedAmongOthers: spoken('?tab=2&mute=1'), open: spoken(''), lookalike: spoken('?unmute=1'),
   beforeClick: beforeClick(), finish: finishWindow(),
   remember: Core.matchRemember('Remember that the till was short'), notRemember: Core.matchRemember('Do you remember that day'),
@@ -143,6 +149,81 @@ console.log(JSON.stringify({
              ['cancel', 'cancel the teardown'], ['close', 'tear down the old shed']].map(([k, s]) => Core.TEARDOWN_COMMANDS[k].test(s)),
 }));
 """
+
+# The acceptance set of spoken switches: a sentence the way Chrome's speech recognition writes it -> the brain or the
+# voice it must switch to (its name in config.json), or None: no switch at all. The page matchers run on the SERVED
+# core.js (NODE_HARNESS) and the server's resolve_name judges the name they give, so the whole chain is proved.
+# page_checks.js holds the same sentences with the name as said (SPOKEN_BRAIN, SPOKEN_VOICE, NOT_A_SWITCH).
+_BRAIN_SAID = {
+    "anthropic": ("switch brain to claude", "switch brain to Claude", "switch brain to cloud", "switch brain to clawed",
+                  "switch brain to clod", "switch my brain to Claude", "switch your brain to Claude",
+                  "can you switch brain to Claude", "please switch brain to Claude", "Jarvis switch brain to Claude",
+                  "Jarvis, switch brain to Claude.", "switch brain to Claude please", "switch the brain to Claude now",
+                  "switch brain to Claude brain", "switch brains to Claude", "switch to Claude", "switch to Claude brain",
+                  "use Claude", "use the Claude brain", "switch the brain to the Claude", "switch brain 2 Claude",
+                  "switch brain two Claude", "switch brain too Claude", "switch Brain To Claude", "switch-brain to Claude",
+                  "switch, brain to Claude", "I want you to switch to cloud"),
+    "deepseek": ("switch brain to deepseek", "Switch brain to DeepSeek.", "switch brain to deep seek",
+                 "Switch brain to Deep Seek.", "switch brain to deep sea", "change the brain to DeepSeek",
+                 "could you switch the brain to DeepSeek", "hey Jarvis switch brain to DeepSeek", "switch to the DeepSeek",
+                 "Jarvis. Switch brain to DeepSeek.", "switch to brain DeepSeek", "will you use DeepSeek for me",
+                 "switch to deep sea thanks"),
+    "openai": ("switch brain to OpenAI", "switch brain to open AI", "switch brain to open a i",
+               "Jarvis, switch your brain to OpenAI"),
+    "openrouter": ("switch brain to Open Router",),
+    "codex": ("switch brain to codecs", "switch brain to codex"),
+    "antigravity": ("switch brain to anti-gravity",),
+    "venice": ("switch brain to Venice", "would you please switch brain to Venice, thank you"),
+}
+_VOICE_SAID = {
+    "elevenlabs": ("switch voice to ElevenLabs", "Switch voice to Eleven Labs.", "switch voice to 11 Labs",
+                   "switch voice to 11labs", "switch voice to eleven lab", "switch voice to level labs",
+                   "switch voice to elevenlabs voice", "switch your voice to Eleven Labs",
+                   "Jarvis, switch your voice to ElevenLabs.", "can you switch your voice to Eleven Labs",
+                   "switch voice 2 Eleven Labs", "switch voice too Eleven Labs", "change voice to Eleven Labs please",
+                   "use Eleven Labs voice", "use the Eleven Labs voice", "speak with Eleven Labs", "switch to Eleven Labs",
+                   "switch to Eleven Labs voice", "switch my voice to Eleven Labs", "change the voice to Eleven Labs",
+                   "switch voices to Eleven Labs", "switch to level labs", "speak with the eleven lab voice"),
+    "deepgram": ("change your voice to Deepgram", "switch voice to deep gram", "switch voice to Deepgram.",
+                 "switch-voice to Deepgram, thanks"),
+    "browser": ("switch the voice to the browser", "switch voice to browser voice"),
+}
+_NOT_A_SWITCH = (
+    "switch the lights off", "my brain hurts too", "use the cloud", "use the cloud for backups", "is the cloud safe",
+    "use the force", "switch brain off", "your voice is too quiet", "I use Claude at work", "use Claude to summarize this",
+    "switch to two columns", "what voice do you use", "tell me about the cloud", "I changed my voice too",
+    "switch it off too", "can you use your voice", "switch to cloud storage", "use two hands", "the cloud brain is down",
+    "speak with the manager too", "my voice is tired", "speak with the manager", "use your voice",
+    "what is your voice like", "what brain do you use",
+)
+SPOKEN_SWITCHES: dict[str, tuple[str, str] | None] = {
+    **{said: ("brain", name) for name, sentences in _BRAIN_SAID.items() for said in sentences},
+    **{said: ("voice", name) for name, sentences in _VOICE_SAID.items() for said in sentences},
+    **{said: None for said in _NOT_A_SWITCH},
+}
+
+
+def spoken_switch_trouble(spoken) -> list[str]:
+    """What is wrong with the harness's answer for SPOKEN_SWITCHES (`spoken`: [brain route, voice route] for each
+    sentence, in order). A sentence must take exactly one route, and the server must resolve its name to the expected
+    brain or voice (brains.resolve_name, voices.resolve_name); a sentence that is no switch takes none. Pure."""
+    sentences = list(SPOKEN_SWITCHES)
+    if not isinstance(spoken, list) or len(spoken) != len(sentences):
+        return ["the spoken switches were not checked: the harness gave no answer for each sentence"]
+    wrong = []
+    for said, got in zip(sentences, spoken):
+        brain, voice = got if isinstance(got, list) and len(got) == 2 else (None, None)
+        if brain is not None and voice is not None:
+            seen = ("both", None)
+        elif brain is not None:
+            seen = ("brain", brains.resolve_name(brain) if isinstance(brain, str) else None)
+        elif voice is not None:
+            seen = ("voice", voices.resolve_name(voice) if isinstance(voice, str) else None)
+        else:
+            seen = None
+        if seen != SPOKEN_SWITCHES[said]:
+            wrong.append(f"\"{said}\" -> {seen}, not {SPOKEN_SWITCHES[said]}")
+    return [f"{len(wrong)} spoken switches go wrong: " + "; ".join(wrong[:6])] if wrong else []
 
 
 class Report:
@@ -2975,7 +3056,8 @@ def run_node(node: str, script, files: dict[str, str]) -> tuple[str | None, str]
 def run_node_harness(node: str, core_text: str) -> tuple[dict | None, str]:
     """Run NODE_HARNESS on one core.js text. (its JSON, "") or (None, why not): Node did not start, took too long,
     exited with an error, or printed no JSON object."""
-    out, why = run_node(node, "harness.js", {"harness.js": NODE_HARNESS, "core.js": core_text})
+    harness = NODE_HARNESS.replace("__SPOKEN__", json.dumps(list(SPOKEN_SWITCHES)))
+    out, why = run_node(node, "harness.js", {"harness.js": harness, "core.js": core_text})
     if out is None:
         return None, why
     try:
@@ -3077,9 +3159,13 @@ def check_voice_rules(report: Report, ctx: dict) -> None:
         problems.append("the first line must wait for the first click, then speak once")
     report.add(FAIL if problems else PASS, mute_name, "; ".join(problems))
 
-    finish_ms = result["finishMs"]
-    expected = [[800 + finish_ms, "what did we agree with the hotel"]]
+    finish_ms, hold_ms = result["finishMs"], result.get("holdMs")
     rules = []
+    if not isinstance(hold_ms, int) or isinstance(hold_ms, bool) or hold_ms <= 1500:
+        rules.append(f"a switch that still needs its name is not held longer than a pause of 1.5 s (HOLD_MS = {hold_ms})")
+        hold_ms = 0
+    expected = [[800 + finish_ms, "what did we agree with the hotel"], [10500 + finish_ms, "switch brain to Claude"],
+                [15000 + hold_ms, "switch voice to"]]
     if result["finish"]["sentences"] != expected:
         rules.append(f"a paused sentence was not sent whole, once: {result['finish']['sentences']}")
     if result["finish"]["stops"] != [[5300, "stop"]]:
@@ -3095,6 +3181,7 @@ def check_voice_rules(report: Report, ctx: dict) -> None:
         rules.append("the \"switch voice\" route was not checked: the served core.js has no Core.matchVoiceSwitch")
     elif said_voices != ["deepgram", "browser", "eleven labs", None, None]:
         rules.append(f"the \"switch voice\" route matched the wrong sentences: {said_voices}")
+    rules += spoken_switch_trouble(result.get("spoken"))
     routes = []
     if result.get("teardowns") != ["igloo.inc", "linear.app", "stripe.com", "example.com", "this", None, None, None,
                                    None, "Example.com/Docs"]:
@@ -3109,7 +3196,8 @@ def check_voice_rules(report: Report, ctx: dict) -> None:
     if result.get("commands") != [True, True, True, True, False]:
         routes.append(f"the teardown commands matched the wrong sentences: {result.get('commands')}")
     ctx["teardown_routes"] = routes
-    report.add(FAIL if rules else PASS, finish_name, "; ".join(rules) or f"FINISH_MS = {finish_ms}")
+    report.add(FAIL if rules else PASS, finish_name, "; ".join(rules) or f"FINISH_MS = {finish_ms}, HOLD_MS = {hold_ms}, "
+               f"{len(SPOKEN_SWITCHES)} spoken switches and small talk")
 
 
 def check_tag_intent(report: Report) -> None:

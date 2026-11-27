@@ -1280,13 +1280,14 @@ story('a voice switch by voice', {
     ['switch to elevenlabs', 'elevenlabs'], ['switch voice to eleven labs', 'eleven labs'], ['speak with eleven labs', 'eleven labs'],
     ['switch voice to 11 labs', '11 labs'], ['use the ElevenLabs voice', 'ElevenLabs'], ['switch to 11labs', '11labs'],
     ['talk using the Eleven Labs voice', 'Eleven Labs'], ['switch back to the eleven labs voice', 'eleven labs'],
+    ['switch to elevenlabs now', 'elevenlabs'],
   ];
   const wrong = voiceCases.filter(([sentence, name]) => matchVoiceSwitch(sentence) !== name)
     .map(([sentence, name]) => `"${sentence}" gave ${JSON.stringify(matchVoiceSwitch(sentence))}, not ${JSON.stringify(name)}`);
   t.check('voice', !wrong.length, wrong.join('; '));
   const notVoice = ['switch brain to deepseek', 'switch to codex', 'what is your voice like', 'use your voice to read this',
     'my voice is tired', 'speak with the manager', 'use your voice', 'switch to eleven', 'switch to labs', 'speak with eleven',
-    'tell me about elevenlabs', 'is eleven labs any good', 'switch to elevenlabs now', 'speak with 11 labs about pricing']
+    'tell me about elevenlabs', 'is eleven labs any good', 'switch to elevenlabs now and then', 'speak with 11 labs about pricing']
     .filter(sentence => matchVoiceSwitch(sentence) !== null);
   t.check('notVoice', !notVoice.length, notVoice.join(' / '));
   const brainSentences = ['Switch brain to Deep Seek.', 'Jarvis, use the OpenAI brain', 'switch to claude', 'switch to codex',
@@ -1298,6 +1299,199 @@ story('a voice switch by voice', {
   const voiceTaken = voiceSentences.filter(sentence => !matchVoiceSwitch(sentence) || matchBrainSwitch(sentence));
   t.check('apart', !both.length && !brainTaken.length && !voiceTaken.length,
     `both: ${both.join(' / ')}; brain lost: ${brainTaken.join(' / ')}; voice lost: ${voiceTaken.join(' / ')}`);
+});
+
+// The acceptance set: switches the way Chrome's speech recognition writes them (capitals, marks, misheard names,
+// polite words, "2" for "to") -> the name that the page sends. The server judges the names: brains.py and voices.py
+// prove that it knows them, and preflight proves the whole chain on the served core.js (SPOKEN_SWITCHES there).
+const SPOKEN_BRAIN = [
+  ['switch brain to deepseek', 'deepseek'], ['switch brain to claude', 'claude'], ['Switch brain to DeepSeek.', 'DeepSeek'],
+  ['switch brain to deep seek', 'deep seek'], ['Switch brain to Deep Seek.', 'Deep Seek'], ['switch brain to deep sea', 'deep sea'],
+  ['switch brain to Claude', 'Claude'], ['switch brain to cloud', 'cloud'], ['switch brain to clawed', 'clawed'],
+  ['switch brain to clod', 'clod'], ['switch brain to OpenAI', 'OpenAI'], ['switch brain to open AI', 'open AI'],
+  ['switch brain to open a i', 'open a i'], ['switch brain to Open Router', 'Open Router'], ['switch brain to codecs', 'codecs'],
+  ['switch brain to codex', 'codex'], ['switch brain to anti-gravity', 'anti gravity'], ['switch brain to Venice', 'Venice'],
+  ['switch my brain to Claude', 'Claude'], ['switch your brain to Claude', 'Claude'], ['change the brain to DeepSeek', 'DeepSeek'],
+  ['can you switch brain to Claude', 'Claude'], ['could you switch the brain to DeepSeek', 'DeepSeek'],
+  ['please switch brain to Claude', 'Claude'], ['Jarvis switch brain to Claude', 'Claude'], ['Jarvis, switch brain to Claude.', 'Claude'],
+  ['hey Jarvis switch brain to DeepSeek', 'DeepSeek'], ['switch brain to Claude please', 'Claude'],
+  ['switch the brain to Claude now', 'Claude'], ['switch brain to Claude brain', 'Claude brain'], ['switch brains to Claude', 'Claude'],
+  ['switch to Claude', 'Claude'], ['switch to Claude brain', 'Claude'], ['use Claude', 'Claude'], ['use the Claude brain', 'Claude'],
+  ['switch to the DeepSeek', 'DeepSeek'], ['switch the brain to the Claude', 'Claude'], ['switch brain 2 Claude', 'Claude'],
+  ['switch brain two Claude', 'Claude'], ['switch brain too Claude', 'Claude'], ['switch Brain To Claude', 'Claude'],
+  ['switch-brain to Claude', 'Claude'], ['switch, brain to Claude', 'Claude'], ['Jarvis, switch your brain to OpenAI', 'OpenAI'],
+  ['Jarvis. Switch brain to DeepSeek.', 'DeepSeek'], ['switch to brain DeepSeek', 'DeepSeek'],
+  // more of the same kinds
+  ['would you please switch brain to Venice, thank you', 'Venice'], ['I want you to switch to cloud', 'cloud'],
+  ['will you use DeepSeek for me', 'DeepSeek'], ['switch to deep sea thanks', 'deep sea'],
+];
+const SPOKEN_VOICE = [
+  ['switch voice to ElevenLabs', 'ElevenLabs'], ['Switch voice to Eleven Labs.', 'Eleven Labs'], ['switch voice to 11 Labs', '11 Labs'],
+  ['switch voice to 11labs', '11labs'], ['switch voice to eleven lab', 'eleven lab'], ['switch voice to level labs', 'level labs'],
+  ['switch voice to elevenlabs voice', 'elevenlabs'], ['switch your voice to Eleven Labs', 'Eleven Labs'],
+  ['change your voice to Deepgram', 'Deepgram'], ['switch voice to deep gram', 'deep gram'], ['switch voice to Deepgram.', 'Deepgram'],
+  ['switch the voice to the browser', 'browser'], ['switch voice to browser voice', 'browser'],
+  ['Jarvis, switch your voice to ElevenLabs.', 'ElevenLabs'], ['can you switch your voice to Eleven Labs', 'Eleven Labs'],
+  ['switch voice 2 Eleven Labs', 'Eleven Labs'], ['switch voice too Eleven Labs', 'Eleven Labs'],
+  ['change voice to Eleven Labs please', 'Eleven Labs'], ['use Eleven Labs voice', 'Eleven Labs'], ['use the Eleven Labs voice', 'Eleven Labs'],
+  ['speak with Eleven Labs', 'Eleven Labs'], ['switch to Eleven Labs', 'Eleven Labs'], ['switch to Eleven Labs voice', 'Eleven Labs'],
+  ['switch my voice to Eleven Labs', 'Eleven Labs'], ['change the voice to Eleven Labs', 'Eleven Labs'],
+  ['switch voices to Eleven Labs', 'Eleven Labs'],
+  // more of the same kinds
+  ['switch to level labs', 'level labs'], ['switch-voice to Deepgram, thanks', 'Deepgram'], ['speak with the eleven lab voice', 'eleven lab'],
+];
+// Small talk that has the words of a switch in it. None of it is a switch, and none of it asks "which one?".
+const NOT_A_SWITCH = [
+  'switch the lights off', 'my brain hurts too', 'use the cloud', 'use the cloud for backups', 'is the cloud safe',
+  'use the force', 'switch brain off', 'your voice is too quiet', 'I use Claude at work', 'use Claude to summarize this',
+  'switch to two columns', 'what voice do you use', 'tell me about the cloud', 'I changed my voice too', 'switch it off too',
+  'can you use your voice', 'switch to cloud storage', 'use two hands', 'the cloud brain is down', 'speak with the manager too',
+  'my voice is tired', 'speak with the manager', 'use your voice', 'what is your voice like', 'what brain do you use',
+];
+
+story('what speech recognition writes for a switch', {
+  brains: 'every spoken brain switch of the acceptance set takes the brain route, with the name that was said',
+  voices: 'every spoken voice switch of the acceptance set takes the voice route (never the brain route), with the name that was said',
+  small: 'small talk with "switch", "brain", "voice", "use", "cloud" or "too" in it is no switch, and the page asks nothing',
+  sent: 'spoken switches reach /brain and /voice with the name that was said, and nothing goes to the brain (/chat)',
+}, async (t, open) => {
+  const p = await open({ handlers: {
+    '/status': statusWith(voiceOffer('browser')),
+    '/brain': () => ({ ok: true, answer: 'Switched', nodes: [], graph: meta(5) }),
+    '/voice': () => ({ ok: true, answer: 'Voice', nodes: [], graph: meta(5), voice: elevenInfo }),
+    '/chat': () => chatReply('chat', 5),
+  } });
+  const { matchBrainSwitch, matchVoiceSwitch, matchSwitchAlone } = p.J().Core;
+  const wrong = (cases, match) => cases.filter(([sentence, name]) => match(sentence) !== name)
+    .map(([sentence, name]) => `"${sentence}" gave ${JSON.stringify(match(sentence))}, not ${JSON.stringify(name)}`).join('; ');
+  t.check('brains', !wrong(SPOKEN_BRAIN, matchBrainSwitch), wrong(SPOKEN_BRAIN, matchBrainSwitch));
+  t.check('voices', !wrong(SPOKEN_VOICE, matchVoiceSwitch), wrong(SPOKEN_VOICE, matchVoiceSwitch));
+  const taken = NOT_A_SWITCH.filter(sentence => matchBrainSwitch(sentence) !== null || matchVoiceSwitch(sentence) !== null
+    || matchSwitchAlone(sentence) !== null);
+  t.check('small', NOT_A_SWITCH.length >= 10 && !taken.length, taken.join(' / '));
+  for (const sentence of ['switch brain to cloud', 'can you switch your voice to Eleven Labs', 'switch brain 2 Claude', 'use Claude',
+    'switch voice to level labs.']) {
+    await p.J().handleInput(sentence);
+    await p.tick(0);
+  }
+  const brainNames = p.fetchLog.filter(entry => entry.key === '/brain').map(entry => entry.body.name);
+  const voiceNames = p.fetchLog.filter(entry => entry.key === '/voice').map(entry => entry.body.name);
+  t.check('sent', JSON.stringify(brainNames) === '["cloud","Claude","Claude"]' && JSON.stringify(voiceNames) === '["Eleven Labs","level labs"]'
+    && count(p.fetchLog, '/chat') === 0, `${JSON.stringify(brainNames)} / ${JSON.stringify(voiceNames)} / ${count(p.fetchLog, '/chat')} chats`);
+});
+
+story('a pause before the name', {
+  constants: 'FINISH_MS is still 900, and HOLD_MS (the wait for a name) is longer',
+  held: 'a spoken "switch brain to", a pause longer than FINISH_MS, then "Claude": one /brain with "Claude", nothing before it',
+  voice: 'the same for "switch your voice to", a pause, then "Eleven Labs": one /voice with "Eleven Labs"',
+  quick: 'an ordinary sentence is not held: it goes to the brain when FINISH_MS is over, not before and not later',
+  stop: '"stop" during the hold acts at once: the held words are dropped, and nothing is sent after the hold',
+}, async (t, open) => {
+  const p = await open({ handlers: {
+    '/status': statusWith(voiceOffer('browser')),
+    '/brain': () => ({ ok: true, answer: 'Switched', nodes: [], graph: meta(5) }),
+    '/voice': () => ({ ok: true, answer: 'Voice', nodes: [], graph: meta(5), voice: elevenInfo }),
+    '/chat': () => chatReply('chat', 5),
+  } });
+  const { FINISH_MS, HOLD_MS } = p.J().Core;
+  t.check('constants', FINISH_MS === 900 && HOLD_MS > FINISH_MS + 1000, `${FINISH_MS} / ${HOLD_MS}`);
+  const sent = key => p.fetchLog.filter(entry => entry.key === key).map(entry => entry.body.name || entry.body.message);
+  p.$('mic').listeners.click[0]();
+  const rec = p.recognizers[0];
+  const greeting = p.$('answer').textContent;
+  rec.onresult(finalResult('switch brain to'));
+  await p.tick(FINISH_MS + 600);                      // a pause longer than FINISH_MS, shorter than HOLD_MS
+  const early = p.fetchLog.length;
+  const waited = p.$('answer').textContent === greeting && p.$('heard').textContent === '“switch brain to”';    // not sent alone
+  rec.onresult(finalResult('Claude'));
+  await p.tick(FINISH_MS + 10);
+  t.check('held', waited && p.fetchLog.length === early + 1 && JSON.stringify(sent('/brain')) === '["Claude"]' && !sent('/chat').length
+    && p.$('heard').textContent === '“switch brain to Claude”',
+    `${waited} / ${JSON.stringify(sent('/brain'))} / ${JSON.stringify(sent('/chat'))} / ${p.$('heard').textContent}`);
+  rec.onresult(finalResult('switch your voice to'));
+  await p.tick(FINISH_MS + 600);
+  const between = p.$('answer').textContent;          // still the answer to the brain switch: nothing was asked
+  rec.onresult(finalResult('Eleven Labs'));
+  await p.tick(FINISH_MS + 10);
+  t.check('voice', between === 'Switched' && JSON.stringify(sent('/voice')) === '["Eleven Labs"]' && !sent('/chat').length
+    && p.$('heard').textContent === '“switch your voice to Eleven Labs”',
+    `${between} / ${JSON.stringify(sent('/voice'))} / ${JSON.stringify(sent('/chat'))} / ${p.$('heard').textContent}`);
+  rec.onresult(finalResult('what did we agree'));
+  await p.tick(FINISH_MS - 1);
+  const before = sent('/chat').length;
+  await p.tick(1);
+  t.check('quick', before === 0 && JSON.stringify(sent('/chat')) === '["what did we agree"]', `${before} then ${JSON.stringify(sent('/chat'))}`);
+  rec.onresult(finalResult('switch brain to'));
+  await p.tick(500);
+  const answer = p.$('answer').textContent;
+  rec.onresult(finalResult('stop'));
+  await p.tick(HOLD_MS * 2);
+  t.check('stop', sent('/brain').length === 1 && sent('/chat').length === 1 && p.$('answer').textContent === answer,
+    `${JSON.stringify(sent('/brain'))} / ${JSON.stringify(sent('/chat'))} / ${p.$('answer').textContent}`);
+});
+
+story('a switch with no name asks which one', {
+  alone: 'a spoken "switch brain to" with nothing after it asks which brain once the hold is over, with the line from /status, and sends nothing',
+  answer: 'the next sentence, a name alone ("Claude"), switches to it: one /brain with "Claude"',
+  once: 'only the next sentence answers: after it, a lone name goes to the brain as a question',
+  other: 'a sentence that is no name ("what time is it") goes its own way and closes the question',
+  late: 'an answer after NAME_WAIT_MS is no answer: it goes to the brain',
+  typed: 'a typed lone "switch brain" asks too, and a typed "to DeepSeek" after it switches to DeepSeek',
+  voice: 'a lone "change your voice" asks which voice, and "the Eleven Labs voice" after it makes one /voice with "Eleven Labs"',
+  mixed: 'a voice name is no answer to "which brain?": it goes to the brain',
+  oldServer: 'with an old server that has no voices, a lone "switch voice" goes to the brain, as before',
+}, async (t, open) => {
+  const words = { brain_which: 'Server words: which brain?', voice_which: 'Server words: which voice?' };
+  const p = await open({ handlers: {
+    '/status': () => Object.assign(statusWith(voiceOffer('browser'))(), { lines: words }),
+    '/brain': () => ({ ok: true, answer: 'Switched', nodes: [], graph: meta(5) }),
+    '/voice': () => ({ ok: true, answer: 'Voice', nodes: [], graph: meta(5), voice: elevenInfo }),
+    '/chat': () => chatReply('chat', 5),
+  } });
+  const { FINISH_MS, HOLD_MS, NAME_WAIT_MS } = p.J().Core;
+  const sent = key => p.fetchLog.filter(entry => entry.key === key).map(entry => entry.body.name || entry.body.message);
+  const say = async sentence => { await p.J().handleInput(sentence); await p.tick(0); };
+  p.$('mic').listeners.click[0]();
+  const rec = p.recognizers[0];
+  rec.onresult(finalResult('switch brain to'));
+  await p.tick(HOLD_MS - 1);
+  const held = p.$('answer').textContent !== words.brain_which;
+  await p.tick(2);
+  t.check('alone', held && p.$('answer').textContent === words.brain_which && !sent('/brain').length && !sent('/chat').length,
+    `${held} / ${p.$('answer').textContent} / ${JSON.stringify(sent('/brain'))} / ${JSON.stringify(sent('/chat'))}`);
+  rec.onresult(finalResult('Claude'));
+  await p.tick(FINISH_MS + 10);
+  t.check('answer', JSON.stringify(sent('/brain')) === '["Claude"]' && !sent('/chat').length, JSON.stringify(sent('/brain')));
+  rec.onresult(finalResult('Claude'));
+  await p.tick(FINISH_MS + 10);
+  t.check('once', sent('/brain').length === 1 && JSON.stringify(sent('/chat')) === '["Claude"]', JSON.stringify(sent('/chat')));
+  await say('switch brain');
+  const asked = p.$('answer').textContent === words.brain_which;
+  await say('what time is it');
+  await say('Claude');
+  t.check('other', asked && sent('/brain').length === 1 && JSON.stringify(sent('/chat').slice(1)) === '["what time is it","Claude"]',
+    `${asked} / ${JSON.stringify(sent('/brain'))} / ${JSON.stringify(sent('/chat'))}`);
+  await say('switch brain');
+  await p.tick(NAME_WAIT_MS + 1);
+  await say('Claude');
+  t.check('late', sent('/brain').length === 1 && sent('/chat').length === 4, `${JSON.stringify(sent('/brain'))} / ${sent('/chat').length} chats`);
+  await say('switch brain');
+  await say('to DeepSeek');
+  t.check('typed', JSON.stringify(sent('/brain')) === '["Claude","DeepSeek"]' && sent('/chat').length === 4, JSON.stringify(sent('/brain')));
+  await say('change your voice');
+  const voiceAsked = p.$('answer').textContent === words.voice_which;
+  await say('the Eleven Labs voice');
+  t.check('voice', voiceAsked && JSON.stringify(sent('/voice')) === '["Eleven Labs"]' && sent('/chat').length === 4,
+    `${voiceAsked} / ${JSON.stringify(sent('/voice'))}`);
+  await say('switch brain');
+  await say('Eleven Labs');
+  t.check('mixed', sent('/brain').length === 2 && sent('/voice').length === 1 && sent('/chat').length === 5,
+    `${JSON.stringify(sent('/brain'))} / ${JSON.stringify(sent('/voice'))} / ${sent('/chat').length} chats`);
+
+  const q = await open({ handlers: { '/chat': () => chatReply('chat', 5) } });     // its /status has no voices
+  await q.J().handleInput('switch voice');
+  await q.tick(0);
+  t.check('oldServer', count(q.fetchLog, '/chat') === 1 && q.$('answer').textContent === 'chat', `${count(q.fetchLog, '/chat')} chats`);
 });
 
 story('the voice switch', {
