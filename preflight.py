@@ -11,6 +11,7 @@ import collections
 import contextlib
 import difflib
 import email.message
+import errno
 import hashlib
 import io
 import http.client
@@ -428,9 +429,11 @@ def check_voices_offline(report: Report) -> None:
 
 
 def voice_keys(config: dict) -> list[bytes]:
-    """The keys of the voices that have one in config.json. None of them may ever show in an answer."""
-    return [str(config[spec["key"]]).encode("utf-8") for name, spec in voices.VOICES.items()
-            if "key" in spec and voices.describe(config, name)["has_key"]]
+    """The keys of the voices that have one in config.json, each as it is and as JSON writes it (a '"' or a '\\' is
+    escaped there, so a key in a JSON answer is not its own bytes). None of them may ever show in an answer."""
+    found = [str(config[spec["key"]]) for name, spec in voices.VOICES.items()
+             if "key" in spec and voices.describe(config, name)["has_key"]]
+    return list(dict.fromkeys(form.encode("utf-8") for key in found for form in (key, json.dumps(key)[1:-1])))
 
 
 def check_voice_key(report: Report, ctx: dict) -> None:
@@ -467,10 +470,22 @@ def check_voice_routes(report: Report, ctx: dict) -> None:
     served = {voice: voices.describe(config, voice) for voice in voices.SERVER_VOICES}
     keys, trouble, answers = voice_keys(config), [], []
     every = voices.configured_keys(config)          # every key of config.json, of a brain or a voice
+    # The second net: a key as JSON or repr() writes it inside quotes (a '"' or a '\' is escaped), each a key too.
+    forms = every + [json.dumps(key)[1:-1] for key in every] + [repr(key)[1:-1] for key in every]
+
+    def scrubbed(value: object) -> object:
+        """A value from an answer with every key out of each text in it, BEFORE it is written as JSON or repr()."""
+        if isinstance(value, str):
+            return voices.scrub_keys(value, every)
+        if isinstance(value, dict):
+            return {scrubbed(name): scrubbed(item) for name, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [scrubbed(item) for item in value]
+        return value
 
     def shown(text: object, limit: int) -> str:
         """A text from an answer, as it may be printed: every key out BEFORE the cut (a cut can leave a piece)."""
-        return short(voices.scrub_keys(str(text), every), limit)
+        return short(voices.scrub_keys(str(text), forms), limit)
 
     def post(path: str, body: dict, timeout: float = 60) -> tuple[int, dict, bytes, dict]:
         """(status, headers, raw body, the body as JSON or {})."""
@@ -490,8 +505,8 @@ def check_voice_routes(report: Report, ctx: dict) -> None:
         got, _, _, parsed = post(path, body)
         if got and (got != status or parsed.get("ok") is not False or parsed.get("error") != error
                     or not isinstance(parsed.get("answer"), str) or not parsed["answer"].strip()):
-            trouble.append(f"POST {path} {short(json.dumps(body), 60)} gave HTTP {got} {parsed.get('error')!r}, "
-                           f"not {status} {error!r} with a line")
+            trouble.append(f"POST {path} {short(json.dumps(body), 60)} gave HTTP {got} "
+                           f"{scrubbed(parsed.get('error'))!r}, not {status} {error!r} with a line")
 
     # /status: the voice block
     _, status = call_json("GET", "/status")
@@ -501,7 +516,7 @@ def check_voice_routes(report: Report, ctx: dict) -> None:
     if (not isinstance(block, dict) or block.get("default") != default
             or block.get("voices") != voices.describe_all(config)):
         trouble.append(f"/status does not give the voice block {{'default': {default!r}, 'voices': [...]}}: "
-                       f"{shown(json.dumps(block), 160)}")
+                       f"{shown(json.dumps(scrubbed(block)), 160)}")
 
     # /voice: it judges the wish
     refused("/voice", {"name": "kazoo"}, 400, "unknown_voice")
@@ -513,7 +528,8 @@ def check_voice_routes(report: Report, ctx: dict) -> None:
         got, _, _, parsed = post("/voice", {"name": said})
         if got and (got != 200 or parsed.get("ok") is not True or parsed.get("voice") != voices.describe(config, wanted)
                     or not isinstance(parsed.get("answer"), str) or not parsed["answer"].strip()):
-            trouble.append(f"POST /voice {said!r} gave HTTP {got} {parsed.get('error')!r}, not the {wanted} voice")
+            trouble.append(f"POST /voice {said!r} gave HTTP {got} {scrubbed(parsed.get('error'))!r}, "
+                           f"not the {wanted} voice")
 
     # /voice/speak: a bad request is refused before any provider is asked (no key needed, no cost). The voice is
     # required, and it must be a server voice.
@@ -543,7 +559,8 @@ def check_voice_routes(report: Report, ctx: dict) -> None:
             if got and (got != 200 or headers.get("content-type") != "audio/mpeg" or not voices.looks_like_mp3(raw)
                         or headers.get("x-jarviz-parts") != parts or headers.get("cache-control") != "no-store"):
                 trouble.append(f"POST /voice/speak {short(json.dumps(body), 40)} gave HTTP {got} "
-                               f"{headers.get('content-type')!r}, parts {headers.get('x-jarviz-parts')!r}"
+                               f"{scrubbed(headers.get('content-type'))!r}, "
+                               f"parts {scrubbed(headers.get('x-jarviz-parts'))!r}"
                                + (f": {shown(parsed.get('answer') or '', 160)}" if parsed else ""))
         refused("/voice/speak", {"text": two, "part": 5, "voice": voice}, 400, "bad_speak_request")
         said.append(f"{label}: mp3 ({seen['model']}), 1 and 2 pieces")
@@ -574,12 +591,148 @@ def real_folders(root: Path, folder: Path) -> bool:
     return os.path.normcase(folder.resolve(strict=True)) == os.path.normcase(folder)
 
 
+FIXTURE_MAX_BYTES = 1 << 20        # a test note is small: a bigger file is not the fixture
+# Windows (kernel32 by ctypes): the access, the share, the flags and the info classes that _handle_delete uses.
+WIN_READ_AND_DELETE = 0x80000000 | 0x00010000       # GENERIC_READ | DELETE
+WIN_SHARE_READ = 0x1                                # others may read it, never write, rename or delete it meanwhile
+WIN_OPEN_EXISTING, WIN_OPEN_REPARSE_POINT = 3, 0x00200000   # the file itself, never what a link there points to
+WIN_ATTRIBUTE_TAG_INFO, WIN_DISPOSITION_INFO = 9, 4
+WIN_DIRECTORY, WIN_REPARSE_POINT = 0x10, 0x400
+WIN_NOT_FOUND = (2, 3)                              # ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND
+
+
+def _fixture_bytes_ok(read, born: str) -> bool:
+    """True when the bytes that `read()` gives, piece by piece until b"", are the fixture (sha256 `born`)."""
+    digest, size = hashlib.sha256(), 0
+    while piece := read():
+        size += len(piece)
+        if size > FIXTURE_MAX_BYTES:
+            return False
+        digest.update(piece)
+    return digest.hexdigest() == born
+
+
+def _handle_delete(root: Path, target: Path, born: str, between=None) -> tuple[bool | None, str]:
+    """Windows: delete the fixture through ONE handle on the file itself. It is opened with no link followed at the
+    file, and while it is held nobody may write, rename or delete the file. Its real path must be `target` itself (a
+    link on the way shows there), it must be no folder and no reparse point, and its bytes, read through the handle,
+    must be `born`. Then the delete goes through the same handle: a folder swapped later cannot redirect it.
+    (True, ""), (False, "linked" | "not_plain" | "changed"), or (None, why there is no safe delete).
+    `between`: a test runs it after the checks, right before the delete."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.CreateFileW.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                                       wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE)
+        kernel.CreateFileW.restype = wintypes.HANDLE
+        kernel.GetFinalPathNameByHandleW.argtypes = (wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD)
+        kernel.GetFinalPathNameByHandleW.restype = wintypes.DWORD
+        for call_name in ("GetFileInformationByHandleEx", "SetFileInformationByHandle"):
+            getattr(kernel, call_name).argtypes = (wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD)
+            getattr(kernel, call_name).restype = wintypes.BOOL
+        kernel.ReadFile.argtypes = (wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD),
+                                    wintypes.LPVOID)
+        kernel.ReadFile.restype = wintypes.BOOL
+        kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel.CloseHandle.restype = wintypes.BOOL
+    except (ImportError, OSError, AttributeError) as error:
+        return None, f"kernel32 could not be used ({type(error).__name__})"
+    handle = kernel.CreateFileW(str(target), WIN_READ_AND_DELETE, WIN_SHARE_READ, None, WIN_OPEN_EXISTING,
+                                WIN_OPEN_REPARSE_POINT, None)
+    if handle in (None, wintypes.HANDLE(-1).value):
+        code = ctypes.get_last_error()
+        if code in WIN_NOT_FOUND:
+            raise FileNotFoundError(code, "not found")
+        return None, f"it could not be opened for a delete (WinError {code})"
+    try:
+        buffer = ctypes.create_unicode_buffer(32768)
+        size = kernel.GetFinalPathNameByHandleW(handle, buffer, len(buffer), 0)
+        if not 0 < size < len(buffer):
+            return None, f"its real place could not be read (WinError {ctypes.get_last_error()})"
+        real = buffer.value
+        real = "\\\\" + real[8:] if real.startswith("\\\\?\\UNC\\") else real[4:] if real.startswith("\\\\?\\") else real
+        if os.path.normcase(real) != os.path.normcase(str(target)):
+            return False, "linked"
+        tag = (wintypes.DWORD * 2)()                   # FILE_ATTRIBUTE_TAG_INFO: the attributes, the reparse tag
+        if not kernel.GetFileInformationByHandleEx(handle, WIN_ATTRIBUTE_TAG_INFO, tag, ctypes.sizeof(tag)):
+            return None, f"its kind could not be read (WinError {ctypes.get_last_error()})"
+        if tag[0] & (WIN_DIRECTORY | WIN_REPARSE_POINT):
+            return False, "not_plain"
+        chunk, got, failed = ctypes.create_string_buffer(65536), wintypes.DWORD(), []
+
+        def read() -> bytes:
+            if not kernel.ReadFile(handle, chunk, len(chunk), ctypes.byref(got), None):
+                failed.append(ctypes.get_last_error())
+                return b""
+            return chunk.raw[:got.value]
+
+        same = _fixture_bytes_ok(read, born)
+        if failed:
+            return None, f"its bytes could not be read (WinError {failed[0]})"
+        if not same:
+            return False, "changed"
+        if between:
+            between()
+        delete = ctypes.c_ubyte(1)                      # FILE_DISPOSITION_INFO: DeleteFile = TRUE
+        if not kernel.SetFileInformationByHandle(handle, WIN_DISPOSITION_INFO, ctypes.byref(delete), 1):
+            return None, f"the delete was refused (WinError {ctypes.get_last_error()})"
+    finally:
+        kernel.CloseHandle(handle)
+    return True, ""
+
+
+def _folder_delete(root: Path, target: Path, born: str, between=None) -> tuple[bool | None, str]:
+    """POSIX: delete the fixture in a folder that stays open. Each folder from the vault down is opened with no link
+    followed (O_NOFOLLOW), the file is checked and read through the last one, and the unlink is made in it: a folder
+    swapped later cannot redirect it. The same answers as _handle_delete. A link on the way raises ELOOP/ENOTDIR."""
+    parts, flags = target.relative_to(root).parts, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    folders = [os.open(root, flags)]
+    try:
+        for part in parts[:-1]:
+            folders.append(os.open(part, flags, dir_fd=folders[-1]))
+        name, folder = parts[-1], folders[-1]
+        seen = os.stat(name, dir_fd=folder, follow_symlinks=False)
+        if not stat.S_ISREG(seen.st_mode):
+            return False, "not_plain"
+        handle = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0), dir_fd=folder)
+        try:
+            opened = os.fstat(handle)
+            same = ((opened.st_dev, opened.st_ino) == (seen.st_dev, seen.st_ino)
+                    and _fixture_bytes_ok(lambda: os.read(handle, 65536), born))
+        finally:
+            os.close(handle)
+        if not same:
+            return False, "changed"
+        if between:
+            between()
+        if os.stat(name, dir_fd=folder, follow_symlinks=False).st_ino != seen.st_ino:
+            return False, "changed"                     # another file at that name now: it stays
+        os.unlink(name, dir_fd=folder)
+    finally:
+        for folder in reversed(folders):
+            os.close(folder)
+    return True, ""
+
+
+def delete_fixture_file(root: Path, target: Path, born: str, between=None) -> tuple[bool | None, str]:
+    """The delete that no swap of a folder can redirect: through a handle on the file (Windows) or inside folders
+    opened with no link followed (POSIX). Neither: (None, why), and nothing is deleted (fail closed)."""
+    if os.name == "nt":
+        return _handle_delete(root, target, born, between)
+    if ({os.open, os.stat, os.unlink} <= os.supports_dir_fd and os.stat in os.supports_follow_symlinks
+            and hasattr(os, "O_NOFOLLOW") and hasattr(os, "O_DIRECTORY")):
+        return _folder_delete(root, target, born, between)
+    return None, "this system has no delete tied to the file or to a checked folder"
+
+
 def remove_fixture(notes_dir: Path, receipt: dict) -> tuple[bool | None, str]:
     """Remove a test note by hand. Only when it is CERTAINLY the fixture: made in THIS notes folder (the receipt's
     "vault"), a regular file at the receipt's path, reached through real folders only (real_folders), whose bytes have
-    the sha256 the receipt names ("born"). A file that changed stays. Nothing else is ever removed. (True, ""),
-    (False, why it stays), or (None, why) when nothing is there any more: that proves nothing about where it went.
-    The limit: Windows has no unlink anchored to a checked folder, so the folders are checked again right before."""
+    the sha256 the receipt names ("born"). The delete itself is tied to the file or to the checked folders
+    (delete_fixture_file), so a folder swapped after the checks cannot redirect it. A file that changed stays. Nothing
+    else is ever removed. (True, ""), (False, why it stays), or (None, why) when nothing is there any more (that proves
+    nothing about where it went) or when there is no safe delete here (it stays: the user removes it)."""
     relative, born = receipt.get("file"), receipt.get("born")
     if not isinstance(relative, str) or not isinstance(born, str) or not re.fullmatch(r"[0-9a-f]{64}", born):
         return False, "the receipt does not name the test note fully, so nothing was removed"
@@ -587,24 +740,27 @@ def remove_fixture(notes_dir: Path, receipt: dict) -> tuple[bool | None, str]:
         return False, "the receipt names another notes folder, so nothing was removed"
     root = notes_dir.resolve()
     target = Path(os.path.normpath(root / relative))        # the place itself: a link there is not followed
-    if not target.is_relative_to(root) or target.suffix.lower() != ".md":
+    if not target.is_relative_to(root) or target == root or target.suffix.lower() != ".md":
         return False, "the receipt names a place outside the notes folder, so nothing was removed"
-    linked = f"a folder on the way to {target} is a link or a junction (it can lead out of the notes folder), so it stays"
+    stays = {"linked": f"a folder on the way to {target} is a link or a junction (it can lead out of the notes "
+                       "folder), so it stays",
+             "not_plain": f"the test note at {target} is not a plain file any more, so it stays",
+             "changed": f"the test note at {target} was changed after it was made, so it stays"}
     try:
         if not real_folders(root, target.parent):
-            return False, linked
+            return False, stays["linked"]
         if not stat.S_ISREG(target.lstat().st_mode):
-            return False, f"the test note at {target} is not a plain file any more, so it stays"
-        if hashlib.sha256(target.read_bytes()).hexdigest() != born:
-            return False, f"the test note at {target} was changed after it was made, so it stays"
-        if not real_folders(root, target.parent):          # once more, right before: the gap is as short as it can be
-            return False, linked
-        target.unlink()
+            return False, stays["not_plain"]
+        done, why = delete_fixture_file(root, target, born)
     except FileNotFoundError:
         return None, f"the test note is not at {target} any more"
     except OSError as error:
-        return False, f"the test note at {target} could not be removed ({error.strerror or error})"
-    return True, ""
+        if error.errno in (errno.ELOOP, errno.ENOTDIR):
+            return False, stays["linked"]
+        return False, f"the test note at {target} could not be removed ({error.strerror or type(error).__name__})"
+    if done is None:                    # fail closed: nothing was deleted
+        return None, f"there is no safe delete here ({why}), so it stays: remove {relative!r} in the notes folder by hand"
+    return done, stays.get(why, why)
 
 
 def check_remember(report: Report, ctx: dict) -> None:
@@ -685,9 +841,10 @@ def check_remember(report: Report, ctx: dict) -> None:
                     if folder.is_dir() and not any(folder.iterdir()) and (folder != captures or not captures_was_there):
                         folder.rmdir()
             elif removed is None:           # gone from its place is no proof that it went to the trash
+                moved = kind == "no_answer" and not os.path.lexists(notes_dir / str(receipt.get("file")))
                 problems.append(f"CLEANUP NOT CONFIRMED: {said}, and {why}" + (
                     f": the server may have moved it to {server.CAPTURES_DIR}/{server.TRASH_DIR} before its answer "
-                    "was lost" if kind == "no_answer" else ""))
+                    "was lost" if moved else ""))
             else:
                 problems.append(f"CLEANUP FAILED: {said}, and {why}")
             if not cleanup_note and len(build.read_graph().get("nodes", [])) != len(before):
@@ -1905,19 +2062,28 @@ def check_sources_stay_true(report: Report) -> None:
 
 def check_served_files(report: Report) -> None:
     name = "The files the browser is served match the files on disk"
-    stale, total = [], 0
+    stale, total, silent = [], 0, []
     for path in sorted(server.VIEWER_ROOT.rglob("*")):
         if not path.is_file() or path.suffix.lower() not in server.STATIC_TYPES:
             continue
         total += 1
         relative = path.relative_to(server.VIEWER_ROOT).as_posix()
-        status, served = call("GET", "/" + quote(relative))
+        kind, got = try_probe(lambda relative=relative: call("GET", "/" + quote(relative)))
+        if kind != "answer":
+            silent.append(f"{relative} ({got})")        # no answer proves nothing
+            continue
+        status, served = got
         if status != 200 or hashlib.sha256(served).digest() != hashlib.sha256(path.read_bytes()).digest():
             stale.append(relative)
-    status, root_page = call("GET", "/")
-    if status != 200 or root_page != (server.VIEWER_ROOT / "index.html").read_bytes():
+    kind, got = try_probe(lambda: call("GET", "/"))
+    if kind != "answer":
+        silent.append(f"/ ({got})")
+    elif got[0] != 200 or got[1] != (server.VIEWER_ROOT / "index.html").read_bytes():
         stale.append("/ (the start page)")
-    if stale or not total:
+    if silent:
+        report.add(FAIL, name, f"NOT VERIFIED, could not look: {len(silent)} files got no answer: "
+                               + short("; ".join(silent), 300) + (f". Stale too: {', '.join(stale)}" if stale else ""))
+    elif stale or not total:
         report.add(FAIL, name, "Stale or missing: " + ", ".join(stale or ["no viewer files found"]) +
                    ". An old server may still hold the port. Close it and start again.")
     else:
@@ -2666,6 +2832,16 @@ def check_tag_intent(report: Report) -> None:
                                      "to the part that asks")
 
 
+def run_check(report: Report, check, *args):
+    """One check. A check that stops is a FAIL that names only the type of the error (its text could hold a key),
+    and the run goes on: preflight always ends with its summary. Gives what the check gave, None when it stopped."""
+    try:
+        return check(report, *args)
+    except Exception as error:          # noqa: BLE001 - a check that stops says so, it never crashes preflight
+        report.add(FAIL, f"{check.__name__} runs to its end", f"the check stopped ({type(error).__name__})")
+        return None
+
+
 def main() -> int:
     report = Report()
     config = server.load_config()
@@ -2673,40 +2849,19 @@ def main() -> int:
     ctx = {"config": config, "brain": brain, "key_set": brain["has_key"], "session": "preflight-" + secrets.token_hex(4)}
     print(f"Jarviz preflight  {time.strftime('%Y-%m-%d %H:%M:%S')}  http://{server.HOST}:{server.PORT}"
           f"  brain: {brain['label']} / {brain['model']}\n")
-    if check_server(report):
-        check_graph(report, ctx)
-        check_brains_offline(report)
-        check_voices_offline(report)
-        check_config_lines(report, ctx)
-        check_brain_locks(report, ctx)          # before the first question goes through the server
-        check_chat(report, ctx)
-        check_key_and_model(report, ctx)
-        check_other_brains(report, ctx)
-        check_voice_key(report, ctx)
-        check_voice_routes(report, ctx)
-        check_remember(report, ctx)
-        check_links_stay_true(report)
-        check_take_back_safe(report)
-        check_notes_dir_follows_config(report)
-        check_brain_choice_saved(report)
-        check_build_survives(report)
-        check_teardown_one_folder(report)
-        check_teardown_receipt_turn(report)
-        check_teardown_cancel(report)
-        check_signature_once(report)
-        check_sources_stay_true(report)
-        check_served_files(report)
-        check_config_hidden(report, ctx)
-        check_other_sites(report)
-        check_lock(report)
-        check_persona_home(report)
-        check_pinned_libraries(report)
-        check_voice_rules(report, ctx)
-        check_page_rules(report, ctx)
-        check_tag_intent(report)
-        check_teardown_kit(report)
-        check_teardown_offline(report, ctx)
-        check_no_investigation_chrome(report)
+    if run_check(report, check_server):
+        for check, *args in (
+                (check_graph, ctx), (check_brains_offline,), (check_voices_offline,), (check_config_lines, ctx),
+                (check_brain_locks, ctx),       # before the first question goes through the server
+                (check_chat, ctx), (check_key_and_model, ctx), (check_other_brains, ctx), (check_voice_key, ctx),
+                (check_voice_routes, ctx), (check_remember, ctx), (check_links_stay_true,), (check_take_back_safe,),
+                (check_notes_dir_follows_config,), (check_brain_choice_saved,), (check_build_survives,),
+                (check_teardown_one_folder,), (check_teardown_receipt_turn,), (check_teardown_cancel,),
+                (check_signature_once,), (check_sources_stay_true,), (check_served_files,), (check_config_hidden, ctx),
+                (check_other_sites,), (check_lock,), (check_persona_home,), (check_pinned_libraries,),
+                (check_voice_rules, ctx), (check_page_rules, ctx), (check_tag_intent,), (check_teardown_kit,),
+                (check_teardown_offline, ctx), (check_no_investigation_chrome,)):
+            run_check(report, check, *args)
     print("\n" + report.summary())
     return 1 if report.counts[FAIL] else 0
 

@@ -212,8 +212,17 @@ directions, and a butler persona. The spec is a 12-prompt pack. `TODO.md` lists 
   `real_folders`), and its bytes are `born`. The trash copy that /forget names goes through the same checks. A
   fixture that is gone from its place is "cleanup not confirmed", never a success. An unanswered /forget still leads
   to that check, and preflight never stops without its summary.
+- A test fixture is deleted only through something that names the file itself: on Windows one handle (no link
+  followed, real path = the place in the vault, no reparse point, bytes = `born` read through that handle, then
+  delete through it); on POSIX folders opened with O_NOFOLLOW and `dir_fd`. Where neither is possible, nothing is
+  deleted and preflight says "cleanup not confirmed" with the note's path in the notes folder (`delete_fixture_file`).
+- Every check in `main` runs through `run_check`: a check that stops is a FAIL that names only the type of its error,
+  never its text, and preflight always ends with its summary. A request that gets no answer is "could not look"
+  (`try_probe`), never a crash.
 - What preflight prints from an answer loses EVERY key of config.json (`voices.configured_keys`,
-  `voices.scrub_keys`) BEFORE it is cut.
+  `voices.scrub_keys`) BEFORE it is cut, and BEFORE it is written as JSON or repr() (`scrubbed`). Every key is also
+  removed in its JSON- and repr-escaped form. A leak scan of raw answer bytes looks for each key as it is AND as JSON
+  writes it.
 - A test that proves a lock holds must see the other thread TRY the lock while the owner holds it, before the owner
   goes on. A lock that is free at that try is NOT VERIFIED.
 - Part Two (REA): it observes only. No clicks, no logins, websites the user may look at.
